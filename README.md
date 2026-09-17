@@ -25,6 +25,11 @@ A system that watches live video, detects and tracks objects, reasons about even
 7. `01_foundations/` — Pick the track relevant to your work (18 tracks)
 8. `02_architecture/` — Read the component files for your layer
 
+**If you're ready to build**, read:
+
+9. `10_training_plan/00_master_plan.md` — What we're training, the full execution plan
+10. `10_training_plan/01_pre_training_preparation.md` — Set up your environment
+
 ---
 
 ## Repository Structure
@@ -164,9 +169,19 @@ multimodal_reasoner_research/
 │   ├── 02_ablation_plan.md
 │   └── 03_risk_register.md
 │
-└── 09_sources/                       ← 139 research sources
-    ├── README.md                     ← Source index (18 categories)
-    └── 02_search_targets.md
+├── 09_sources/                       ← 139 research sources
+│   ├── README.md                     ← Source index (18 categories)
+│   └── 02_search_targets.md
+│
+└── 10_training_plan/                 ← TRAINING EXECUTION PLAN (start here for implementation)
+    ├── 00_master_plan.md             ← ★ START HERE: What we're training, how, and why
+    ├── 01_pre_training_preparation.md ← Environment setup, GPU verification
+    ├── 02_dataset_preparation.md     ← Every dataset, every preprocessing step
+    ├── 03_training_pipeline.md       ← Exact training configs for each model
+    ├── 04_optimization_strategies.md ← FP16, TensorRT, torch.compile, CUDA graphs
+    ├── 05_inference_integration.md   ← How models connect into the pipeline
+    ├── 06_benchmarking_plan.md       ← How we measure everything
+    └── 07_timeline_milestones.md     ← Day-by-day execution plan (28 days)
 ```
 
 ---
@@ -223,6 +238,16 @@ Read: CAPSTONE_PAPER.md                     ← The pitch paper
       02_architecture/FULL_ARCHITECTURE.md  ← Complete architecture
       02_architecture/diagrams/04_master_architecture.md ← System diagrams
       benchmark_report_2026.md              ← Benchmark data for tables
+```
+
+### If you're ready to **start building / training**
+```
+Read: 10_training_plan/00_master_plan.md             ← The master plan
+      10_training_plan/01_pre_training_preparation.md ← Environment setup
+      10_training_plan/02_dataset_preparation.md      ← Data prep
+      10_training_plan/03_training_pipeline.md        ← Training configs
+      10_training_plan/05_inference_integration.md    ← Pipeline code
+      10_training_plan/07_timeline_milestones.md      ← Day-by-day plan
 ```
 
 ---
@@ -365,7 +390,8 @@ Video (30 FPS) + Audio + Metadata
 | Benchmarks & research | 3 | ~1,500 |
 | Implementation plan | 3 | ~500 |
 | Evaluation plan | 2 | ~300 |
-| **Total** | **93** | **~16,484** |
+| **Training plan** | **8** | **~3,500** |
+| **Total** | **101** | **~20,000** |
 
 ---
 
