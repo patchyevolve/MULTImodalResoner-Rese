@@ -23,7 +23,14 @@ Day 13+:  Integration + benchmarking
 
 Detection is the foundation. Every downstream component (tracking, pose, reasoning) depends on detection quality. If detection fails, everything fails.
 
-### Training Configuration
+### Training Strategy
+
+**Two-stage approach** (consistent with `01_foundations/18_training_strategy.md`):
+
+1. **Baseline (this plan, Days 5-7):** Fine-tune from COCO-pretrained weights on COCO + custom domain. This establishes the baseline accuracy.
+2. **Domain Adaptation (Phase 2+, if needed):** If sports domain accuracy is insufficient, apply LoRA adapters and fine-tune on sports-specific data.
+
+### Training Configuration (Baseline Stage)
 
 ```yaml
 # configs/rf_detr_s_finetune.yaml
@@ -183,6 +190,59 @@ python scripts/benchmark_trt.py \
     --input-size 640 640 \
     --iterations 1000
 ```
+
+### Domain Adaptation with LoRA (Phase 2+, If Needed)
+
+If baseline mAP on sports domain is < 50% (below target), apply LoRA adapters:
+
+```yaml
+# configs/rf_detr_s_lora_domain.yaml
+
+model:
+  name: "rf-detr-s"
+  pretrained: "models/checkpoints/rf_detr_s/best.pth"  # Start from baseline
+  lora:
+    enabled: true
+    rank: 16                    # Low-rank adaptation
+    alpha: 32                   # Scaling factor
+    target_modules:             # Apply LoRA to transformer layers
+      - "encoder.layers.*.self_attn"
+      - "encoder.layers.*.ffn"
+      - "decoder.layers.*.self_attn"
+      - "decoder.layers.*.cross_attn"
+    dropout: 0.1
+
+training:
+  epochs: 20                    # Fewer epochs than baseline
+  batch_size: 4                 # Smaller batch for fine-tuning
+  learning_rate: 5e-5           # 10× lower than baseline
+  freeze_backbone: true         # Freeze ConvNeXt backbone
+  # Only LoRA adapters + decoder are trained
+```
+
+```bash
+# LoRA fine-tune on sports domain data
+python scripts/train_detection_lora.py \
+    --config configs/rf_detr_s_lora_domain.yaml \
+    --data data/processed/sports/ \
+    --gpu 0
+
+# Merge LoRA weights into base model
+python scripts/merge_lora.py \
+    --base models/checkpoints/rf_detr_s/best.pth \
+    --lora models/checkpoints/rf_detr_s/lora_best.pth \
+    --output models/checkpoints/rf_detr_s/domain_adapted.pth
+```
+
+**When to use LoRA:**
+- Baseline mAP on sports clips < 50%
+- Sports-specific classes (ball, goal, referee) have low recall
+- Custom domain video shows detection gaps
+
+**When NOT to use LoRA:**
+- Baseline already meets targets (mAP ≥ 53.0)
+- Time is limited (LoRA adds 1-2 days)
+- Domain is similar to COCO (general objects)
 
 ---
 

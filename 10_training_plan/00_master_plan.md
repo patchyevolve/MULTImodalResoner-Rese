@@ -244,6 +244,97 @@ This is not "make it work." This is "make it impressive."
 
 ---
 
+## Risk Mitigation (How Training Plan Addresses Each Risk)
+
+> Reference: `08_implementation/03_risk_register.md` — all 13 risks mapped to concrete mitigations in this training plan.
+
+| Risk | What Could Go Wrong | Mitigation in This Training Plan | Where |
+|---|---|---|---|
+| **R1: False confidence** | System outputs high-confidence claims that are wrong | Calibration pipeline: ECE < 0.05, conformal coverage ≥ 95%, 5-component confidence decomposition | `03_training_pipeline.md` Model 5 |
+| **R2: Temporal hallucination** | VLM claims events that didn't happen in the right order | Fast verifier checks temporal consistency before VLM. Evidence graph tracks timestamps. Ring buffer preserves recent state. | `05_inference_integration.md` — fast verifier + evidence graph code |
+| **R3: Compounding state error** | Detection errors propagate and amplify over time | World state ring buffer with staleness tracking. Periodic re-detection every N frames. Entity confidence decays without fresh observations. | `08_infrastructure_development.md` — world_state.py code |
+| **R4: Scheduler starvation** | VLM queue backs up, blocks 30 FPS path | Backpressure triggers: when queue depth > 4, coalesce stale jobs. Priority scheduler: R-score ≥ 0.7 gets priority. 30 FPS path never blocked. | `08_infrastructure_development.md` — scheduler code |
+| **R5: Domain overfitting** | Model works on soccer but fails on basketball | LoRA domain adaptation is optional (Phase 2+). Baseline trained on COCO (general). Domain-specific rules in separate config. | `03_training_pipeline.md` — LoRA section |
+| **R6: Synthetic media brittleness** | Deepfake detector fails on real-world content | Forensics uses ensemble (3+ detectors) + C2PA provenance. Output "inconclusive" when confidence < threshold. Never binary flag. | `08_infrastructure_development.md` — forensics code |
+| **R7: Hidden-state overinterpretation** | System claims certainty about occluded objects | Confidence decomposition includes "occlusion_level" component. Claims carry `visibility_score` per joint. Conformal prediction sets, not single labels. | `03_training_pipeline.md` — calibrator training |
+| **R8: Latency collapse at high load** | System slows down under load, misses 30 FPS | Benchmark at D25: sustained 30 FPS stress test. Memory leak detection. GPU utilization monitoring. | `06_benchmarking_plan.md` — stress test section |
+| **R9: Adversarial attacks on VLM** | VLM manipulated by adversarial inputs | Qwen3-VL-30B-A3B has 6.5-15.5% ASR (vs LLaVA 52.6-66.9%). Drift-gated defense in VLM reasoner. | `05_inference_integration.md` — VLM reasoner code |
+| **R10: VLM robustness under shift** | VLM quality drops on different video types | VLM-RobustBench testing (49 augmentations). Multi-rate scheduling: VLM is async, never blocks perception. | `06_benchmarking_plan.md` — distribution shift tests |
+| **R11: Production failure rate** | System crashes in production | Every component has error handling. Pipeline degrades gracefully: skip VLM, skip forensics, still output state. Docker health checks. | `08_infrastructure_development.md` — all component code |
+| **R12: Bias and fairness** | VLM produces biased claims | Confidence decomposition includes cross-modal agreement. Claims carry provenance. Human review for high-stakes claims. | `06_calibration/` — confidence decomposition |
+| **R13: EU AI Act compliance** | Legal requirements not met | C2PA content credentials. Claim output includes `provenance` field. Deepfake disclosure in claim metadata. | `06_calibration/04_claim_output.py` — claim schema |
+
+### Concrete Mitigations Implemented in Training Pipeline
+
+```python
+# R1: False confidence — calibration training
+# 03_training_pipeline.md, Model 5
+temperature_scaler.fit(calibration_logits, ground_truth)  # ECE < 0.05
+conformal.calibrate(nonconformity_scores, alpha=0.05)     # Coverage ≥ 95%
+
+# R2: Temporal hallucination — fast verifier
+# 05_inference_integration.md
+def verify_temporal(hypothesis, state_snapshots):
+    """Check if hypothesis is temporally consistent with recent state."""
+    for snapshot in state_snapshots[-10:]:
+        if contradicts(hypothesis, snapshot):
+            return VerificationResult(verdict="REFUTED", reason="temporal_contradiction")
+    return VerificationResult(verdict="SUPPORTED")
+
+# R3: Compounding state error — staleness tracking
+# 08_infrastructure_development.md
+class WorldState:
+    def update(self, detections, frame_id):
+        self.ring_buffer.write(detections, frame_id)
+        # Mark entities not seen for N frames as "stale"
+        for entity in self.entities:
+            if frame_id - entity.last_seen > self.stale_threshold:
+                entity.confidence *= 0.9  # Decay confidence
+
+# R4: Scheduler starvation — backpressure
+# 08_infrastructure_development.md
+class Backpressure:
+    def check(self, queue_depth, gpu_util):
+        if queue_depth > 4 or gpu_util > 0.95:
+            return Action.COALESCENT_STALE_JOBS  # Drop old VLM jobs
+        return Action.PROCESS_NORMALLY
+
+# R7: Hidden-state overinterpretation — occlusion-aware confidence
+# 06_calibration/confidence_decomposition.py
+def decompose(self, perception_conf, temporal_conf, motion_conf, cross_modal_conf, reasoning_conf):
+    return {
+        "perception": perception_conf,
+        "temporal": temporal_conf,
+        "motion": motion_conf,
+        "cross_modal": cross_modal_conf,
+        "reasoning": reasoning_conf,
+        "overall": self.weighted_average(perception_conf, temporal_conf, ...),
+        "occlusion_penalty": self.compute_occlusion_penalty(),  # R7 mitigation
+    }
+
+# R11: Production failure — graceful degradation
+# 08_infrastructure_development.md
+class Pipeline:
+    def process(self, frame):
+        try:
+            state = self.perception.process(frame)
+        except PerceptionError:
+            state = self.last_known_state  # Use cached state
+            state.staleness += 1
+
+        try:
+            events = self.event_detector.detect(state)
+        except EventError:
+            events = []  # Skip events, continue pipeline
+
+        try:
+            claim = self.reasoning.reason(events, state)
+        except ReasoningError:
+            claim = self.build_minimal_claim(state)  # Output state without reasoning
+```
+
+---
+
 ## Evaluation Experiments Mapping
 
 > How this training plan maps to the formal experiment matrix in `07_evaluation/01_experiment_matrix.md`.

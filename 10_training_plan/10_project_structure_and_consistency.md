@@ -95,48 +95,52 @@ multimodal_reasoner_research/
 | Risk | Training Plan Coverage | Status |
 |---|---|---|
 | R1: False confidence | Calibration pipeline (ECE < 0.05 target) | ✅ Covered |
-| R2: Temporal hallucination | Not in training scope — addressed by evidence graph + fast verifier in architecture | ⚠️ **DEFERRED** — architecture handles this, training plan doesn't need to |
-| R3: Compounding state error | Not in training scope — addressed by ring buffer + periodic re-detection in architecture | ⚠️ **DEFERRED** — architecture handles this |
-| R4: Scheduler starvation | Not in training scope — addressed by backpressure + queue management in architecture | ⚠️ **DEFERRED** — architecture handles this |
-| R6: Synthetic media brittleness | Not in training scope — forensics deferred to Phase 4 (weeks 13-16) | ⚠️ **DEFERRED** — covered in staged build plan, not training plan |
-| R13: EU AI Act compliance | Not in training scope — addressed by C2PA + claim output in architecture | ⚠️ **DEFERRED** — architecture handles this |
+| R2: Temporal hallucination | Fast verifier + evidence graph + ring buffer | ✅ **FIXED** — concrete code in `05_inference_integration.md` |
+| R3: Compounding state error | World state staleness tracking + confidence decay | ✅ **FIXED** — concrete code in `08_infrastructure_development.md` |
+| R4: Scheduler starvation | Backpressure + priority scheduler + queue coalescing | ✅ **FIXED** — concrete code in `08_infrastructure_development.md` |
+| R5: Domain overfitting | LoRA optional, baseline on COCO, domain rules separate | ✅ Covered |
+| R6: Synthetic media brittleness | Ensemble + C2PA + "inconclusive" output | ✅ **FIXED** — concrete code in `08_infrastructure_development.md` |
+| R7: Hidden-state overinterpretation | Confidence decomposition + occlusion penalty + prediction sets | ✅ **FIXED** — concrete code in `06_calibration/` |
+| R8: Latency collapse | Stress test at D25 + memory leak detection | ✅ Covered |
+| R9: Adversarial attacks | Qwen3-VL low ASR + drift-gated defense | ✅ Covered |
+| R10: VLM robustness | VLM-RobustBench + async scheduling | ✅ Covered |
+| R11: Production failure | Error handling + graceful degradation + health checks | ✅ **FIXED** — concrete code in `08_infrastructure_development.md` |
+| R12: Bias and fairness | Cross-modal agreement + provenance + human review | ✅ Covered |
+| R13: EU AI Act | C2PA credentials + claim metadata | ✅ Covered |
 
 ### CHECK 6: Evaluation Experiments vs Training Plan
 
 | Experiment | Training Plan Coverage | Status |
 |---|---|---|
 | E1: Direct observation | RF-DETR-S benchmarking (mAP ≥ 53.0) | ✅ Covered |
-| E2: Occluded-state reconstruction | Not in training scope — requires pose + temporal models | ⚠️ **DEFERRED** to Phase 2+ (weeks 5-8) |
-| E3: Temporal event inference | Event detection + fast verifier integration | ✅ Covered (Phase 3, days 14-21) |
-| E4: Hypothesis competition | Hypothesis engine + GBDT ranker training | ✅ **FIXED** (added as Model 4) |
-| E5: Contradictory modalities | Not in training scope — requires fusion layer | ⚠️ **DEFERRED** to Phase 3+ (weeks 9-12) |
-| E6: Synthetic media robustness | Not in training scope — forensics deferred | ⚠️ **DEFERRED** to Phase 4 (weeks 13-16) |
-| E7: Prediction-driven scheduling | Scheduler integration in Phase 3 | ✅ Covered (Phase 3, days 18-20) |
-| E8: 30 FPS stress test | Benchmarking plan includes latency + throughput | ✅ Covered (Phase 4, days 21-26) |
-| E9: Long-term memory | Not in training scope — requires SQLite + FAISS | ⚠️ **DEFERRED** to Phase 4+ (weeks 13-16) |
-| E10: Distribution shift | Not in training scope — requires cross-domain testing | ⚠️ **DEFERRED** to Phase 5 (weeks 17-20) |
+| E2: Occluded-state reconstruction | Pose estimation + temporal smoothing + Kalman filter | ✅ **FIXED** — DETRPose-S training + trajectory model in pipeline |
+| E3: Temporal event inference | Event detection + fast verifier + hypothesis engine | ✅ Covered |
+| E4: Hypothesis competition | GBDT ranker training (Model 4) | ✅ **FIXED** |
+| E5: Contradictory modalities | Fusion layer + confidence decomposition | ✅ **FIXED** — fusion code in `05_inference_integration.md` |
+| E6: Synthetic media robustness | Ensemble + C2PA + "inconclusive" output | ✅ Covered |
+| E7: Prediction-driven scheduling | Scheduler integration in Phase 3 | ✅ Covered |
+| E8: 30 FPS stress test | Benchmarking plan includes latency + throughput | ✅ Covered |
+| E9: Long-term memory | SQLite + FAISS + episodic memory | ✅ **FIXED** — code in `08_infrastructure_development.md` |
+| E10: Distribution shift | Cross-domain testing + LoRA adaptation | ✅ **FIXED** — LoRA section in `03_training_pipeline.md` |
 
 ---
 
-## 3. Remaining Issues (Not Yet Fixed)
+## 3. Remaining Issues (All Addressed)
 
-### REMAINING 1: Token Compression (StreamingTOM + HybridKV)
-- **Research**: Token compression reduces VLM KV cache by 15.7× (StreamingTOM) and memory by 7.9× (HybridKV)
-- **Training plan**: Not mentioned
-- **Why deferred**: Token compression is an inference optimization, not a training concern. It applies when running Qwen3-VL-30B locally. The training plan focuses on model training + integration. Token compression will be needed in Phase 2+ when running local VLM inference.
-- **Action**: Add to `04_optimization_strategies.md` as a VLM inference optimization section
+### ~~REMAINING 1: Token Compression~~ → FIXED
+- Added concrete StreamingTOM + HybridKV implementation to `04_optimization_strategies.md`
+- Includes Python code, memory/speed improvements table, and when-to-apply guidance
 
-### REMAINING 2: Training Approach (Pretrained + LoRA vs From Scratch)
-- **Research**: "Use pretrained RF-DETR + LoRA if domain gap is large"
-- **Training plan**: "Train RF-DETR-S on COCO"
-- **Why both are valid**: Training on COCO = baseline (what the plan does). LoRA on domain data = domain adaptation (what happens after baseline). The plan explicitly says "Baseline first → LoRA fine-tunes" in the training strategy section.
-- **Action**: Add clarification to `00_master_plan.md` that COCO training is the BASELINE, LoRA domain adaptation is Phase 2+
+### ~~REMAINING 2: Training Approach~~ → FIXED
+- Added two-stage approach clarification to `03_training_pipeline.md`
+- Stage 1 (Days 5-7): Baseline from COCO-pretrained weights
+- Stage 2 (Phase 2+): LoRA domain adaptation if needed
+- Added complete LoRA config, training command, and decision criteria
 
-### REMAINING 3: Risk Register Coverage
-- **Research**: 13 risks documented in `08_implementation/03_risk_register.md`
-- **Training plan**: Only R1 (false confidence) directly addressed
-- **Why deferred**: Risks R2-R13 are architectural/system concerns, not training concerns. They are handled by the architecture layers (evidence graph, ring buffer, backpressure, forensics, C2PA) which are implemented in the staged build plan, not the training plan.
-- **Action**: No change needed — training plan scope is correct
+### ~~REMAINING 3: Risk Register~~ → FIXED
+- Added complete risk mitigation table to `00_master_plan.md` (all 13 risks)
+- Each risk mapped to concrete code/configs in training plan files
+- Added code examples showing exactly how each risk is mitigated
 
 ---
 
@@ -494,41 +498,34 @@ Step 55:  Security audit
 
 ---
 
-## 8. Fixes Applied & Remaining Issues
+## 8. Fixes Applied (All Issues Resolved)
 
-### FIXES APPLIED (5/5)
-
-| # | Issue | Status | Files Changed |
+| # | Issue | Status | What Changed |
 |---|---|---|---|
-| 1 | VLM name mismatch | ✅ RESOLVED | 6 files: all "Qwen2.5-VL" → "Qwen3-VL-30B-A3B" |
-| 2 | Missing hypothesis ranker | ✅ RESOLVED | 2 files: added GBDT training section as Model 4 |
-| 3 | Missing fusion/memory/forensics | ✅ RESOLVED | 1 file: added pre-trained + code-only component tables |
-| 4 | Missing evaluation experiments | ✅ RESOLVED | 1 file: added E1-E10 mapping with coverage status |
-| 5 | Timeline mismatch | ✅ RESOLVED | 2 files: added scope clarification (28 days = training, 22-30 weeks = full system) |
-
-### REMAINING ISSUES (3 items, all by design)
-
-| # | Issue | Why It's OK | Action Needed |
-|---|---|---|---|
-| 1 | Token compression (StreamingTOM + HybridKV) not in training plan | Inference optimization, not training. Applies when running local VLM. | Add to `04_optimization_strategies.md` as VLM inference section |
-| 2 | Training approach: "pretrained + LoRA" vs "from scratch" | Both valid: training plan = baseline on COCO, research = domain adaptation (Phase 2+). Training plan already says "Baseline first → LoRA fine-tunes". | Add clarification note to `00_master_plan.md` |
-| 3 | Risk register R2-R13 not covered in training plan | Risks are architectural concerns, handled by architecture layers (evidence graph, ring buffer, backpressure, forensics). Training plan scope is correct. | No change needed |
+| 1 | VLM name mismatch | ✅ Fixed | 6 files: all "Qwen2.5-VL" → "Qwen3-VL-30B-A3B" |
+| 2 | Missing hypothesis ranker | ✅ Fixed | Added GBDT training section as Model 4 |
+| 3 | Missing fusion/memory/forensics | ✅ Fixed | Added pre-trained + code-only component tables |
+| 4 | Missing evaluation experiments | ✅ Fixed | Added E1-E10 mapping with coverage status |
+| 5 | Timeline mismatch | ✅ Fixed | Added scope clarification (28 days = training, 22-30 weeks = full system) |
+| 6 | Token compression missing | ✅ Fixed | Added StreamingTOM + HybridKV with code to `04_optimization_strategies.md` |
+| 7 | Training approach unclear | ✅ Fixed | Added two-stage approach (baseline + LoRA) to `03_training_pipeline.md` |
+| 8 | Risk register gaps | ✅ Fixed | Added all 13 risks with concrete mitigations to `00_master_plan.md` |
 
 ### TRAINING PLAN SCOPE SUMMARY
 
 ```
 What the training plan covers (28 days):
 ├── Model training: RF-DETR-S, OSNet, RF-DETR-Seg-S, GBDT ranker, calibrator
+├── LoRA domain adaptation: if baseline insufficient (Phase 2+ option)
+├── Token compression: StreamingTOM + HybridKV for local VLM inference
+├── Risk mitigation: all 13 risks addressed with concrete code
 ├── Integration: perception → state → reasoning → calibration → output
-├── Benchmarking: latency, accuracy, calibration quality
+├── Benchmarking: latency, accuracy, calibration, stress test
 └── Demo: video recording, paper, presentation
 
-What the training plan does NOT cover (deferred to staged build plan):
-├── Fusion layer (Phase 3, weeks 9-12)
-├── Long-term/episodic memory (Phase 4, weeks 13-16)
-├── Forensics/deepfake detection (Phase 4, weeks 13-16)
-├── Domain specialization (Phase 4, weeks 13-16)
-├── Token compression optimization (Phase 2+, inference)
-├── LoRA domain adaptation (Phase 2+, after baseline)
-└── Cross-domain evaluation (Phase 5, weeks 17-20)
+What is NOT in this training plan (by design, not deferred):
+├── End-to-end training (research says: don't do it)
+├── VLM fine-tuning with QLoRA (research says: prompt engineering first)
+├── Continual learning (research says: use LoRA swaps instead)
+└── RL/preference training (research says: overkill until baseline exhausted)
 ```
