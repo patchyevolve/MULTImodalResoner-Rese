@@ -45,102 +45,98 @@ multimodal_reasoner_research/
 
 ---
 
-## 2. Consistency Audit: Training Plan vs Research
+## 2. Consistency Audit: Training Plan vs Research (Current State)
 
-> **Status:** All 5 inconsistencies have been FIXED (see Section 8 below).
+> Last updated: after all fixes applied. Each check shows what was fixed and what remains.
 
 ### CHECK 1: Model Selection Matrix vs Training Plan
 
-| What Research Says (`03_models/`) | What Training Plan Says (`10_training_plan/`) | Consistent? |
+| What Research Says (`03_models/`) | What Training Plan Says (`10_training_plan/`) | Status |
 |---|---|---|
-| Detector: RF-DETR-S or M (3.5-4.4ms T4) | Training pipeline uses RF-DETR-S | ✅ Yes |
-| Pose: DETRPose-S (2.39ms A10) | Training pipeline doesn't mention pose training | ✅ OK — pose is pretrained, no training needed |
-| Tracker: ByteTrack (pretrained, no training) | Training plan doesn't train tracker | ✅ Yes |
-| VLM: Qwen3-VL-30B-A3B for local reasoning | Training plan references VLM fine-tuning with QLoRA | ⚠️ Partially — training plan says "Qwen2.5-VL" in some places, should be "Qwen3-VL-30B-A3B" |
-| Hypothesis ranker: GBDT (XGBoost/LightGBM) | Training plan doesn't cover this | ⚠️ Missing — hypothesis ranker training not in plan |
-| Calibration: post-hoc temperature scaling | Training plan includes temperature scaling | ✅ Yes |
-| Token compression: StreamingTOM + HybridKV | Training plan doesn't mention these | ⚠️ Missing — VLM optimization not in training plan |
+| Detector: RF-DETR-S or M (3.5-4.4ms T4) | Training pipeline uses RF-DETR-S | ✅ Consistent |
+| Pose: DETRPose-S (2.39ms A10) | No training needed (pretrained) | ✅ Consistent |
+| Tracker: ByteTrack (pretrained, no training) | No training needed (algorithm) | ✅ Consistent |
+| VLM: Qwen3-VL-30B-A3B for local reasoning | All files now reference Qwen3-VL-30B-A3B | ✅ **FIXED** |
+| Hypothesis ranker: GBDT (LightGBM) | Added as Model 4 in training pipeline | ✅ **FIXED** |
+| Calibration: post-hoc temperature scaling | Includes temperature + conformal | ✅ Consistent |
+| Token compression: StreamingTOM + HybridKV | Not in training plan | ⚠️ **REMAINING** — VLM optimization deferred to Phase 2+ (not needed for initial training, only for inference optimization) |
 
 ### CHECK 2: Staged Build Plan vs Training Plan
 
-| What Research Says (`08_implementation/`) | What Training Plan Says | Consistent? |
+| What Research Says (`08_implementation/`) | What Training Plan Says | Status |
 |---|---|---|
-| 10 stages, 22-30 weeks total | 28-day execution timeline | ❌ **INCONSISTENT** — staged plan says 5-7 months, training plan says 28 days |
-| Stage 1: perception backbone (2-3 weeks) | Phase 1: train detector (days 1-7) | ⚠️ Different scope — staged plan includes integration, training plan is just model training |
-| Stage 6: deep reasoning (3-4 weeks) | Phase 4: VLM fine-tuning | ⚠️ Different scope |
-| Total compute: 500-1,000 RTX 4090 hours | Training plan: ~$5-15 API costs | ⚠️ Different scope — staged plan includes ALL development, training plan is just model training |
+| 10 stages, 22-30 weeks total | 28-day execution timeline | ✅ **FIXED** — scope clarified: training plan = first 4 weeks of staged build plan |
+| Stage 1: perception backbone (2-3 weeks) | Phase 1: train detector (days 1-7) | ✅ Consistent (different granularity) |
+| Stage 6: deep reasoning (3-4 weeks) | Phase 3: VLM integration (days 14-21) | ✅ Consistent (different granularity) |
+| Total compute: 500-1,000 RTX 4090 hours | Training plan: ~$5-15 API costs | ✅ Consistent (training plan = model training only, staged plan = full development) |
 
 ### CHECK 3: 30 FPS Budget vs Training Plan
 
-| What Research Says (`05_realtime/`) | What Training Plan Says | Consistent? |
+| What Research Says (`05_realtime/`) | What Training Plan Says | Status |
 |---|---|---|
 | Critical path: 8-20ms p50 | Critical path: 8-12ms | ✅ Consistent (training plan is more specific) |
-| Multi-rate: 30 FPS tracking, 5-10 Hz fast reasoning, 1-5 Hz deep | Same multi-rate design | ✅ Yes |
-| RTX 4090 hardware decode >100 streams | Training plan assumes RTX 4090/5070 Ti | ✅ Yes |
+| Multi-rate: 30 FPS tracking, 5-10 Hz fast reasoning, 1-5 Hz deep | Same multi-rate design | ✅ Consistent |
+| RTX 4090 hardware decode >100 streams | Training plan assumes RTX 4090/5070 Ti | ✅ Consistent |
 
 ### CHECK 4: Training Strategy vs Training Plan
 
-| What Research Says (`01_foundations/18_training_strategy.md`) | What Training Plan Says | Consistent? |
+| What Research Says (`01_foundations/18_training_strategy.md`) | What Training Plan Says | Status |
 |---|---|---|
-| Compose pretrained modules, don't train end-to-end | Training plan trains 4 models independently | ✅ Yes — matches modular strategy |
-| Detector: pretrained RF-DETR, LoRA if needed | Trains RF-DETR-S from scratch on COCO | ⚠️ Slight mismatch — research says "pretrained + LoRA", training plan says "train from scratch" |
-| Hypothesis ranker: GBDT, <1 GPU day | Not in training plan | ❌ Missing |
-| Confidence calibration: post-hoc, 0 training | Training plan includes calibration training | ⚠️ Calibration is post-hoc (no backbone retraining), but training plan describes training a calibration model |
-| VLM: prompt engineering first, QLoRA if needed | Training plan does QLoRA fine-tuning | ✅ Consistent — training plan is the "if needed" path |
+| Compose pretrained modules, don't train end-to-end | Training plan trains 5 models independently | ✅ Consistent — matches modular strategy |
+| Detector: pretrained RF-DETR, LoRA if needed | Trains RF-DETR-S on COCO | ⚠️ **REMAINING** — research says "pretrained + LoRA", training plan says "train from scratch". Both valid: training plan = baseline, research = domain adaptation (Phase 2+) |
+| Hypothesis ranker: GBDT, <1 GPU day | Added as Model 4, CPU only | ✅ **FIXED** |
+| Confidence calibration: post-hoc, 0 training | Training plan includes calibration training | ✅ Consistent — post-hoc calibration on validation set (no backbone retraining) |
+| VLM: prompt engineering first, QLoRA if needed | Training plan uses API first, local optional | ✅ Consistent |
 | Data: 50-200K labeled samples | Training plan uses COCO (118K), MOT17, Market1501, SoccerNet | ✅ Consistent |
-| Compute: 500-1,000 RTX 4090 hours | Training plan: ~$5-15 API costs | ⚠️ Different scope — research includes ALL development |
+| Compute: 500-1,000 RTX 4090 hours | Training plan: ~$5-15 API costs | ✅ Consistent (different scope) |
 
 ### CHECK 5: Risk Register vs Training Plan
 
-| Risk | Training Plan Coverage | Consistent? |
+| Risk | Training Plan Coverage | Status |
 |---|---|---|
-| R1: False confidence | Calibration pipeline covers this | ✅ Yes |
-| R2: Temporal hallucination | Not addressed in training | ⚠️ Not covered |
-| R3: Compounding state error | Not addressed in training | ⚠️ Not covered |
-| R4: Scheduler starvation | Not addressed in training | ⚠️ Not covered |
-| R6: Synthetic media brittleness | Not addressed in training | ⚠️ Not covered |
-| R13: EU AI Act compliance | Not addressed in training | ⚠️ Not covered |
+| R1: False confidence | Calibration pipeline (ECE < 0.05 target) | ✅ Covered |
+| R2: Temporal hallucination | Not in training scope — addressed by evidence graph + fast verifier in architecture | ⚠️ **DEFERRED** — architecture handles this, training plan doesn't need to |
+| R3: Compounding state error | Not in training scope — addressed by ring buffer + periodic re-detection in architecture | ⚠️ **DEFERRED** — architecture handles this |
+| R4: Scheduler starvation | Not in training scope — addressed by backpressure + queue management in architecture | ⚠️ **DEFERRED** — architecture handles this |
+| R6: Synthetic media brittleness | Not in training scope — forensics deferred to Phase 4 (weeks 13-16) | ⚠️ **DEFERRED** — covered in staged build plan, not training plan |
+| R13: EU AI Act compliance | Not in training scope — addressed by C2PA + claim output in architecture | ⚠️ **DEFERRED** — architecture handles this |
 
 ### CHECK 6: Evaluation Experiments vs Training Plan
 
-| Experiment | Training Plan Coverage | Consistent? |
+| Experiment | Training Plan Coverage | Status |
 |---|---|---|
-| E1: Direct observation | Benchmarking plan includes detection mAP | ✅ Yes |
-| E2: Occluded-state reconstruction | Not in training plan | ❌ Missing |
-| E3: Temporal event inference | Not in training plan | ❌ Missing |
-| E4: Hypothesis competition | Not in training plan | ❌ Missing |
-| E5: Contradictory modalities | Not in training plan | ❌ Missing |
-| E6: Synthetic media robustness | Not in training plan | ❌ Missing |
-| E7: Prediction-driven scheduling | Not in training plan | ❌ Missing |
-| E8: 30 FPS stress test | Benchmarking plan includes latency | ✅ Yes |
-| E9: Long-form memory | Not in training plan | ❌ Missing |
-| E10: Distribution shift | Not in training plan | ❌ Missing |
+| E1: Direct observation | RF-DETR-S benchmarking (mAP ≥ 53.0) | ✅ Covered |
+| E2: Occluded-state reconstruction | Not in training scope — requires pose + temporal models | ⚠️ **DEFERRED** to Phase 2+ (weeks 5-8) |
+| E3: Temporal event inference | Event detection + fast verifier integration | ✅ Covered (Phase 3, days 14-21) |
+| E4: Hypothesis competition | Hypothesis engine + GBDT ranker training | ✅ **FIXED** (added as Model 4) |
+| E5: Contradictory modalities | Not in training scope — requires fusion layer | ⚠️ **DEFERRED** to Phase 3+ (weeks 9-12) |
+| E6: Synthetic media robustness | Not in training scope — forensics deferred | ⚠️ **DEFERRED** to Phase 4 (weeks 13-16) |
+| E7: Prediction-driven scheduling | Scheduler integration in Phase 3 | ✅ Covered (Phase 3, days 18-20) |
+| E8: 30 FPS stress test | Benchmarking plan includes latency + throughput | ✅ Covered (Phase 4, days 21-26) |
+| E9: Long-term memory | Not in training scope — requires SQLite + FAISS | ⚠️ **DEFERRED** to Phase 4+ (weeks 13-16) |
+| E10: Distribution shift | Not in training scope — requires cross-domain testing | ⚠️ **DEFERRED** to Phase 5 (weeks 17-20) |
 
 ---
 
-## 3. Key Inconsistencies Found
+## 3. Remaining Issues (Not Yet Fixed)
 
-### INCONSISTENCY 1: Timeline Mismatch
-- **Staged build plan** (`08_implementation/`): 22-30 weeks (5-7 months) for full system
-- **Training plan** (`10_training_plan/`): 28 days for training + infrastructure
-- **Reality**: The training plan covers ONLY model training. The staged build plan covers the ENTIRE system development. These are different scopes. The training plan timeline is a SUBSET of the staged build plan.
+### REMAINING 1: Token Compression (StreamingTOM + HybridKV)
+- **Research**: Token compression reduces VLM KV cache by 15.7× (StreamingTOM) and memory by 7.9× (HybridKV)
+- **Training plan**: Not mentioned
+- **Why deferred**: Token compression is an inference optimization, not a training concern. It applies when running Qwen3-VL-30B locally. The training plan focuses on model training + integration. Token compression will be needed in Phase 2+ when running local VLM inference.
+- **Action**: Add to `04_optimization_strategies.md` as a VLM inference optimization section
 
-### INCONSISTENCY 2: VLM Name Mismatch
-- **Model selection matrix**: "Qwen3-VL-30B-A3B" (latest, MoE architecture)
-- **Training plan**: References "Qwen2.5-VL" in some places
-- **Fix**: Training plan should consistently reference "Qwen3-VL-30B-A3B"
-
-### INCONSISTENCY 3: Missing Components
-- **Hypothesis ranker training** (GBDT) — not in training plan
-- **Fusion layer** — not in training plan
-- **Memory layer** — not in training plan
-- **Forensics** — not in training plan
-- **Evaluation experiments** (E1-E10) — not in training plan
-
-### INCONSISTENCY 4: Training Approach
+### REMAINING 2: Training Approach (Pretrained + LoRA vs From Scratch)
 - **Research**: "Use pretrained RF-DETR + LoRA if domain gap is large"
-- **Training plan**: "Train RF-DETR-S from scratch on COCO"
-- **Reality**: Training from scratch on COCO is valid for getting a baseline, but the research suggests pretrained + LoRA for domain adaptation. Both are valid, but the training plan should clarify this is the BASELINE training, not the domain adaptation.
+- **Training plan**: "Train RF-DETR-S on COCO"
+- **Why both are valid**: Training on COCO = baseline (what the plan does). LoRA on domain data = domain adaptation (what happens after baseline). The plan explicitly says "Baseline first → LoRA fine-tunes" in the training strategy section.
+- **Action**: Add clarification to `00_master_plan.md` that COCO training is the BASELINE, LoRA domain adaptation is Phase 2+
+
+### REMAINING 3: Risk Register Coverage
+- **Research**: 13 risks documented in `08_implementation/03_risk_register.md`
+- **Training plan**: Only R1 (false confidence) directly addressed
+- **Why deferred**: Risks R2-R13 are architectural/system concerns, not training concerns. They are handled by the architecture layers (evidence graph, ring buffer, backpressure, forensics, C2PA) which are implemented in the staged build plan, not the training plan.
+- **Action**: No change needed — training plan scope is correct
 
 ---
 
@@ -498,36 +494,41 @@ Step 55:  Security audit
 
 ---
 
-## 8. Fixes Applied (All 5 Inconsistencies Resolved)
+## 8. Fixes Applied & Remaining Issues
 
-### FIX 1: VLM Name Mismatch → RESOLVED
-- `00_master_plan.md`: "Qwen2.5-VL-7B" → "Qwen3-VL-30B-A3B FP8"
-- `01_pre_training_preparation.md`: "Qwen2.5-VL-7B" → "Qwen3-VL-30B-A3B" (2 locations)
-- `04_optimization_strategies.md`: "Qwen/Qwen2.5-VL-32B-Instruct" → "Qwen/Qwen3-VL-30B-A3B"
-- `05_inference_integration.md`: "Qwen2.5-VL-7B" + "Qwen2VLForConditionalGeneration" → "Qwen3-VL-30B-A3B" + "Qwen3VLForConditionalGeneration"
-- `08_infrastructure_development.md`: "qwen2.5-vl-7b" → "qwen3-vl-30b-a3b"
+### FIXES APPLIED (5/5)
 
-### FIX 2: Missing Hypothesis Ranker → RESOLVED
-- Added complete GBDT Hypothesis Ranker training section to `03_training_pipeline.md` (Model 4)
-- Added training data preparation scripts
-- Added expected performance targets (NDCG@3 ≥ 0.85)
-- Updated training order to include ranker on Day 13
-- Updated model export summary to include `models/hypothesis_ranker/ranker.json`
-- Updated Phase 2 exit criteria and milestone summary
+| # | Issue | Status | Files Changed |
+|---|---|---|---|
+| 1 | VLM name mismatch | ✅ RESOLVED | 6 files: all "Qwen2.5-VL" → "Qwen3-VL-30B-A3B" |
+| 2 | Missing hypothesis ranker | ✅ RESOLVED | 2 files: added GBDT training section as Model 4 |
+| 3 | Missing fusion/memory/forensics | ✅ RESOLVED | 1 file: added pre-trained + code-only component tables |
+| 4 | Missing evaluation experiments | ✅ RESOLVED | 1 file: added E1-E10 mapping with coverage status |
+| 5 | Timeline mismatch | ✅ RESOLVED | 2 files: added scope clarification (28 days = training, 22-30 weeks = full system) |
 
-### FIX 3: Missing Fusion/Memory/Forensics Coverage → RESOLVED
-- Added "Components That Use Pre-Trained Weights" table (7 components with architecture refs)
-- Added "Components That Are Code-Only (No Training)" table (25 components with architecture refs)
-- Each component mapped to its architecture file in `02_architecture/`
+### REMAINING ISSUES (3 items, all by design)
 
-### FIX 4: Missing Evaluation Experiments → RESOLVED
-- Added "Evaluation Experiments Mapping" section to `00_master_plan.md`
-- Mapped all 10 experiments (E1-E10) to training plan coverage
-- Identified which experiments are covered (5/10) vs deferred (5/10)
-- Added targets from `07_evaluation/01_experiment_matrix.md`
+| # | Issue | Why It's OK | Action Needed |
+|---|---|---|---|
+| 1 | Token compression (StreamingTOM + HybridKV) not in training plan | Inference optimization, not training. Applies when running local VLM. | Add to `04_optimization_strategies.md` as VLM inference section |
+| 2 | Training approach: "pretrained + LoRA" vs "from scratch" | Both valid: training plan = baseline on COCO, research = domain adaptation (Phase 2+). Training plan already says "Baseline first → LoRA fine-tunes". | Add clarification note to `00_master_plan.md` |
+| 3 | Risk register R2-R13 not covered in training plan | Risks are architectural concerns, handled by architecture layers (evidence graph, ring buffer, backpressure, forensics). Training plan scope is correct. | No change needed |
 
-### FIX 5: Timeline Inconsistency → RESOLVED
-- Added scope clarification to `00_master_plan.md`:
-  - This plan = 28 days (model training + integration + demo)
-  - Full system = 22-30 weeks (from `08_implementation/01_staged_build_plan.md`)
-  - This plan is the FIRST 4 weeks of the larger effort
+### TRAINING PLAN SCOPE SUMMARY
+
+```
+What the training plan covers (28 days):
+├── Model training: RF-DETR-S, OSNet, RF-DETR-Seg-S, GBDT ranker, calibrator
+├── Integration: perception → state → reasoning → calibration → output
+├── Benchmarking: latency, accuracy, calibration quality
+└── Demo: video recording, paper, presentation
+
+What the training plan does NOT cover (deferred to staged build plan):
+├── Fusion layer (Phase 3, weeks 9-12)
+├── Long-term/episodic memory (Phase 4, weeks 13-16)
+├── Forensics/deepfake detection (Phase 4, weeks 13-16)
+├── Domain specialization (Phase 4, weeks 13-16)
+├── Token compression optimization (Phase 2+, inference)
+├── LoRA domain adaptation (Phase 2+, after baseline)
+└── Cross-domain evaluation (Phase 5, weeks 17-20)
+```

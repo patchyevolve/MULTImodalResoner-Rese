@@ -348,7 +348,38 @@ After profiling, check:
 
 ---
 
-## 11. Optimization Results Target
+## 11. VLM Token Compression (Phase 2+ Optimization)
+
+### Why This Matters
+
+Running Qwen3-VL-30B-A3B locally requires managing KV cache memory. Token compression techniques reduce memory usage and improve throughput without retraining.
+
+### StreamingTOM (Training-Free)
+
+- Reduces KV cache by **15.7×** with 2× TTFT speedup
+- 63.8% accuracy on VideoMME (competitive with full-context)
+- No training required — apply at inference time
+- Reference: `03_models/01_model_selection_matrix.md`
+
+### HybridKV (Training-Free)
+
+- Reduces memory by **7.9×** with 1.52× decode speedup
+- Near-100% accuracy retention on 7B models
+- No training required — apply at inference time
+- Reference: `03_models/01_model_selection_matrix.md`
+
+### Implementation (After VLM Integration)
+
+```python
+# Apply after VLM is working locally
+# StreamingTOM for KV cache compression
+# HybridKV for decode speedup
+# Both are inference-time optimizations, not training optimizations
+```
+
+---
+
+## 12. Optimization Results Target
 
 | Component | Baseline | After Optimization | Target |
 |---|---|---|---|

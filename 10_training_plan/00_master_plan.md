@@ -23,7 +23,7 @@ We are NOT training everything from scratch. We are:
 
 | Component | Strategy | Why |
 |---|---|---|
-| **Object Detection** | Fine-tune RF-DETR-S on custom data | Pre-trained on COCO, fine-tune for our domain |
+| **Object Detection** | Fine-tune RF-DETR-S on COCO | Baseline training on COCO. If domain gap is large (sports), LoRA fine-tune on domain data in Phase 2+ (`01_foundations/18_training_strategy.md`) |
 | **Pose Estimation** | Use pre-trained DETRPose-S, no fine-tuning | Already 67.0 AP on COCO, sufficient for our needs |
 | **Object Tracking** | Use ByteTrack as-is, tune parameters | Algorithm-based, no learning needed |
 | **Segmentation** | Use RF-DETR-Seg-S pre-trained | May fine-tune if time permits |
