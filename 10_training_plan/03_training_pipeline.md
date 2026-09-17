@@ -10,6 +10,7 @@
 Day 5-7:  RF-DETR-S (detection)        ← Most critical, everything depends on this
 Day 8-9:  OSNet (Re-ID)                 ← Quick, 1-2 days
 Day 10-12: RF-DETR-Seg-S (segmentation) ← If time permits, skip if behind
+Day 13:   GBDT Hypothesis Ranker        ← CPU only, 2-4 hours
 Day 13:   Calibrator training           ← CPU only, 2-4 hours
 Day 13+:  Integration + benchmarking
 ```
@@ -306,7 +307,139 @@ training:
 
 ---
 
-## Model 4: Calibrator Training (CPU Only)
+## Model 4: GBDT Hypothesis Ranker (CPU Only)
+
+### Why Fourth
+
+The hypothesis ranker decides which hypotheses to send to the expensive VLM reasoner. A GBDT (Gradient Boosted Decision Tree) model is fast to train, fast to inference, and gives calibrated rankings. This is the "intelligence" that decides what's worth reasoning about.
+
+### Architecture Reference
+
+`02_architecture/05_reasoning/01_hypothesis_engine.md` — the ranker sits inside the hypothesis engine, scoring candidate hypotheses before verification.
+
+### What We're Training
+
+A LightGBM ranking model that takes structured features from the evidence graph and outputs a relevance score for each hypothesis. Features include:
+- Prediction error (how far the hypothesis deviates from observed state)
+- Evidence count (how many observations support/refute)
+- Temporal consistency (does the hypothesis agree with recent history)
+- Cross-modal agreement (do vision and audio agree)
+- Entity count and occlusion level
+- R-score from event detector
+
+### Training Configuration
+
+```python
+# scripts/train_hypothesis_ranker.py
+
+"""
+Hypothesis Ranker Training:
+1. Generate labeled (event, hypothesis, correct_rank) triples
+2. Extract structured features from evidence graph
+3. Train LightGBM ranker with LambdaMART objective
+4. Export to JSON for inference
+"""
+
+import lightgbm as lgb
+import numpy as np
+import json
+
+class HypothesisRanker:
+    """GBDT ranker for hypothesis scoring."""
+
+    FEATURE_NAMES = [
+        "prediction_error",
+        "evidence_count_for",
+        "evidence_count_against",
+        "temporal_consistency",
+        "cross_modal_agreement",
+        "entity_count",
+        "occlusion_level",
+        "r_score",
+        "hypothesis_age_ms",
+        "similar_past_episodes_count",
+    ]
+
+    def __init__(self):
+        self.model = None
+
+    def train(self, X_train, y_train, X_val, y_val):
+        """Train LambdaMART ranker."""
+        train_data = lgb.Dataset(X_train, label=y_train)
+        val_data = lgb.Dataset(X_val, label=y_val, reference=train_data)
+
+        params = {
+            "objective": "lambdarank",
+            "metric": "ndcg",
+            "eval_at": [3, 5, 10],
+            "num_leaves": 31,
+            "learning_rate": 0.05,
+            "feature_fraction": 0.8,
+            "bagging_fraction": 0.8,
+            "bagging_freq": 5,
+            "verbose": -1,
+        }
+
+        self.model = lgb.train(
+            params,
+            train_data,
+            num_boost_round=200,
+            valid_sets=[val_data],
+            callbacks=[lgb.log_evaluation(50)],
+        )
+
+        return self.model
+
+    def predict(self, features):
+        """Score hypotheses."""
+        return self.model.predict(features)
+
+    def export(self, path):
+        """Export model to JSON."""
+        self.model.dump_model(path)
+
+    def load(self, path):
+        """Load model from JSON."""
+        self.model = lgb.Booster(model_file=path)
+```
+
+### Training Data Preparation
+
+```bash
+# Step 1: Generate labeled data from validation set
+# Run the pipeline on validation videos, collect (event, hypotheses, ground_truth) triples
+python scripts/generate_ranker_data.py \
+    --data data/splits/val_videos.json \
+    --output experiments/ranker/labeled_data.json \
+    --min-hypotheses 3 \
+    --max-hypotheses 10
+
+# Step 2: Extract features
+python scripts/extract_ranker_features.py \
+    --labeled-data experiments/ranker/labeled_data.json \
+    --output experiments/ranker/features.npz
+
+# Step 3: Train ranker
+python scripts/train_hypothesis_ranker.py \
+    --features experiments/ranker/features.npz \
+    --output models/hypothesis_ranker/ranker.json \
+    --eval-split 0.2
+```
+
+### Expected Performance
+
+| Metric | Target | Notes |
+|---|---|---|
+| NDCG@3 | ≥ 0.85 | Top-3 hypotheses contain correct one |
+| NDCG@5 | ≥ 0.80 | Top-5 ranking quality |
+| Inference latency | < 1ms | Single prediction on CPU |
+| Model size | < 1MB | Lightweight for deployment |
+
+**Target: NDCG@3 ≥ 0.85, inference < 1ms**
+
+---
+
+## Model 5: Calibrator Training (CPU Only)
 
 ### Why Last
 
@@ -522,6 +655,9 @@ models/
 │   ├── rf_detr_s_fp16.engine        # TensorRT FP16
 │   ├── rf_detr_s_int8.engine        # TensorRT INT8 (if quantized)
 │   └── rf_detr_seg_s_fp16.engine
+│
+├── hypothesis_ranker/
+│   └── ranker.json                  # LightGBM ranker (GBDT)
 │
 └── calibrator/
     ├── temperature.json

@@ -247,12 +247,12 @@ print('Whisper large-v3 loaded successfully')
 ### 4.8 VLM (Reasoning)
 
 ```bash
-# Option A: Qwen2.5-VL-7B (fits in 16GB VRAM for inference)
+# Option A: Qwen3-VL-30B-A3B FP8 (fits in 24GB RTX 4090 for inference, 90 tok/s)
 # Option B: API access to Qwen3-VL-30B or GPT-4.1
 
 # For local:
 pip install qwen-vl-utils
-# Download Qwen2.5-VL-7B-Instruct from HuggingFace
+# Download Qwen3-VL-30B-A3B from HuggingFace
 
 # For API:
 # Set up API keys as environment variables

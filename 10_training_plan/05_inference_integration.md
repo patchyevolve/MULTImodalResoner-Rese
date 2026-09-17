@@ -366,9 +366,9 @@ class VLMReasoner:
             self.client = openai.OpenAI()
             self.model = "gpt-4o"  # or gemini
         else:
-            # Local model (Qwen2.5-VL-7B)
-            from transformers import Qwen2VLForConditionalGeneration
-            self.model = Qwen2VLForConditionalGeneration.from_pretrained(
+            # Local model (Qwen3-VL-30B-A3B)
+            from transformers import Qwen3VLForConditionalGeneration
+            self.model = Qwen3VLForConditionalGeneration.from_pretrained(
                 config.vlm_model_path,
                 torch_dtype="auto",
                 device_map="auto",

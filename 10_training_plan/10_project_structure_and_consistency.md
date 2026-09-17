@@ -47,6 +47,8 @@ multimodal_reasoner_research/
 
 ## 2. Consistency Audit: Training Plan vs Research
 
+> **Status:** All 5 inconsistencies have been FIXED (see Section 8 below).
+
 ### CHECK 1: Model Selection Matrix vs Training Plan
 
 | What Research Says (`03_models/`) | What Training Plan Says (`10_training_plan/`) | Consistent? |
@@ -489,8 +491,43 @@ Step 55:  Security audit
 
 ## 7. What to Do Next
 
-1. **Fix inconsistencies in training plan** — update VLM name, add missing components
-2. **Start coding Phase 1** — begin with `src/ingestor/file_ingestor.py`
-3. **Set up project structure** — create all directories and `__init__.py` files
-4. **Download models** — get RF-DETR-S, DETRPose-S, ByteTrack configs
-5. **Write first test** — verify file_ingestor reads video correctly
+1. **Start coding Phase 1** — begin with `src/ingestor/file_ingestor.py`
+2. **Set up project structure** — create all directories and `__init__.py` files
+3. **Download models** — get RF-DETR-S, DETRPose-S, ByteTrack configs
+4. **Write first test** — verify file_ingestor reads video correctly
+
+---
+
+## 8. Fixes Applied (All 5 Inconsistencies Resolved)
+
+### FIX 1: VLM Name Mismatch → RESOLVED
+- `00_master_plan.md`: "Qwen2.5-VL-7B" → "Qwen3-VL-30B-A3B FP8"
+- `01_pre_training_preparation.md`: "Qwen2.5-VL-7B" → "Qwen3-VL-30B-A3B" (2 locations)
+- `04_optimization_strategies.md`: "Qwen/Qwen2.5-VL-32B-Instruct" → "Qwen/Qwen3-VL-30B-A3B"
+- `05_inference_integration.md`: "Qwen2.5-VL-7B" + "Qwen2VLForConditionalGeneration" → "Qwen3-VL-30B-A3B" + "Qwen3VLForConditionalGeneration"
+- `08_infrastructure_development.md`: "qwen2.5-vl-7b" → "qwen3-vl-30b-a3b"
+
+### FIX 2: Missing Hypothesis Ranker → RESOLVED
+- Added complete GBDT Hypothesis Ranker training section to `03_training_pipeline.md` (Model 4)
+- Added training data preparation scripts
+- Added expected performance targets (NDCG@3 ≥ 0.85)
+- Updated training order to include ranker on Day 13
+- Updated model export summary to include `models/hypothesis_ranker/ranker.json`
+- Updated Phase 2 exit criteria and milestone summary
+
+### FIX 3: Missing Fusion/Memory/Forensics Coverage → RESOLVED
+- Added "Components That Use Pre-Trained Weights" table (7 components with architecture refs)
+- Added "Components That Are Code-Only (No Training)" table (25 components with architecture refs)
+- Each component mapped to its architecture file in `02_architecture/`
+
+### FIX 4: Missing Evaluation Experiments → RESOLVED
+- Added "Evaluation Experiments Mapping" section to `00_master_plan.md`
+- Mapped all 10 experiments (E1-E10) to training plan coverage
+- Identified which experiments are covered (5/10) vs deferred (5/10)
+- Added targets from `07_evaluation/01_experiment_matrix.md`
+
+### FIX 5: Timeline Inconsistency → RESOLVED
+- Added scope clarification to `00_master_plan.md`:
+  - This plan = 28 days (model training + integration + demo)
+  - Full system = 22-30 weeks (from `08_implementation/01_staged_build_plan.md`)
+  - This plan is the FIRST 4 weeks of the larger effort

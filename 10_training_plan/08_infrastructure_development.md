@@ -628,7 +628,7 @@ reasoning:
   hypothesis_max: 10
   fast_verify_timeout_ms: 5
   vlm_mode: "api"              # api | local
-  vlm_model: "gpt-4o"         # or qwen2.5-vl-7b
+  vlm_model: "gpt-4o"         # or qwen3-vl-30b-a3b (local, 90 tok/s on RTX 4090D)
   vlm_api_key_env: "OPENAI_API_KEY"
   vlm_queue_depth: 4
   vlm_timeout_ms: 5000

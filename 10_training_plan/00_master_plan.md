@@ -38,20 +38,65 @@ We are NOT training everything from scratch. We are:
 
 ### Models We Actually Fine-Tune (Sequential, One at a Time)
 
-| Priority | Model | Dataset | Duration | GPU |
-|---|---|---|---|---|
-| 1st | RF-DETR-S (detection) | COCO + custom domain | 2-3 days | Full GPU |
-| 2nd | OSNet (Re-ID) | Market1501 + custom | 1-2 days | Full GPU |
-| 3rd | RF-DETR-Seg-S (segmentation) | COCO + custom | 2-3 days | Full GPU |
-| 4th | Calibrator (temperature + conformal) | Held-out validation | 2-4 hours | CPU |
+| Priority | Model | Dataset | Duration | GPU | Architecture Ref |
+|---|---|---|---|---|---|
+| 1st | RF-DETR-S (detection) | COCO + custom domain | 2-3 days | Full GPU | `02_architecture/01_perception/01_detection.md` |
+| 2nd | OSNet (Re-ID) | Market1501 + custom | 1-2 days | Full GPU | `02_architecture/01_perception/06_reid.md` |
+| 3rd | RF-DETR-Seg-S (segmentation) | COCO + custom | 2-3 days | Full GPU | `02_architecture/01_perception/04_segmentation.md` |
+| 4th | GBDT Hypothesis Ranker | Labeled event-hypothesis pairs | 2-4 hours | CPU | `02_architecture/05_reasoning/01_hypothesis_engine.md` |
+| 5th | Calibrator (temperature + conformal) | Held-out validation | 2-4 hours | CPU | `02_architecture/06_calibration/03_temperature_scaling.md` |
 
-**Total training time: 7-9 days** (sequential on one GPU)
+**Total training time: 7-9 days** (sequential on one GPU for GPU models, CPU models same day)
 
 Everything else uses pre-trained weights or classical algorithms.
+
+### Components That Use Pre-Trained Weights (No Fine-Tuning)
+
+| Component | Model | Source | Architecture Ref |
+|---|---|---|---|
+| Pose Estimation | DETRPose-S | Pre-trained, 67.0 AP COCO | `02_architecture/01_perception/02_pose_estimation.md` |
+| Object Tracking | ByteTrack | Algorithm, no weights | `02_architecture/01_perception/03_tracking.md` |
+| OCR | PaddleOCR v4 | Pre-trained, 3% WER | `02_architecture/01_perception/05_ocr.md` |
+| Audio | Whisper-large-v3 | Pre-trained, 3% WER | `02_architecture/01_perception/07_audio_features.md` |
+| Camera Motion | ORB+RANSAC | Classical CV | `02_architecture/01_perception/08_camera_motion.md` |
+| Deepfake Detection | CLIP+EVA-02+SRM ensemble | Pre-trained | `02_architecture/08_forensics/01_deepfake_detection.md` |
+| C2PA/SynthID | Existing tools | Integration only | `02_architecture/08_forensics/02_provenance_c2pa.md` |
+
+### Components That Are Code-Only (No Training)
+
+| Component | Strategy | Architecture Ref |
+|---|---|---|
+| Multi-Modal Fusion | Weighted combination, rule-based | `02_architecture/02_fusion/01_multimodal_fusion.md` |
+| Temporal Fusion | Exponential moving average | `02_architecture/02_fusion/02_temporal_fusion.md` |
+| Cross-Modal Alignment | Timestamp matching | `02_architecture/02_fusion/03_cross_modal_alignment.md` |
+| World State | Ring buffer, typed store | `02_architecture/03_state/01_world_state.md` |
+| Entity Tracker | Lifecycle state machine | `02_architecture/03_state/02_entity_tracker.md` |
+| Trajectory Model | Kalman filter | `02_architecture/03_state/03_trajectory_model.md` |
+| Event Detection | Rule-based triggers | `02_architecture/03_state/04_event_detection.md` |
+| Short-Term Memory | Ring buffer | `02_architecture/04_memory/01_short_term.md` |
+| Working Memory | Top-K active hypotheses | `02_architecture/04_memory/02_working_memory.md` |
+| Long-Term Memory | SQLite + vector search | `02_architecture/04_memory/03_long_term.md` |
+| Episodic Memory | FAISS event store | `02_architecture/04_memory/04_episodic_memory.md` |
+| Fast Verifier | Rule-based checks | `02_architecture/05_reasoning/02_fast_verifier.md` |
+| VLM Reasoner | Prompt engineering + few-shot | `02_architecture/05_reasoning/03_deep_vlm_reasoner.md` |
+| Evidence Graph | Graph construction | `02_architecture/05_reasoning/04_evidence_graph.md` |
+| Prediction Model | Kalman + learned residual | `02_architecture/05_reasoning/05_prediction_model.md` |
+| Confidence Decomposition | Weighted combination | `02_architecture/06_calibration/01_confidence_decomposition.md` |
+| Conformal Prediction | Nonconformity scores | `02_architecture/06_calibration/02_conformal_prediction.md` |
+| Claim Output | JSON assembly | `02_architecture/06_calibration/04_claim_output.md` |
+| Scheduler | Priority queue | `02_architecture/07_scheduler/01_multi_rate_scheduler.md` |
+| Queue Manager | Bounded deque | `02_architecture/07_scheduler/02_queue_management.md` |
+| Backpressure | Threshold triggers | `02_architecture/07_scheduler/03_backpressure.md` |
+| GPU Distributor | CUDA stream assignment | `02_architecture/07_scheduler/04_gpu_work_distribution.md` |
+| Sports Reasoning | Domain rules + trajectories | `02_architecture/09_domains/01_sports_reasoning.md` |
+| General Multimedia | Domain-agnostic fallback | `02_architecture/09_domains/02_general_multimedia.md` |
+| Synthetic Media | Detection + provenance | `02_architecture/09_domains/03_synthetic_media.md` |
 
 ---
 
 ## Execution Phases
+
+> **Important scope clarification:** This training plan covers model training + integration + demo (28 days). The full system development (including all 41 architecture components, domains, forensics, production deployment) follows the staged build plan in `08_implementation/01_staged_build_plan.md` (22-30 weeks). This plan is the FIRST 4 weeks of that larger effort.
 
 ### Phase 0: Pre-Training Preparation (Days 1-3)
 **Goal:** Environment ready, data collected, baseline established
@@ -159,7 +204,7 @@ Training Phase:
 Inference Phase:
   - Perception pipeline: ~3GB
   - VLM: API fallback (GPT-4.1 / Gemini Flash)
-  - OR local Qwen2.5-VL-7B (fits in remaining 13GB)
+  - OR local Qwen3-VL-30B-A3B FP8 (fits in remaining 13GB if 4090D 48GB, else API fallback)
 ```
 
 ---
@@ -196,6 +241,28 @@ This is not "make it work." This is "make it impressive."
 - [ ] GPU utilization during operation
 - [ ] Memory usage over time (no leaks)
 - [ ] Throughput (frames per second sustained)
+
+---
+
+## Evaluation Experiments Mapping
+
+> How this training plan maps to the formal experiment matrix in `07_evaluation/01_experiment_matrix.md`.
+
+| Experiment | Description | Training Plan Coverage | Target |
+|---|---|---|---|
+| **E1** | Direct observation (perception accuracy) | RF-DETR-S training + benchmarking | Within 2% of COCO baselines |
+| **E2** | Occluded-state reconstruction | Not in this plan (Phase 2+ from `08_implementation/`) | <40% degradation at 50% occlusion |
+| **E3** | Temporal event inference | Event detection + fast verifier | Top-3 recall ≥85% at 2s horizon |
+| **E4** | Hypothesis competition | Hypothesis engine + GBDT ranker | recall@3 ≥85% for correct hypothesis |
+| **E5** | Contradictory modalities | Fusion layer + confidence decomposition | Audio-contradiction claims downweighted |
+| **E6** | Synthetic media robustness | Not in this plan (Phase 4 from `08_implementation/`) | Inconclusive on >80% attacked samples |
+| **E7** | Prediction-driven scheduling | Scheduler integration | Event-triggered ≥15% better than fixed-rate |
+| **E8** | 30 FPS stress test | Pipeline integration + benchmarking | 30 FPS sustained, p99 <33ms |
+| **E9** | Long-term memory | Not in this plan (Phase 2+ from `08_implementation/`) | State continuity across 30+ min sessions |
+| **E10** | Distribution shift | Not in this plan (Phase 5 from `08_implementation/`) | <10pp degradation across 3+ domain shifts |
+
+**Experiments covered in this plan:** E1, E3, E4, E7, E8 (5 of 10)
+**Experiments deferred to later phases:** E2, E5, E6, E9, E10 (5 of 10)
 
 ---
 

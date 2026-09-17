@@ -294,7 +294,7 @@ Splits model across multiple GPUs for larger models or higher throughput.
 from vllm import LLM
 
 llm = LLM(
-    model="Qwen/Qwen2.5-VL-32B-Instruct",
+    model="Qwen/Qwen3-VL-30B-A3B",
     tensor_parallel_size=2,  # Split across 2 GPUs
     dtype="float16",
     gpu_memory_utilization=0.9,

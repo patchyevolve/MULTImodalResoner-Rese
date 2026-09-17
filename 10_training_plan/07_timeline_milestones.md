@@ -64,6 +64,7 @@
 | D9 | Verify OSNet Rank-1 > 95% | 30m | Market1501 evaluation passing | [ ] |
 | D10-D12 | Fine-tune RF-DETR-Seg-S (segmentation) | 2-3 days | `models/checkpoints/rf_detr_seg_s/best.pth` | [ ] |
 | D12 | Export RF-DETR-Seg-S to TensorRT | 2h | `models/trt_engines/rf_detr_seg_s_fp16.engine` | [ ] |
+| D13 | Train GBDT hypothesis ranker | 2-4h | `models/hypothesis_ranker/ranker.json` | [ ] |
 | D13 | Train calibrator (temperature + conformal) | 4h | `models/calibrator/` files | [ ] |
 | D13 | Verify calibration ECE < 0.05 | 30m | Calibration quality report | [ ] |
 
@@ -71,8 +72,9 @@
 - [ ] RF-DETR-S: mAP ≥ 53.0, latency p50 < 2.5ms (TensorRT)
 - [ ] OSNet: Rank-1 > 95%, latency p50 < 1.5ms
 - [ ] RF-DETR-Seg-S: mAP ≥ 43.0 (optional, skip if behind)
+- [ ] Hypothesis Ranker: NDCG@3 ≥ 0.85, latency < 1ms
 - [ ] Calibrator: ECE < 0.05, coverage ≥ 95%
-- [ ] All models exported to TensorRT
+- [ ] All models exported to TensorRT (GPU models)
 - [ ] All benchmarks logged to W&B
 
 ---
@@ -141,7 +143,7 @@
 | **M0: Environment Ready** | D1-D2 | GPU working, models loaded, deps installed |
 | **M1: Data Ready** | D3-D5 | All datasets preprocessed and versioned |
 | **M2: Detection Trained** | D7 | RF-DETR-S fine-tuned, benchmarked, exported |
-| **M3: All Models Trained** | D13 | All 4 models done, calibrator trained |
+| **M3: All Models Trained** | D13 | All 5 models done (incl. ranker + calibrator) |
 | **M4: Pipeline Integrated** | D21 | Full pipeline running end-to-end |
 | **M5: Benchmarks Complete** | D26 | All metrics measured and documented |
 | **M6: Demo Ready** | D28 | Demo video, paper, presentation |
