@@ -40,10 +40,11 @@ The repo contains 97 markdown files across 12 directories. These are the authori
 07_evaluation/       ← 10 experiments (E1-E10), success criteria
 08_implementation/   ← Staged build plan (10 stages), ablation plan, risk register
 09_sources/          ← 139 sources in 18 categories
-10_training_plan/    ← 13 files: master plan, preparation, datasets, training, optimization,
+10_training_plan/    ← 14 files: master plan, preparation, datasets, training, optimization,
                        inference integration, benchmarking, timeline, infrastructure,
                        system flow, project structure audit, model weights/disk space,
-                       MLForge v1.0 training system (immutable runs, fail-closed resume validation)
+                       MLForge v1.0 architecture spec, MLForge product spec (CLI contract,
+                       state machines, sequence diagrams, failure matrix, status plane)
 ```
 
 ---

@@ -376,6 +376,7 @@ class Pipeline:
 | `10_project_structure_and_consistency.md` | Structure audit, 8 resolved issues |
 | `11_model_weights_and_disk_space.md` | Model weight sizes, disk budgets, download order |
 | `12_training_system.md` | **MLForge v1.0 architecture — immutable runs, artifact hashes, fail-closed resume validation, exact vs portable modes, lineage DAG, 3070→H100→multi-GPU** |
+| `13_product_specification.md` | **MLForge product spec — user lifecycle, exact CLI contract, state machines, sequence diagrams, failure matrix, status/telemetry plane** |
 
 ---
 
