@@ -1,723 +1,1067 @@
-# Standalone ML Training System
+# MLForge — Training System Architecture (v1.0)
 
-> A hardware-agnostic, project-agnostic training platform. Install it on any OS, train on any GPU (RTX 3070 today, H100 tomorrow, CPU if desperate), and move trained models between machines via a single self-contained folder. Reusable across every future project.
-
----
-
-## 1. What This Is
-
-A standalone app (`mlforge`) — installable on any OS, self-configuring on install:
-
-```
-┌──────────────────────────────────────────────────────────────┐
-│                       mlforge CLI                            │
-│   init / configure / prepare / train / open / resume / ...   │
-├──────────────┬──────────────┬──────────────┬─────────────────┤
-│  Hardware    │  Run Folder  │  Dataset     │  Checkpoint     │
-│  Abstraction │  Manager     │  Config      │  Store          │
-│  (auto-scale)│  (portable)  │  (user paths)│  (self-contained│
-├──────────────┴──────┬───────┴──────────────┴─────────────────┤
-│                     │  Ingestion Pipeline                     │
-│                     │  (raw → model-ready, cached, validated) │
-├─────────────────────┴────────────────────────────────────────┤
-│                     Training Engine                           │
-│          (Lightning + DDP/FSDP + config freeze)               │
-├──────────────────────────────────────────────────────────────┤
-│                     Evaluation + Export                        │
-└──────────────────────────────────────────────────────────────┘
-```
-
-**Design principles:**
-1. **Portable run folders** — every training run is one folder. Copy it to any machine, resume there.
-2. **Config freeze** — training semantics never change silently. Hardware settings auto-adapt.
-3. **User-configured paths** — you point at your data. No autonomous scanning, no "discovery."
-4. **Self-configuring install** — one command installs the right PyTorch/CUDA/deps for your OS and GPU.
-5. **Dataset-validated resume** — before resuming, system verifies you're pointing at the same data.
-6. **Environment-pinned** — run folder records exact library versions; new machine installs those.
-7. **Explicit decisions** — training/retraining is always your choice. System reports, you decide.
+> A hardware-agnostic, project-agnostic training platform built on **immutable artifacts, cryptographic identities, explicit execution modes, and fail-closed validation**. Install on any OS, train on any GPU, move between machines via portable run folders — with a hard guarantee: **if the system cannot prove a continuation is valid, it refuses to run.**
 
 ---
 
-## 2. App Installation (Any OS, Self-Configuring)
+## 1. Guarantees
+
+The system advertises exactly these — no more:
+
+```
+MLFORGE GUARANTEES
+────────────────────────────────────────────
+ 1. No silent semantic changes.
+ 2. No resume with unidentified data.
+ 3. No resume with unidentified code.
+ 4. No resume with unidentified model architecture.
+ 5. No resume from corrupt checkpoints.
+ 6. No execution in an unverified environment.
+ 7. Hardware may change only through validated execution adaptation.
+ 8. Semantic configuration is immutable.
+ 9. Fine-tuning always creates a new lineage node.
+10. Retraining always creates a new run.
+11. Every checkpoint is independently recoverable.
+12. Every model is traceable to code, data, transforms,
+    environment, configuration, checkpoint.
+13. Every execution segment records its hardware.
+14. Every artifact is content-addressed.
+15. Unknown compatibility = BLOCK, never GUESS.
+```
+
+**What we explicitly do NOT promise:**
+
+> ~~"Train on RTX 3070 and resume identically on H100."~~
+
+What we promise:
+
+> **MLForge preserves experiment semantics across supported hardware migrations and explicitly distinguishes exact deterministic continuation from portable continuation. If MLForge cannot prove the continuation is valid, MLForge refuses to continue.**
+
+### 1.1 What "never break" means precisely
+
+We **cannot** guarantee identical floating-point bits across GPU architectures, drivers, CUDA kernels, reduction orderings, or compiler versions. Anyone claiming that is lying.
+
+We **can** guarantee:
+
+| Guarantee | Meaning |
+|---|---|
+| **A: No silent semantic change** | If continuation validity cannot be proven → `DO NOT TRAIN`. No guessing, no downgrading, no substituting. |
+| **B: Reproducible experiment identity** | Every run has immutable identities for code, config, data, transforms, base model, environment, randomness, training state. |
+| **C: Controlled hardware migration** | GPU/CPU/count/Precision changes never silently alter semantic parameters. |
+| **D: Lineage-traceable continuation** | Every model traces back through checkpoints → datasets → code → environment image. |
+
+---
+
+## 2. Core Architecture
+
+```
+                        ┌───────────────────────┐
+                        │      mlforge CLI       │
+                        └───────────┬───────────┘
+                                    │
+                        ┌───────────▼───────────┐
+                        │   Run Orchestrator     │
+                        │                        │
+                        │  State Machine          │
+                        │  Validation Gate        │
+                        │  Lineage Manager        │
+                        │  Policy Engine          │
+                        └───────────┬───────────┘
+                                    │
+       ┌────────────────────────────┼────────────────────────────┐
+       │                            │                            │
+       ▼                            ▼                            ▼
+┌───────────────┐          ┌──────────────────┐          ┌─────────────────┐
+│  Artifact     │          │  Execution       │          │  Dataset        │
+│  Registry     │          │  Environment     │          │  Registry       │
+│               │          │                  │          │                 │
+│ code          │          │ container image  │          │ immutable data  │
+│ models        │          │ dependencies     │          │ manifests       │
+│ checkpoints   │          │ runtime          │          │ transforms      │
+│ configs       │          │ hardware adapter │          │ cache           │
+└───────┬───────┘          └────────┬─────────┘          └────────┬────────┘
+        │                           │                             │
+        └───────────────────────────┼─────────────────────────────┘
+                                    ▼
+                        ┌───────────────────────┐
+                        │  Training Runtime      │
+                        │                        │
+                        │  Model                  │
+                        │  Optimizer + Scheduler  │
+                        │  AMP / scaler           │
+                        │  RNG hierarchy          │
+                        │  Sampler + Dataloader   │
+                        │  Distributed runtime    │
+                        └───────────┬───────────┘
+                                    │
+                         ┌──────────▼──────────┐
+                         │ Atomic Checkpoint    │
+                         │ + Event Journal      │
+                         └──────────┬──────────┘
+                                     │
+                   ┌─────────────────┼─────────────────┐
+                   ▼                 ▼                 ▼
+                RESUME           EVALUATE           EXPORT
+```
+
+**The key conceptual change:**
+
+> ~~"A run is a folder that contains enough things to resume."~~
+>
+> **"A run is an immutable, content-addressed scientific state whose execution can occur across multiple machines. The folder is a portable materialization of that state."**
+
+---
+
+## 3. The Four Separated Concepts
+
+Do not conflate these:
+
+| Concept | Question it answers |
+|---|---|
+| **Dataset** | What data exists in the world? |
+| **Prepared dataset** | What exact representation enters the model? |
+| **Run** | What experiment was performed? |
+| **Model** | What learned parameters were produced? |
+
+Each has its own identity, its own artifact, its own lifecycle.
+
+---
+
+## 4. Immutable Run Specification
+
+Every run is defined by a `run_spec.json` — created once, **never mutated**:
+
+```yaml
+# run_spec.json
+schema_version: 1
+
+run:
+    id: "run_01JABC..."
+    created_at: "2026-09-30T14:30:00Z"
+    parent: null                    # set when forked
+
+code:
+    source_hash: "sha256:..."       # hash of full source tree
+    repository_commit: "abc123"
+    dirty: false                    # uncommitted changes?
+    training_runtime_version: "1.0.0"
+
+model:
+    architecture: "rf_detr_s"
+    architecture_hash: "sha256:..." # hash of model implementation code
+    base_weights:
+        artifact: "pretrained_rf_detr_s"
+        digest: "sha256:..."        # exact pretrained checkpoint hash
+
+data:
+    train_manifest: "sha256:..."    # dataset identity (NOT path)
+    validation_manifest: "sha256:..."
+    transform_manifest: "sha256:..." # transform artifact identity
+
+training:
+    optimizer: "adamw"
+    learning_rate: 1e-4
+    scheduler: "cosine_with_restarts"
+    global_batch_size: 32           # THE semantic invariant
+    seed: 12345
+    target_epochs: 50
+    early_stopping: {patience: 10, metric: "mAP", mode: "max"}
+    losses: [...]
+    augmentations: [...]
+    precision_policy:
+        preferred: "bf16"
+        fallback: "fp32"            # fallback requires PORTABLE mode
+
+environment:
+    image_digest: "sha256:..."      # OCI container image — primary identity
+    lockfile_sha256: "sha256:..."
+
+reproducibility:
+    level: "R2"                     # see §14
+    deterministic_algorithms: true
+    cudnn_benchmark: false
+    data_order: "deterministic"
+    allow_nondeterministic_kernels: false
+```
+
+**Canonicalization before hashing:**
+
+```
+YAML → schema validation → normalized representation → canonical JSON → SHA256
+```
+
+So `lr: 0.0001` and `lr: 1e-4` produce the **same** `run_spec_hash`.
+
+**Hard rule:** `run_spec_hash` is immutable. Changing LR, batch, optimizer, augmentation, loss, dataset, or model creates a **NEW RUN** with `parent_run = <old hash>`. Never mutate. (`mlforge fork`, not `--reconfigure`.)
+
+---
+
+## 5. Portable Run Folder
+
+The folder is a **materialization** of the immutable run state:
+
+```
+runs/run_01JABC.../
+│
+├── manifest.json              # folder-level integrity (hashes of everything below)
+├── run_spec.json              # 🔒 immutable experiment identity
+├── lineage.json               # parent runs/models (DAG edges)
+├── status.json                # CREATED/PAUSED/COMPLETED/FAILED
+│
+├── code/
+│   └── source.snapshot.tar.gz # full source tree snapshot (gap: code capture)
+│       + artifact.manifest     # sha256 of snapshot
+│
+├── environment/
+│   ├── image.json             # OCI image digest + requirements
+│   ├── lock.json              # pip freeze / lockfile
+│   └── hardware_requirements.json  # min driver, min VRAM, arch
+│
+├── datasets/
+│   ├── train.manifest         # dataset identity: hashes, counts, schemas
+│   ├── val.manifest
+│   └── transforms.manifest    # transform artifact identities
+│
+├── checkpoints/
+│   ├── ckpt-000001/
+│   │   ├── manifest.json      # hashes of every file below + commit marker
+│   │   ├── model.safetensors
+│   │   ├── optimizer.pt
+│   │   ├── scheduler.pt
+│   │   ├── amp_scaler.pt
+│   │   ├── rng_state.bin      # full RNG hierarchy (§11)
+│   │   ├── sampler_state.bin
+│   │   ├── dataloader_state.bin
+│   │   └── state.json         # epoch, global_step, batch_position, metrics
+│   ├── ckpt-000002/
+│   └── ckpt-000003/
+│       └── (keep top-K generations for recovery)
+│
+├── segments/                  # one per hardware execution context
+│   ├── 0001/
+│   │   ├── execution.json     # RTX 3070, 1 GPU, bf16, micro=2, accum=16
+│   │   └── metrics.jsonl
+│   └── 0002/
+│       ├── execution.json     # H100, 1 GPU, bf16, micro=32, accum=1
+│       └── metrics.jsonl
+│
+├── evaluations/
+│   └── eval_001/              # model_hash + dataset_hash + code_hash + metrics
+│
+├── exports/
+│   └── onnx/model.onnx
+│
+├── events.jsonl               # append-only audit journal
+│
+└── integrity.json             # merkle root of all artifacts in this folder
+```
+
+**Size:** ~400MB-1GB for RF-DETR-S scale models. Transferable via git-LFS, USB, network share.
+
+---
+
+## 6. Artifact Identity Model
+
+### 6.1 Content-Addressed Store
+
+```text
+~/.mlforge/store/
+    sha256/
+        ab/abcdef...
+        72/72f91...
+```
+
+All artifacts — datasets, transforms, source, environments, models, checkpoints, evaluations — are immutable objects identified by content hash. The run folder contains **references**:
+
+```json
+{"model": "sha256:abc...", "dataset": "sha256:def...", "environment": "sha256:ghi..."}
+```
+
+Deduplication and integrity come for free.
+
+### 6.2 Dataset Identity Is Cryptographic (Not Count-Based)
+
+```
+Dataset
+   ├── dataset_id        # e.g. "coco_2017"
+   ├── version           # e.g. "v1"
+   ├── schema            # annotation format
+   ├── files[]
+   │     ├── sha256
+   │     ├── size
+   │     └── relative_path      # NEVER absolute path
+   └── manifest_hash = SHA256(canonical_manifest)
+```
+
+**Sample counts are NOT identity.** Two 100,000-image datasets can be completely different data. Hashes catch that.
+
+### 6.3 Paths Are Machine-Local, Never Part of Identity
+
+```yaml
+# run_spec.json (immutable)
+dataset:
+    id: "coco_2017"
+    version: "v1"
+    identity: "sha256:abc..."     # ← this is the identity
+```
+
+```yaml
+# ~/.mlforge/datasets_<project>.yaml (machine-local, mutable)
+coco_2017:
+    path: "/home/daksh/data/coco"     # Machine A
+    # path: "/mnt/datasets/coco"      # Machine B
+    # path: "D:\datasets\coco"        # Machine C
+```
+
+Same dataset identity, different physical location per machine. User configures paths via `mlforge configure datasets` (§10.2).
+
+### 6.4 Transform Identity Is an Artifact
+
+```
+Transform Artifact
+   ├── transform_id
+   ├── code_hash            # hash of transform implementation
+   ├── config_hash
+   ├── input_schema
+   ├── output_schema
+   └── implementation_version
+```
+
+Chain:
+
+```
+RAW DATA (dataset_hash)
+    ↓
+TRANSFORM (transform_hash)
+    ↓
+MODEL DATA (output_manifest_hash)
+    ↓
+TRAINING
+```
+
+**Cache key becomes:**
+
+```
+cache_key = SHA256(input_artifact_hash + transform_hash + transform_config_hash + environment_hash)
+```
+
+Same inputs + same transform + same environment = same artifact. Change any one → new artifact. No stale-cache guessing.
+
+### 6.5 Environment Identity Is an Image Digest
+
+```yaml
+environment:
+    schema_version: 1
+    image:
+        type: oci
+        digest: "sha256:..."      # ← THE identity, not package versions
+    python: {implementation: CPython, version: "3.11.9"}
+    framework: {pytorch: "2.5.1"}
+    cuda: {runtime: "12.4"}
+    dependencies: {lockfile_sha256: "sha256:..."}
+```
+
+`same package versions ≠ same executable environment`. The image digest is authoritative.
+
+**Host vs training environment separation:**
+
+```
+HOST MACHINE provides:      CPU, RAM, GPU, driver, filesystem, container runtime
+TRAINING ENV provides:      Python, PyTorch, Lightning, CUDA runtime, model code, all deps
+```
+
+Same image runs on 3070 machine and H100 machine. Eliminates pip drift, system Python drift, dependency drift, compiler drift.
+
+### 6.6 Code Is Captured
+
+Every run records:
+
+- source tree hash
+- git commit + submodules + dirty flag
+- training runtime version
+- model implementation version
+- **full source snapshot** in `code/source.snapshot.tar.gz`
+
+If the git repo disappears, the experiment is still recoverable.
+
+---
+
+## 7. Validation Gate (Fail-Closed)
+
+### 7.1 BLOCK vs WARN
+
+**WARN** — information that does not invalidate the operation:
+
+```
+H100 is 15× faster than original GPU
+Disk has 1.8TB free (plenty)
+```
+
+**BLOCK** — anything that could change the experiment:
+
+```
+dataset hash mismatch
+code artifact missing
+architecture hash mismatch
+base model hash mismatch
+environment unavailable / unverifiable
+checkpoint integrity failure
+global batch cannot be preserved
+driver incompatible
+checkpoint atomicity unsupported
+schema version unsupported
+secrets present in artifacts
+```
+
+Environment incompatibility is **NOT a warning path** — it routes through a compatibility resolver:
+
+```
+environment mismatch
+       ↓
+compatibility resolver
+       ↓
+  ┌────┴────┐
+SAFE      UNSAFE
+  ↓          ↓
+continue    BLOCK
+```
+
+"Probably compatible" does not exist.
+
+### 7.2 Validation Report
+
+```text
+$ mlforge validate runs/run_01JABC...
+
+VALIDATION REPORT
+─────────────────────────────────────────
+[PASS] Run manifest integrity
+[PASS] Schema version (v1 supported)
+[PASS] Code artifact present + hash match
+[PASS] Source snapshot hash match
+[PASS] Dataset identity: coco_2017 v1 (sha256:abc...)
+[PASS] Dataset sample verification (118,287 files hashed)
+[PASS] Transform artifact identity
+[PASS] Model architecture hash
+[PASS] Base pretrained weights digest
+[PASS] Checkpoint integrity (ckpt-000023, all hashes valid)
+[PASS] Environment image available (sha256:ghi...)
+[PASS] GPU capability (H100, bf16 supported)
+[PASS] Driver compatibility (CUDA 12.4 runtime ≤ driver 550.x)
+[PASS] Global batch preserved (32 = 32)
+[PASS] Precision policy supported (bf16 → bf16)
+[PASS] Optimizer state recoverable
+[PASS] LR scheduler state recoverable
+[PASS] RNG hierarchy recoverable
+[PASS] Sampler state recoverable
+[PASS] Disk space sufficient (need 8GB, have 1.8TB)
+[PASS] Atomic rename supported (filesystem: ext4)
+[PASS] No secrets in artifacts
+
+RESULT:
+    SAFE TO RESUME
+    MODE: PORTABLE CONTINUATION
+    SEGMENT: 0002 (new execution context will be recorded)
+```
+
+Or:
+
+```text
+[FAIL] Dataset identity
+    Expected: sha256:abc... (coco_2017 v1, 118,287 files)
+    Found:    sha256:def... at /home/daksh/data/coco
+    Reason:   different content (same count, different files)
+
+RESULT:
+    RESUME BLOCKED
+```
+
+**If steps 1–N fail: TRAINING DOES NOT START.**
+
+### 7.3 Preflight
+
+Before any expensive operation:
 
 ```bash
-# Linux / macOS
-curl -fsSL https://mlforge.dev/install.sh | bash
-
-# Windows (PowerShell)
-irm https://mlforge.dev/install.ps1 | iex
-
-# Or via pip (universal)
-pip install mlforge
+$ mlforge preflight runs/run_01JABC...
 ```
 
-What the installer does:
+Validates: OS, Python, container runtime, GPU, driver, VRAM, disk space, RAM, dataset hashes, code, environment, model, checkpoint, filesystem write permissions, atomic rename support, storage headroom.
 
-```
-[1/6] Detecting OS...           Linux x86_64 (or Windows / macOS)
-[2/6] Detecting GPU...          NVIDIA RTX 3070, CUDA 12.4 detected
-                                (or: no GPU → CPU-only mode)
-[3/6] Installing PyTorch...     torch 2.5.1+cu124 (matches your CUDA)
-[4/6] Installing dependencies... lightning, opencv, scikit-learn, ...
-[5/6] Creating config dir...    ~/.mlforge/
-[6/6] Running smoke test...     GPU matrix multiply OK
+Only after `PREFLIGHT PASSED` does `mlforge train/resume` proceed.
 
-mlforge 1.0.0 installed.
-Run `mlforge init` to create your first project.
-```
-
-No manual CUDA setup. No conda environments. No "which PyTorch version do I need." The installer figures it out from your hardware.
+**Disk-space validation is mandatory** — computes worst-case: checkpoint + temp checkpoint + dataset cache + logs + safety margin. If free < required → BLOCK. Never "train until disk fills."
 
 ---
 
-## 3. The Portable Run Folder (Core Concept)
+## 8. Two Resume Modes
 
-**Every training run is ONE folder. It contains everything needed to continue training on any machine.**
+### 8.1 Mode EXACT
+
+Guarantees continuation of the same trajectory:
 
 ```
-runs/rf_detr_s_20260930_1430/
-│
-├── checkpoint.ckpt              # Model weights + optimizer state + scheduler state + epoch
-│                                #   (PyTorch Lightning format — hardware-agnostic)
-│
-├── training_config.yaml         # 🔒 SEMANTIC config — FROZEN after training starts
-│                                #   effective_batch, learning_rate, lr_schedule,
-│                                #   optimizer, losses, augmentations, seed,
-│                                #   target_epochs, early_stopping
-│
-├── hardware_config.json         # 🔄 DISPOSABLE — last machine's settings, regenerated on open
-│                                #   micro_batch, grad_accum, precision, num_workers,
-│                                #   gradient_checkpointing, strategy, gpu_name
-│
-├── state.json                   # Where training is at
-│                                #   epoch: 23, max_epochs: 50,
-│                                #   metrics: {mAP: 49.1, ...},
-│                                #   best_metric: 49.1, best_epoch: 25,
-│                                #   status: "interrupted" | "completed" | "early_stopped"
-│
-├── dataset_manifest.json        # 📋 WHAT data trained this — validated on resume
-│                                #   datasets: [{name, version, path_when_trained,
-│                                #              sample_count, split, checksum}],
-│                                #   transform_hash: "a1b2c3d4"
-│
-├── environment.json             # 📦 EXACT libraries that trained this (gap #2)
-│                                #   python: "3.11.9",
-│                                #   packages: {torch: "2.5.1+cu124",
-│                                #              lightning: "2.4.0",
-│                                #              numpy: "1.26.4", ...},
-│                                #   captured_at: "2026-09-30T14:30:00Z"
-│
-├── metrics.jsonl                # Per-epoch training log (loss, lr, metrics)
-│
-├── wandb_export/                # Offline experiment log (if W&B used)
-│
-└── README.txt                   # Human-readable summary
-                                   "RF-DETR-S, trained 23/50 epochs on RTX 3070,
-                                    best mAP 49.1, needs coco_2017 + custom_clips"
+same execution environment  ·  same software  ·  same world size
+same precision  ·  same deterministic settings  ·  same dataset
+same sampler  ·  same code  ·  same config
 ```
 
-**Size:** ~400MB for RF-DETR-S (130MB weights + 260MB optimizer state + configs/logs). Small enough for git-LFS, USB drive, network share, email — any transfer method.
+Requires: R3+ reproducibility level, identical execution topology, recoverable RNG/sampler/dataloader state.
 
-**Portability guarantee:** `checkpoint.ckpt` is FP32 + `map_location="cpu"` on load. Trained on RTX 3070, loads identically on H100, RTX 4090, or CPU.
+```
+CHECKPOINT → EXACT CONTINUATION
+```
+
+### 8.2 Mode PORTABLE
+
+Hardware may change (3070→H100, 1→4 GPU, GPU→CPU):
+
+**Preserved:** model, optimizer semantics, global batch, LR semantics, dataset, transform, code, configuration.
+
+**Explicitly recorded:**
+
+```json
+{
+    "trajectory_continuity": "semantic",
+    "bitwise_reproducibility": false
+}
+```
+
+This is honest and technically defensible.
+
+### 8.3 Why global batch is the invariant (and why even that isn't bitwise)
+
+```
+global_effective_batch = micro_batch × grad_accum × world_size
+```
+
+| Machine | micro | accum | world | global |
+|---|---|---|---|---|
+| RTX 3070 | 2 | 16 | 1 | **32** |
+| H100 | 32 | 1 | 1 | **32** |
+| 2× H100 | 8 | 2 | 2 | **32** |
+
+**But even preserved global batch ≠ identical training**, because:
+
+- **BatchNorm**: micro_batch 2→32 changes batch statistics
+- **FP reduction order**: `(a+b)+c ≠ a+(b+c)` in floating point
+- **Distributed all-reduce**: world size changes reduction structure
+- **AMP kernels**: different GPU architectures execute different kernels
+- **Data ordering**: worker counts affect loading order unless controlled
+
+Therefore: EXACT mode requires identical topology; everything else is PORTABLE mode with `bitwise_reproducibility: false`.
 
 ---
 
-## 4. Config Freeze Model (Semantic vs Hardware)
+## 9. Reproducibility Levels
 
-### 4.1 The Two Types
-
-| Type | What | Changes on new machine? | Why |
-|---|---|---|---|
-| 🔒 **Semantic** (`training_config.yaml`) | effective_batch, learning_rate, lr_schedule, optimizer, losses, augmentations, seed, target_epochs, early_stopping | **NEVER** silently | Training dynamics depend on these. Changing mid-run destabilizes training. Adam moments were computed under these values. |
-| 🔄 **Hardware** (`hardware_config.json`) | micro_batch, grad_accum, precision, num_workers, gradient_checkpointing, strategy, gpu_name | **ALWAYS** regenerated | Just *how* this machine achieves the same training. Disposable. |
-
-### 4.2 The Key Invariant: effective_batch Never Changes
-
-```
-RTX 3070 (8GB):                       H100 (80GB):
-  micro_batch = 2                       micro_batch = 32
-  grad_accum  = 16                      grad_accum  = 1
-  ─────────────────                     ─────────────────
-  effective   = 2 × 16 = 32             effective   = 32 × 1 = 32
-                                       
-  ←── SAME gradient statistics per optimizer step ──→
-  ←── SAME LR meaning ──→
-  ←── Adam moments still valid ──→
+```text
+R0 — no reproducibility guarantee
+R1 — experiment reproducibility (same config/data/code)
+R2 — execution reproducibility (same environment + hardware class)
+R3 — deterministic continuation (same topology + deterministic runtime)
+R4 — verified bitwise reproducibility (only where framework/hardware supports it)
 ```
 
-The training process doesn't know hardware changed. Only the mechanics of *how* each optimizer step is computed changed.
+Recorded in `run_spec.reproducibility.level`. **Never claim R4 when you only have R1.**
 
-### 4.3 Adaptation Flow (When You Open a Run Folder on a New Machine)
-
-```
-$ mlforge open runs/rf_detr_s_20260930_1430/
-
-Reading run folder...
-  Model: rf_detr_s | Epoch: 23/50 | Best mAP: 49.1
-  Status: interrupted (saved at epoch 23)
-  Trained on: RTX 3070 8GB
-
-Detecting current hardware...
-  GPU: H100 80GB | CUDA 12.6 | 1 GPU
-
-Config adaptation:
-  ┌───────────────────────┬──────────┬──────────┬───────────┐
-  │ Setting               │ Stored   │ Current  │ Type      │
-  ├───────────────────────┼──────────┼──────────┼───────────┤
-  │ micro_batch           │ 2        │ 32       │ 🔄 hw     │
-  │ grad_accum            │ 16       │ 1        │ 🔄 hw     │
-  │ effective_batch       │ 32       │ 32       │ 🔒 frozen │
-  │ learning_rate         │ 1e-4     │ 1e-4     │ 🔒 frozen │
-  │ lr_schedule position  │ epoch 23 │ epoch 23 │ 🔒 frozen │
-  │ optimizer (Adam) state│ loaded   │ loaded   │ 🔒 frozen │
-  │ precision             │ bf16     │ bf16     │ 🔄 hw     │
-  │ gradient_checkpointing│ ON       │ OFF      │ 🔄 hw     │
-  │ num_workers           │ 8        │ 16       │ 🔄 hw     │
-  └───────────────────────┴──────────┴──────────┴───────────┘
-
-  effective_batch unchanged → training dynamics preserved ✅
-
-Validating datasets (gap #1)...
-  Manifest says: coco_2017 v1 (118,287 train), custom_clips v1 (200)
-  
-  Checking paths from your dataset config...
-  coco_2017:      /home/user/data/coco/      → 118,287 samples ✅ match
-  custom_clips:   /home/user/data/custom/    → 200 samples ✅ match
-
-Environment check (gap #2)...
-  Folder expects: python 3.11, torch 2.5.1+cu124, lightning 2.4.0
-  Current:        python 3.12, torch 2.5.1+cu126, lightning 2.4.0
-  ⚠️ Minor version differences detected.
-     torch 2.5.1+cu124 → 2.5.1+cu126: compatible (minor CUDA patch) ✅
-     python 3.11 → 3.12: compatible ✅
-  (System checks compatibility, not exact match — CUDA patch versions differ by GPU)
-
-Resume from epoch 23? [Y/n]: y
-
-Starting training...
-  Epoch 24/50 | mAP 49.3 | lr 7.5e-5 | 8.2 it/s (was 2.1 it/s on 3070)
+```yaml
+reproducibility:
+    level: "R2"
+    seed: 123456
+    deterministic_algorithms: true
+    cudnn_benchmark: false
+    data_order: deterministic
+    worker_seed_policy: deterministic
+    allow_nondeterministic_kernels: false
 ```
 
-### 4.4 CPU-Only Machine
-
-```
-$ mlforge open runs/rf_detr_s_20260930_1430/
-  (on a machine with no GPU)
-
-Reading run folder...
-  Model: rf_detr_s | Epoch: 23/50 | Best mAP: 49.1
-
-Detecting current hardware...
-  GPU: none (CPU only)
-
-Config adaptation:
-  micro_batch:       2 → 1     🔄 hw
-  grad_accum:        16 → 32   🔄 hw
-  effective_batch:   32 → 32   🔒 frozen
-  precision:         bf16 → fp32 (CPU)  🔄 hw
-
-  ⚠️ WARNING: CPU-only training speed estimate:
-     Current GPU (RTX 3070): ~2.1 it/s
-     CPU estimate:           ~0.02 it/s
-     Remaining 27 epochs:    estimated 17 DAYS
-
-  Options:
-    [a] Continue anyway (very slow — 17 days)
-    [b] Stop here — current checkpoint usable as-is (mAP 49.1)
-    [c] Cancel
-
-  Choice:
-```
-
-### 4.5 Explicit Semantic Change (`--reconfigure`)
-
-Only when YOU decide to change what training means:
-
-```
-$ mlforge open runs/rf_detr_s_20260930_1430/ --reconfigure effective_batch=64 lr=2e-4
-
-  ⚠️ You are changing SEMANTIC config mid-training:
-     effective_batch: 32 → 64
-     learning_rate:   1e-4 → 2e-4 (linearly scaled)
-
-  This may destabilize training:
-  - Adam moments were accumulated under effective_batch=32
-  - Gradient noise profile will change
-  - LR schedule position (epoch 23) was computed for old LR
-
-  Recommendation: finish current run at effective_batch=32,
-                  then start a FRESH run at effective_batch=64.
-
-  Force anyway? [y/N]:
-```
-
-### 4.6 Rules Summary
-
-| Situation | What happens |
-|---|---|
-| Resume on bigger GPU | Hardware auto-upgrades, semantics locked, seamless |
-| Resume on smaller GPU | Hardware downgrades, semantics locked, seamless |
-| Resume on CPU | Hardware downgrades, time estimate warning, user chooses |
-| Resume with wrong dataset | ❌ BLOCKED — manifest mismatch, error shown |
-| Resume with compatible library versions | ✅ Proceeds (minor CUDA/python patch diffs OK) |
-| Resume with incompatible library versions | ⚠️ Warning with fix instructions |
-| Change effective_batch/LR | Explicit `--reconfigure`, warning, confirmation |
-| Fresh start (no checkpoint) | Everything auto-configured for this machine |
+If a model requires a nondeterministic kernel: STRICT mode → BLOCK; RELAXED mode → allow + record exception.
 
 ---
 
-## 5. Dataset Configuration (User-Configured Paths)
+## 10. Dataset Configuration & Ingestion
 
-**No discovery. You tell the system where your data is. Period.**
+### 10.1 User-Configured Paths (No Discovery)
 
-### 5.1 One-Time Setup Per Machine
+One-time per machine:
 
 ```bash
 $ mlforge configure datasets
-
-# System shows you what it needs for your project:
-This project uses these datasets:
-
-  [1] coco_2017        (detection images + annotations, ~25GB)
-  [2] market1501       (person Re-ID crops, ~153MB)
-  [3] custom_clips     (your annotated sports videos, ~5GB)
-  [4] event_hypothesis_pairs  (labeled CSV for ranker, ~12KB)
-
-Enter path for coco_2017: /home/daksh/data/coco
-  → Checking... found 118,287 train images, 5,000 val ✅
-
-Enter path for market1501: /home/daksh/data/market1501
-  → Checking... found 15,109 train identities ✅
-
-Enter path for custom_clips: /home/daksh/data/custom
-  → Checking... found 200 annotated frames ✅
-
-Enter path for event_hypothesis_pairs: /home/daksh/data/labels/pairs.csv
-  → Checking... found 5,000 rows ✅
-
+  coco_2017 path? /home/daksh/data/coco
+    → verifying content hash... ✅ matches sha256:abc (coco_2017 v1)
+  market1501 path? /home/daksh/data/market1501
+    → verifying... ✅ matches sha256:def
 Saved: ~/.mlforge/datasets_multimodal_reasoner.yaml
-
-All datasets configured. You can change paths anytime with:
-  mlforge configure datasets
 ```
 
-### 5.2 What Gets Saved
+Wrong path → hash mismatch → explicit error with fix options. The system **verifies identity**, it does not scan or guess.
+
+### 10.2 Ingestion Is a Content-Addressed DAG
 
 ```yaml
-# ~/.mlforge/datasets_multimodal_reasoner.yaml
-# (machine-local — different on each machine)
-
-machine: "lab-pc-3070"
-os: "linux"
-
-datasets:
-  coco_2017:
-    path: "/home/daksh/data/coco"
-    train_split: "train2017"
-    val_split: "val2017"
-    annotations: "annotations/instances_train2017.json"
-
-  market1501:
-    path: "/home/daksh/data/market1501"
-    train_split: "bounding_box_train"
-    query: "query"
-    gallery: "gallery"
-
-  custom_clips:
-    path: "/home/daksh/data/custom"
-    annotations: "annotations/"
-
-  event_hypothesis_pairs:
-    path: "/home/daksh/data/labels/pairs.csv"
-```
-
-**Different machine → different paths → run `mlforge configure datasets` again.** That's the whole workflow.
-
-### 5.3 If a Path Is Wrong
-
-```
-$ mlforge train --config rf_detr_s.yaml
-
-Validating dataset paths...
-  coco_2017: /home/daksh/data/coco → ❌ NOT FOUND
-  custom_clips: /home/daksh/data/custom → ✅ found
-
-Error: dataset 'coco_2017' not found at /home/daksh/data/coco
-
-Fix options:
-  a) Re-run: mlforge configure datasets
-  b) Download: mlforge download coco_2017
-  c) Edit: ~/.mlforge/datasets_multimodal_reasoner.yaml
-```
-
-No guessing. No scanning the whole disk. You get a clear error and clear fix options.
-
----
-
-## 6. Ingestion: Raw Data → Model-Ready
-
-Every model needs a different data format. This is the transform layer between "datasets you configured" and "DataLoader the model trains on."
-
-### 6.1 Model ↔ Dataset Mapping (`ingestion.yaml`)
-
-```yaml
-# projects/multimodal_reasoner/ingestion.yaml
-
+# ingestion.yaml
 models:
   rf_detr_s:
-    task: detection
-    transform: coco_detection          # raw → RF-DETR DataLoader
-    train_sources:
-      - dataset: coco_2017
-        split: train
-      - dataset: custom_clips
-        split: train
-    val_sources:
-      - dataset: coco_2017
-        split: val
-    expected: {train: 118487, val: 5000}
-
+    transform: coco_detection
+    train_sources: [coco_2017:train, custom_clips:train]
+    val_sources: [coco_2017:val]
   osnet:
-    task: reid
     transform: reid_crops
-    train_sources:
-      - dataset: market1501
-        split: train
-      - dataset: custom_reid           # extracted from custom_clips
-        depends_on: rf_detr_s          # needs trained detector for crops
-    val_sources:
-      - dataset: market1501
-        split: query
-      - dataset: market1501
-        split: gallery
-    expected: {train: 15309}
-
-  gbdt_ranker:
-    task: ranking
-    transform: tabular
-    train_sources:
-      - dataset: event_hypothesis_pairs
-        split: train
-    expected: {train: 5000}
-
+    train_sources: [market1501:train, custom_reid:train]
+    depends_on: [rf_detr_s]           # crops need trained detector
   calibrator:
-    task: calibration
     transform: calibration
-    train_sources:
-      - generated_from: rf_detr_s      # (logits, ground truth) from RF-DETR-S val
+    train_sources: [{generated_from: rf_detr_s}]
     depends_on: [rf_detr_s]
-    expected: {train: 5000}
 ```
 
-### 6.2 Transform Cache
-
-Once transformed, data is cached. Re-running doesn't redo work:
-
-```python
-# mlforge/ingestion/cache.py
-class TransformCache:
-    """
-    Keyed by (dataset_path, transform_name, config_hash).
-    If the input data and transform config haven't changed, reuse the output.
-    """
-    def get(self, dataset, transform, config_hash) -> Optional[Path]:
-        key = f"{dataset}__{transform}__{config_hash[:8]}"
-        manifest = Path(f"data/manifests/{key}.json")
-        if manifest.exists():
-            out = json.loads(manifest.read_text())["output_path"]
-            if Path(out).exists():
-                return Path(out)       # ✅ cached, skip transform
-        return None                    # ❌ need to transform
-```
-
-### 6.3 Prepare Flow
+Formalized as DAG:
 
 ```
-$ mlforge prepare --model rf_detr_s
-
-Resolving: rf_detr_s → ingestion.yaml
-  Sources: coco_2017:train + custom_clips:train
-
-[1/4] Transform cache...
-  coco_2017 → coco_detection:     ✅ cached (118,287)
-  custom_clips → coco_detection:  ✅ cached (200)
-
-[2/4] Merge: 118,287 + 200 = 118,487 train samples
-
-[3/4] Validate (gap: data quality)...
-  ✅ 500 random images load
-  ✅ All bboxes within image bounds
-  ✅ No duplicate image IDs
-
-[4/4] Manifest written to data/manifests/rf_detr_s.json
-
-Ready. (0 bytes re-processed)
+Dataset → Transform → Artifact → Model → Derived Dataset → Next Model
 ```
+
+Every node gets `artifact_hash`. Invalidation is deterministic.
 
 ---
 
-## 7. Hardware Abstraction
+## 11. Checkpoint Integrity & Recovery
 
-### 7.1 Detection
+### 11.1 Transactional Writes (Never `torch.save` Directly)
 
-```python
-# mlforge/hardware/detector.py
-
-@dataclass
-class HardwareProfile:
-    gpu_name: str
-    gpu_vram_gb: float
-    gpu_count: int
-    compute_capability: str
-    cpu_cores: int
-    ram_gb: float
-    supports_bf16: bool     # Ampere+ (SM 8.0+)
-    supports_fp8: bool      # Hopper (SM 9.0+)
-
-def detect() -> HardwareProfile: ...  # Same as before — reads torch.cuda
+```text
+write checkpoint.tmp files
+        ↓
+calculate hashes
+        ↓
+fsync
+        ↓
+atomic rename → final names
+        ↓
+write manifest.json
+        ↓
+fsync
+        ↓
+write commit marker
 ```
 
-### 7.2 Auto-Config (Fresh Start Only)
+Power loss mid-write → `ckpt-23` has no commit marker → treated as incomplete. System reports:
 
-Only used when training from scratch. Resuming uses the freeze model (§4).
-
-```python
-def auto_configure(hw, model_name) -> dict:
-    # Batch table by VRAM tier
-    batch_table = {
-        80: {"rf_detr_s": 32, "osnet": 64, "rf_detr_seg_s": 16, "detrpose_s": 32},
-        40: {"rf_detr_s": 16, "osnet": 32, "rf_detr_seg_s": 8,  "detrpose_s": 16},
-        24: {"rf_detr_s": 8,  "osnet": 32, "rf_detr_seg_s": 4,  "detrpose_s": 16},
-        16: {"rf_detr_s": 4,  "osnet": 16, "rf_detr_seg_s": 2,  "detrpose_s": 8},
-        8:  {"rf_detr_s": 2,  "osnet": 8,  "rf_detr_seg_s": 1,  "detrpose_s": 4},
-        0:  {"rf_detr_s": 1,  "osnet": 4,  "rf_detr_seg_s": 1,  "detrpose_s": 1},
-    }
-    # ... pick by vram, compute grad_accum to reach effective_batch=32,
-    #     set precision, workers, strategy (same logic as before)
+```text
+Latest valid checkpoint: 22
+Latest attempted checkpoint: 23 (incomplete — ignored)
+Resume point: 22
 ```
+
+### 11.2 Multiple Generations (Recovery Quorum)
+
+```
+checkpoints/
+    ckpt-000017/   ← committed
+    ckpt-000018/   ← committed
+    ckpt-000019/   ← committed (keep top-K)
+```
+
+If N corrupt → fall back to N-1 → N-2. Record `recovery_from_checkpoint`.
+
+### 11.3 Integrity Verification on Load
+
+```text
+load manifest → verify per-file sha256 → verify commit marker → load
+```
+
+Corrupt → **BLOCK**, not "try anyway."
+
+### 11.4 Complete Checkpoint Contents
+
+```text
+MODEL · OPTIMIZER · LR SCHEDULER · AMP SCALER · EMA STATE
+GLOBAL STEP · EPOCH · BATCH POSITION
+SAMPLER STATE · DATALOADER STATE · DISTRIBUTED STATE
+GRADIENT ACCUMULATION STATE · EARLY STOPPING STATE · BEST MODEL STATE
+RNG HIERARCHY:
+    python_rng · numpy_rng · torch_cpu_rng · torch_cuda_rng[per-device]
+    dataloader_worker_seeds · sampler_state
+```
+
+Without RNG/sampler/dataloader state, "resume" means *same weights + different future data* — not continuation.
 
 ---
 
-## 8. Training Engine
+## 12. Run State Machine
 
-```python
-# mlforge/training/engine.py
+CLI commands never manipulate training directly — they drive the state machine:
 
-class TrainingEngine:
-    def __init__(self, run_dir: str = None, config_path: str = None):
-        """
-        Two modes:
-          run_dir given    → RESUME (load semantic config from folder, adapt hardware)
-          config_path given → FRESH START (auto-configure everything for this machine)
-        """
-        if run_dir:
-            self.mode = "resume"
-            self.semantic = load_yaml(f"{run_dir}/training_config.yaml")   # 🔒 frozen
-            self.state = load_json(f"{run_dir}/state.json")
-            self.manifest = load_json(f"{run_dir}/dataset_manifest.json")  # gap #1
-            self.environment = load_json(f"{run_dir}/environment.json")    # gap #2
-            self.hw = detect()
-            self.hardware = self._adapt_hardware()      # 🔄 regenerate
-        else:
-            self.mode = "fresh"
-            self.semantic = load_yaml(config_path)
-            self.hw = detect()
-            self.hardware = auto_configure(self.hw, self.semantic["model"]["name"])
-
-    def _adapt_hardware(self) -> dict:
-        """Regenerate hardware settings for THIS machine, keeping effective_batch."""
-        cfg = auto_configure(self.hw, self.semantic["model"]["name"])
-        # Force effective_batch to match frozen semantic value
-        target = self.semantic["training"]["target_effective_batch"]
-        cfg["micro_batch"] = ...           # max that fits this GPU
-        cfg["grad_accum"] = max(1, target // cfg["micro_batch"])
-        cfg["effective_batch"] = cfg["micro_batch"] * cfg["grad_accum"]
-        assert cfg["effective_batch"] == target, "effective_batch must not change"
-        return cfg
-
-    def validate_datasets(self) -> bool:
-        """gap #1: verify datasets match what trained this checkpoint."""
-        for entry in self.manifest["datasets"]:
-            path = get_configured_path(entry["name"])       # from user's machine config
-            if not path.exists():
-                raise DatasetError(f"{entry['name']} not found at {path}")
-            count = count_samples(path, entry["split"])
-            if count != entry["sample_count"]:
-                raise DatasetError(
-                    f"{entry['name']}: expected {entry['sample_count']} samples, "
-                    f"found {count}. Wrong dataset version?"
-                )
-        return True
-
-    def validate_environment(self) -> list:
-        """gap #2: check library compatibility against folder's environment.json."""
-        warnings = []
-        current = snapshot_environment()    # pip freeze equivalent
-        for pkg, expected in self.environment["packages"].items():
-            got = current.get(pkg)
-            if got and not compatible(expected, got):
-                warnings.append(f"{pkg}: folder={expected}, current={got}")
-        return warnings
-
-    def train(self):
-        if self.mode == "resume":
-            self.validate_datasets()          # gap #1 — BLOCKS if mismatch
-            self.validate_environment()       # gap #2 — WARNS if incompatible
-        # ... Lightning Trainer.fit() with semantic + hardware configs ...
+```text
+CREATED → VALIDATING → PREPARING → READY → RUNNING
+                                        ├── PAUSING → PAUSED
+                                        ├── CHECKPOINTING
+                                        ├── FAILED
+                                        └── COMPLETED
 ```
+
+```text
+Resume:    PAUSED → VALIDATING → READY → RUNNING
+Fork:      CHECKPOINT → FORK → NEW RUN → VALIDATE → TRAIN
+Inference: MODEL ARTIFACT → ENV VALIDATION → SCHEMA VALIDATION → INFERENCE
+```
+
+**SIGINT / preemption / OOM / power loss all use the same checkpoint protocol:**
+
+```text
+RUNNING → STOP REQUESTED → finish safe boundary → checkpoint → commit → STOPPED
+```
+
+### 12.1 OOM Recovery (Constrained)
+
+```text
+OOM → capture failure → rollback to last committed checkpoint
+    → planner proposes hardware execution adjustment
+    → validate semantic invariants
+    → new execution segment
+```
+
+May auto-adapt: `micro_batch`, `grad_accum`, `checkpointing`, `num_workers`.
+Never: `LR`, `optimizer`, `loss`, `dataset`, `augmentation`, `global batch`, `model` — those require a fork.
+
+### 12.2 Execution Segments (Hardware Migration Record)
+
+Hardware changes create a new segment, never overwrite history:
+
+```text
+Segment 0001: RTX 3070, 1 GPU, bf16, micro=2, accum=16  → epoch 0→23
+Segment 0002: H100, 1 GPU, bf16, micro=32, accum=1       → epoch 23→50
+```
+
+Each segment's `execution.json` preserves the historical execution environment forever.
 
 ---
 
-## 9. CLI Execution Flows
+## 13. Capability-Based Execution Planner
 
-### 9.1 First Time on a New Machine
+### 13.1 Capability Negotiation (Not Hardcoded VRAM Tables)
 
-```
-$ mlforge configure datasets          # point at your data (§5)
-$ mlforge prepare --model rf_detr_s   # transform raw → model-ready (§6)
-$ mlforge train --config rf_detr_s.yaml   # fresh start (auto-config for this HW)
-```
-
-### 9.2 Training Produces a Run Folder
-
-```
-$ mlforge train --config rf_detr_s.yaml
-
-[1/7] Fresh start — auto-configuring for RTX 3070...
-      micro_batch=2 | grad_accum=16 | effective=32 | bf16
-
-[2/7] Validating dataset paths...
-      coco_2017: ✅ | custom_clips: ✅
-
-[3/7] Preparing data (cached transforms)...
-      118,487 train / 5,000 val
-
-[4/7] Training...
-      Epoch 1/50 → epoch 23/50... (interrupted by user, Ctrl+C)
-
-[5/7] Saving run folder...
-      runs/rf_detr_s_20260930_1430/
-        checkpoint.ckpt ✅
-        training_config.yaml ✅ (semantic frozen)
-        hardware_config.json ✅ (3070 settings)
-        state.json ✅ (epoch 23, status: interrupted)
-        dataset_manifest.json ✅ (coco_v1: 118287, custom: 200)
-        environment.json ✅ (torch 2.5.1+cu124, python 3.11.9, ...)
-        metrics.jsonl ✅
-
-[6/7] Size: 412 MB
-
-[7/7] Resume anytime: mlforge open runs/rf_detr_s_20260930_1430/
+```text
+Hardware → Capabilities:
+    memory · compute_capability · bf16 · fp16 · fp8 · tensor_cores
+    gpu_count · interconnect · cpu · ram
 ```
 
-### 9.3 Moving to Another Machine
+### 13.2 Feasibility Solver
 
-```
-# On old machine (3070):
-$ cp -r runs/rf_detr_s_20260930_1430/ /media/usb/
-# (or git push, scp, whatever — it's just a folder)
+```text
+Target global batch = 32
 
-# On new machine (H100):
-$ mlforge install                          # self-configuring installer (§2)
-$ mlforge configure datasets               # point at data on THIS machine
-  (download or copy datasets as needed)
-
-$ mlforge open /path/to/rf_detr_s_20260930_1430/
-
-  Reading run folder...
-    Epoch 23/50 | Best mAP 49.1 | RTX 3070 → H100 adaptation (§4.3)
-  
-  Validating datasets (gap #1)...
-    coco_2017: 118,287 ✅ match
-    custom_clips: 200 ✅ match
-  
-  Environment check (gap #2)...
-    torch 2.5.1+cu124 → 2.5.1+cu126: compatible ✅
-  
-  Resume from epoch 23? [Y/n]: y
-  
-  Training... Epoch 24/50 (8.2 it/s on H100 — was 2.1 on 3070)
+Find: micro_batch × grad_accum × world_size = 32
+Subject to:
+    VRAM(micro_batch) ≤ available − overhead
+    precision supported by arch
+    micro_batch ≥ model minimum
 ```
 
-### 9.4 Status View (Explicit Decisions)
+H100 solutions: `32×1×1`, `8×2×2`, `4×4×2` — planner picks a valid one.
 
+### 13.3 Hard Namespace Separation
+
+```text
+SEMANTIC (immutable)                EXECUTION (adaptable)
+────────────────────                ────────────────────
+optimizer                           micro_batch
+learning_rate                       workers
+scheduler                           gpu_count
+loss                                checkpointing
+augmentation                        distributed strategy
+global_batch                        kernel selection
+seed                                prefetch
+epochs                              cpu threads
+model · dataset · precision policy  precision fallback (triggers PORTABLE)
 ```
-$ mlforge status
 
-═══════════════════════════════════════════════════════
- MODELS
-═══════════════════════════════════════════════════════
-  Model          Metric   Baseline  Status    Run Folder
-  ────────────── ──────── ───────── ──────── ──────────────────────────
-  rf_detr_s      mAP 49.1  53.0     ⏸ 23/50   rf_detr_s_20260930_1430
-  osnet          R@1 96.1  95.0     ✅ done   osnet_20261001_0900
-  gbdt_ranker    NDCG 0.87 0.85     ✅ done   gbdt_20261001_1400
-  rf_detr_seg_s  —         43.0     ⬜ never  —
-
-═══════════════════════════════════════════════════════
- AVAILABLE ACTIONS (you decide)
-═══════════════════════════════════════════════════════
-  Resume:      mlforge open runs/rf_detr_s_20260930_1430/
-  Fresh:       mlforge train --config rf_detr_s.yaml
-  Train new:   mlforge train --config rf_detr_seg_s.yaml
-  Evaluate:    mlforge eval --run runs/osnet_20261001_0900
-  Export:      mlforge export --run runs/osnet_20261001_0900 --format onnx
-```
+**Enforcement: `execution → semantic` is forbidden.** Execution code cannot mutate semantic configuration. There is no `--reconfigure` that edits a run in place — semantic change = `mlforge fork` = new run.
 
 ---
 
-## 10. What Trains Where
+## 14. Reproducibility & Precision Policy
 
-### RTX 3070 8GB (Now)
+`precision_policy` declared at run creation:
 
-| Model | micro_batch | grad_accum | effective | Est. Time |
-|---|---|---|---|---|
-| OSNet | 8 | 4 | 32 | ~8h |
-| GBDT (CPU) | — | — | — | ~2h |
-| Calibrator (CPU) | — | — | — | ~2h |
-| RF-DETR-S | 2 | 16 | 32 | ~48h |
-| RF-DETR-Seg-S | 1 | 32 | 32 | ~80h (defer) |
+```yaml
+precision_policy:
+    preferred: bf16
+    fallback: fp32
+```
 
-### H100 80GB (Later — Same Run Folders Resume Here)
-
-| Model | micro_batch | grad_accum | effective | Est. Time |
-|---|---|---|---|---|
-| RF-DETR-S | 32 | 1 | 32 | ~3h |
-| OSNet | 64 | 1 | 32* | ~1.5h |
-| RF-DETR-Seg-S | 16 | 2 | 32 | ~4h |
-| VLM LoRA | 4-8 | — | — | ~8h |
-
-*effective_batch stays at frozen value — hardware just computes it faster.
+`bf16 → fp32` (e.g., on CPU) is allowed but **must produce `execution_mode = PORTABLE`**, never EXACT.
 
 ---
 
-## 11. Disk Space
+## 15. Lineage & Operations
 
-| Item | Size |
+### 15.1 Three Distinct Operations (Never Ambiguous CLI)
+
+```bash
+mlforge resume RUN       # continue an existing trajectory (same run)
+mlforge finetune MODEL   # new optimization from existing model (new run, parent set)
+mlforge train CONFIG     # from scratch (new run, parent null)
+```
+
+### 15.2 Lineage DAG
+
+```bash
+mlforge finetune --from model://rf_detr_s:v4 --dataset custom_v2 --config finetune.yaml
+```
+
+```text
+creates run_005:
+    parent_model: rf_detr_s:v4
+    parent_checkpoint: sha256:...
+    dataset: custom_v2
+```
+
+```text
+                    ┌── finetune B
+base run ── ckpt ───┼── finetune C
+                    └── evaluation
+```
+
+Parent always immutable. No accidental mutation.
+
+### 15.3 Model Artifact (Weights Alone ≠ Model)
+
+```text
+model/
+├── model.safetensors
+├── model_spec.json
+├── architecture.json
+├── preprocessing.json
+├── postprocessing.json
+├── label_map.json
+├── normalization.json
+├── environment.json
+├── provenance.json        # full lineage
+└── integrity.json
+```
+
+Inference is independent of training: `mlforge package` → `mlforge validate` → `mlforge infer`.
+
+### 15.4 Evaluation References Immutable Artifacts
+
+```bash
+mlforge eval --model model://abc --dataset dataset://xyz
+```
+
+Result records `model_hash + dataset_hash + code_hash + environment_hash` → metrics are reproducible.
+
+---
+
+## 16. Event Journal & Source of Truth
+
+```text
+events.jsonl (append-only):
+{"step":0,"event":"run_created"}
+{"step":0,"event":"validation_passed"}
+{"step":18492,"event":"checkpoint_committed"}
+{"step":18492,"event":"hardware_migration","segment":"0002"}
+```
+
+**Metrics are observations, never state.** Training state comes only from checkpoint manifests. Secrets (API keys, tokens) never enter run_spec/environment/logs/checkpoints — only references, injected at runtime.
+
+### 16.1 Single Authority Per Fact
+
+| Information | Authority |
 |---|---|
-| mlforge app + deps | ~5 GB |
-| Pre-trained weights | ~5 GB |
-| Core datasets | ~50 GB |
-| Full datasets (optional) | ~130 GB |
-| Run folders (5 models) | ~2 GB |
-| Transformed/cached data | ~5 GB |
-| **Total** | **~70-195 GB** |
+| Experiment semantics | `run_spec` |
+| Code | source artifact |
+| Dataset | dataset manifest |
+| Transform | transform artifact |
+| Environment | environment artifact |
+| Model | model artifact |
+| Training state | checkpoint |
+| Hardware | execution segment |
+| History | event journal |
+| Metrics | metrics log |
+| Lineage | lineage graph |
 
-2TB HDD on the 3070 machine is plenty.
+No duplicate sources of truth.
 
 ---
 
-## 12. Summary
+## 17. Invariant Table (Implement as Spec)
 
-| Concern | Solution |
+| Invariant | If violated |
 |---|---|
-| Move training between machines | One self-contained run folder — copy it, `mlforge open`, resume |
-| Config mismatch (3070 batch=2 vs H100 batch=32) | Semantic config frozen, hardware config regenerated. effective_batch always preserved |
-| Weaker machine (CPU) | Time estimate warning, user chooses to continue or stop |
-| Want to change batch/LR mid-run | Explicit `--reconfigure`, warning, confirmation |
-| Wrong dataset pointed at resume | ❌ Blocked — manifest validation (gap #1) catches sample count mismatch |
-| Library version mismatch | environment.json comparison, compatibility check with warnings (gap #2) |
-| Dataset paths | User configures per machine via `mlforge configure datasets`. No scanning |
-| Fresh install on any OS | Self-configuring installer detects OS/GPU, installs correct PyTorch |
-| Reusing already-downloaded data | Point at existing folder. Transforms cached. Nothing re-downloaded unless path is wrong |
-| Who decides when to train | You. Always. System reports status, never auto-trains |
+| Run spec immutable | Block |
+| Dataset hash unchanged | Block resume |
+| Transform hash unchanged | Block |
+| Model architecture hash unchanged | Block |
+| Base model hash unchanged | Block |
+| Code artifact available | Block |
+| Environment reproducible | Block or explicit migration |
+| Checkpoint integrity valid | Block |
+| Global batch preserved | Block |
+| Optimizer semantics preserved | Block |
+| LR schedule state recoverable | Block |
+| RNG state recoverable | Exact mode only |
+| Sampler state recoverable | Exact mode only |
+| Precision policy supported | Block or migration |
+| GPU driver compatible | Block |
+| Disk space sufficient | Block |
+| Checkpoint atomicity supported | Block |
+| Schema version supported | Block/migrate |
+| Secrets absent from artifacts | Block packaging |
+
+Schema versions everywhere (`schema_version: 1`). Old schemas require explicit migration: `v1 → migration → v2`. Never silently reinterpret.
+
+---
+
+## 18. Resume Flow (17 Steps)
+
+```text
+mlforge resume RUN
+        │
+        ├──  1. Verify run manifest integrity
+        ├──  2. Verify schema version
+        ├──  3. Verify source artifact + code hash
+        ├──  4. Verify dataset identity (cryptographic)
+        ├──  5. Verify transform identity
+        ├──  6. Verify model architecture + base weights hash
+        ├──  7. Verify environment availability (image digest)
+        ├──  8. Verify driver compatibility (CUDA runtime → min driver)
+        ├──  9. Detect hardware + capabilities
+        ├── 10. Generate execution plan (feasibility solver)
+        ├── 11. Verify global batch preserved
+        ├── 12. Verify precision policy
+        ├── 13. Verify distributed semantics
+        ├── 14. Verify checkpoint integrity (hashes + commit marker)
+        ├── 15. Restore full state (optimizer/scheduler/RNG/sampler)
+        ├── 16. Create execution segment
+        └── 17. Resume
+```
+
+**Any failure in 1–15 → TRAINING DOES NOT START.**
+
+---
+
+## 19. Full Lifecycle
+
+```text
+PROJECT SPEC → DATA REGISTER → TRANSFORM DAG → CODE ARTIFACT
+    → ENV ARTIFACT → RUN SPEC (IMMUTABLE) → PREFLIGHT
+        ├── FAIL → STOP
+        └── PASS → EXECUTION → CHECKPOINT (atomic, hashed)
+                        ├── CONTINUE → CHECKPOINT...
+                        └── STOP → COMPLETE
+                                          │
+                                     NEW MACHINE
+                                          │
+                                       PREFLIGHT
+                                    ┌─────┴─────┐
+                                 EXACT        PORTABLE
+                                    │             │
+                                 RESUME     NEW SEGMENT
+```
+
+Model lifecycle:
+
+```text
+TRAIN → RUN A → MODEL A → {EVALUATE | FINETUNE → RUN B → MODEL B | EXPORT}
+```
+
+Every edge recorded in lineage.
+
+---
+
+## 20. CLI Surface
+
+```bash
+# Setup
+mlforge init                          # create project
+mlforge configure datasets            # machine-local paths (hash-verified)
+mlforge preflight RUN                 # full validation before expense
+
+# Data
+mlforge prepare --model rf_detr_s     # transform DAG, cached, content-addressed
+
+# Operations (three distinct, never ambiguous)
+mlforge train --config X.yaml         # from scratch (new run)
+mlforge resume RUN                    # continue trajectory (same run)
+mlforge fork RUN --set lr=2e-4        # semantic change (new run, parent set)
+
+# Inspection
+mlforge inspect RUN                   # full human-readable report
+mlforge validate RUN                  # the gate — PASS/FAIL per invariant
+mlforge status                        # all runs, explicit actions, no auto-anything
+
+# Downstream
+mlforge eval --model model://X --dataset dataset://Y
+mlforge export --run RUN --format onnx|tensorrt
+mlforge package --run RUN             # inference bundle
+mlforge infer --model model://X
+```
+
+`mlforge inspect RUN` output:
+
+```text
+RUN                          CODE
+──────────────────────       ──────────────────────
+ID:       run_01J...         Commit:   abc123
+Status:   INTERRUPTED        Source:   sha256:...
+Epoch:    23 / 50            Dirty:    NO
+
+DATA                         ENVIRONMENT
+──────────────────────       ──────────────────────
+Train:  dataset://coco:v1    Image:    sha256:...
+Hash:   sha256:...           Python:   3.11.9
+Val:    dataset://cust:v2    PyTorch:  2.5.1
+                              CUDA:     12.4 runtime
+
+TRAINING                     CHECKPOINT
+──────────────────────       ──────────────────────
+Global batch: 32             Epoch:    23
+Optimizer:     AdamW         Step:     18492
+LR:            1e-4          Integrity: VALID
+Scheduler:     cosine        Mode:     PORTABLE-capable
+Seed:          12345
+```
+
+---
+
+## 21. What Changed From v0.1
+
+| v0.1 (old) | v1.0 (this spec) |
+|---|---|
+| Run = folder with files | Run = immutable content-addressed state; folder is materialization |
+| `environment.json` + warnings | Environment artifact = OCI image digest; unknown → BLOCK |
+| Dataset validated by sample count | Dataset validated by cryptographic manifest hash |
+| Absolute paths in configs | Paths machine-local; identity is hash, never path |
+| Transform cache by name | Transform = artifact; cache key = hash(input+transform+config+env) |
+| `--reconfigure` edits semantics | Semantic change = `fork` = new run with parent (DAG) |
+| One checkpoint file | Transactional multi-generation checkpoints + integrity hashes |
+| Hardware config overwritten | Execution segments preserve every hardware context |
+| VRAM lookup tables | Capability negotiation + feasibility solver |
+| `effective_batch = micro × accum` | `global_batch = micro × accum × world_size` |
+| Resume = "compatible → continue" | 17-step validation gate; any fail → no start |
+| CPU: warn + estimate | CPU: same gate; PORTABLE mode only; explicit user choice |
+| No code capture | Source snapshot + git commit + dirty flag in run folder |
+| No RNG preservation | Full RNG hierarchy in checkpoint; Exact mode requires it |
+| Training state from metrics | Metrics = observations; state = checkpoint manifest only |
+| No lineage | Lineage DAG: runs → models → evaluations → exports |
+| No schema versioning | `schema_version` on all artifacts; migration required |
+| Warning-heavy | Formal invariant table; BLOCK vs WARN distinction |
+| Single "resume" command | `train` / `resume` / `fork` — three distinct semantics |
+
+---
+
+## 22. Guarantees Restated
+
+```
+If MLForge cannot prove the continuation is valid,
+MLForge refuses to continue.
+```
+
+That is the design principle that prevents the system from silently
+corrupting a training run. Everything above — immutable specs,
+cryptographic identities, transactional checkpoints, execution
+segments, fail-closed validation — exists to make that refusal
+correct, informative, and rare.
