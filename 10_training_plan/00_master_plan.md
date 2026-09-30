@@ -169,7 +169,7 @@ Everything else uses pre-trained weights or classical algorithms.
 
 ## Hardware Utilization Strategy
 
-> **Full system design in `12_training_system.md`** — the standalone, reusable ML training system (`mlforge`) that auto-adapts to any hardware. Summary below.
+> **Full system design in `12_training_system.md`** — the standalone ML training system (`mlforge`) built on immutable runs, cryptographic artifact identities, and fail-closed validation. Summary below.
 
 ### Two-Phase Hardware Plan
 
@@ -375,7 +375,7 @@ class Pipeline:
 | `09_system_flow.md` | Architecture ↔ code mapping |
 | `10_project_structure_and_consistency.md` | Structure audit, 8 resolved issues |
 | `11_model_weights_and_disk_space.md` | Model weight sizes, disk budgets, download order |
-| `12_training_system.md` | **Standalone ML training system (`mlforge`) — hardware-agnostic, reusable across projects, 3070→H100→multi-GPU** |
+| `12_training_system.md` | **MLForge v1.0 architecture — immutable runs, artifact hashes, fail-closed resume validation, exact vs portable modes, lineage DAG, 3070→H100→multi-GPU** |
 
 ---
 

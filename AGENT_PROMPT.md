@@ -43,7 +43,7 @@ The repo contains 97 markdown files across 12 directories. These are the authori
 10_training_plan/    ← 13 files: master plan, preparation, datasets, training, optimization,
                        inference integration, benchmarking, timeline, infrastructure,
                        system flow, project structure audit, model weights/disk space,
-                       standalone ML training system (mlforge, hardware-agnostic)
+                       MLForge v1.0 training system (immutable runs, fail-closed resume validation)
 ```
 
 ---
@@ -479,7 +479,7 @@ EVENT TRIGGERED (R ≥ 0.5)
 | **Permanent** | H100 ~80GB | Day 10+ | Full-quality retraining, VLM LoRA, everything fast |
 | **Future** | Multi-GPU (2-4× H100) | If needed | DDP/FSDP — auto-detected, no code changes |
 
-Training system design: `10_training_plan/12_training_system.md` (standalone `mlforge` package, hardware-agnostic).
+Training system design: `10_training_plan/12_training_system.md` (MLForge v1.0 — immutable runs, cryptographic artifact identities, fail-closed validation, exact vs portable resume modes).
 
 ### Inference Hardware (Tier 1: Single RTX 4090 24GB — Production Target)
 
