@@ -169,42 +169,44 @@ Everything else uses pre-trained weights or classical algorithms.
 
 ## Hardware Utilization Strategy
 
-### RTX 4090 (24GB) — Primary Training GPU
+> **Full system design in `12_training_system.md`** — the standalone, reusable ML training system (`mlforge`) that auto-adapts to any hardware. Summary below.
+
+### Two-Phase Hardware Plan
+
+| Phase | Hardware | Duration | Purpose |
+|---|---|---|---|
+| **Phase A (Temporary)** | RTX 3070 8GB, 32GB RAM, 2TB HDD | Days 1-10 | Train small models (OSNet, GBDT, calibrator), start RF-DETR-S with batch=2 + grad accumulation |
+| **Phase B (Permanent)** | H100 (~80GB) | Day 10+ | Retrain all models at full quality, VLM LoRA, everything fast |
+| **Phase C (Future)** | Multi-GPU (2-4× H100) | If needed | DDP/FSDP, linear speedup — auto-detected, no code changes |
+
+**Checkpoints trained on the 3070 load directly on the H100** (PyTorch format is hardware-agnostic).
+
+### What Trains Where
+
+| Model | RTX 3070 8GB | H100 80GB |
+|---|---|---|
+| OSNet (Re-ID) | ✅ ~8 hours | ✅ ~1.5 hours |
+| GBDT ranker | ✅ CPU, ~2 hours | ✅ CPU, ~2 hours |
+| Calibrator | ✅ CPU, ~2 hours | ✅ CPU, ~2 hours |
+| RF-DETR-S | ✅ ~48 hours (batch=2, accum=16) | ✅ ~3 hours (batch=32) |
+| DETRPose-S (if fine-tuning) | ✅ ~20 hours | ✅ ~2 hours |
+| RF-DETR-Seg-S | ⚠️ ~80 hours — defer if possible | ✅ ~4 hours |
+| VLM LoRA | ❌ | ✅ ~8 hours |
+
+### Hardware Abstraction (How One Config Works Everywhere)
 
 ```
-Training Phase:
-  GPU Memory: 23GB allocated
-  - Model weights: varies
-  - Optimizer states: 2-4x model size
-  - Activations: depends on batch size
-  - Gradient buffers: 1x model size
-  Training runs: ONE MODEL AT A TIME
-  Background: Nothing else on GPU during training
-
-Inference Phase:
-  GPU Memory: ~8GB allocated
-  - RF-DETR-S: 1.5GB
-  - DETRPose-S: 0.5GB
-  - ByteTrack: 0.05GB
-  - CUDA context: 1GB
-  - Working space: 2GB
-  Total: ~5GB, leaves headroom for VLM inference
-```
-
-### If Only RTX 5070 Ti (16GB) Available
-
-```
-Training Phase:
-  - Reduce batch size
-  - Use gradient accumulation
-  - Use mixed precision (FP16/BF16)
-  - One model at a time, no exceptions
-  - May need to reduce RF-DETR input resolution during training
-
-Inference Phase:
-  - Perception pipeline: ~3GB
-  - VLM: API fallback (GPT-4.1 / Gemini Flash)
-  - OR local Qwen3-VL-30B-A3B FP8 (fits in remaining 13GB if 4090D 48GB, else API fallback)
+Config says: target_effective_batch=32
+                    │
+            Hardware detector runs
+                    │
+     ┌──────────────┼──────────────┐
+     ▼              ▼              ▼
+  3070 8GB      H100 80GB     Multi-GPU
+  batch=2       batch=32      batch=64/GPU
+  accum=16      accum=1       strategy=ddp
+  bf16          bf16/fp8      bf16
+  grad_ckpt=on  grad_ckpt=off grad_ckpt=off
 ```
 
 ---
@@ -363,12 +365,17 @@ class Pipeline:
 |---|---|
 | `00_master_plan.md` | This file — overview and strategy |
 | `01_pre_training_preparation.md` | Environment setup, dependencies, verification |
-| `02_dataset_preparation.md` | Every dataset, every preprocessing step |
+| `02_dataset_preparation.md` | Every dataset, every preprocessing step, download priority |
 | `03_training_pipeline.md` | Exact training configs for each model |
 | `04_optimization_strategies.md` | Mixed precision, TensorRT, quantization |
 | `05_inference_integration.md` | How models connect into the pipeline |
 | `06_benchmarking_plan.md` | How we measure everything |
 | `07_timeline_milestones.md` | Day-by-day execution plan |
+| `08_infrastructure_development.md` | Infrastructure code plan |
+| `09_system_flow.md` | Architecture ↔ code mapping |
+| `10_project_structure_and_consistency.md` | Structure audit, 8 resolved issues |
+| `11_model_weights_and_disk_space.md` | Model weight sizes, disk budgets, download order |
+| `12_training_system.md` | **Standalone ML training system (`mlforge`) — hardware-agnostic, reusable across projects, 3070→H100→multi-GPU** |
 
 ---
 

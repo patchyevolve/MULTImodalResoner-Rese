@@ -2,6 +2,8 @@
 
 > Day-by-day execution plan. Every day has a clear deliverable. No ambiguity.
 
+> **Hardware note:** Days 1-10 run on RTX 3070 8GB (temporary). Day 10+ migrate to H100. Full hardware strategy in `12_training_system.md`. Batch sizes auto-adapt — no config changes needed at migration.
+
 ---
 
 ## Phase 0: Pre-Training Preparation (Days 1-3)
