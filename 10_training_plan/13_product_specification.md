@@ -52,7 +52,7 @@ A run produces a model. A model never mutates — retrain/fine-tune create new r
 ### 2.3 Actions
 
 ```text
-PREPARE · TRAIN · RESUME · RETRAIN · FINE-TUNE · EVALUATE · INFER · EXPORT · COMPARE
+PREPARE · TRAIN · RESUME · PAUSE · STOP · RETRAIN · FINE-TUNE · EVALUATE · INFER · EXPORT · COMPARE
 ```
 
 Each maps to exactly one command. **The command expresses intent** — no generic "what do you want to do?" menu (safer for automation and scripting).
@@ -80,14 +80,14 @@ Each maps to exactly one command. **The command expresses intent** — no generi
                     └──────┬───────┘
                            ▼
                        RUN #1
-              ┌────────────┼───────────────┐
-              ▼            ▼               ▼
-           RESUME       EVALUATE         STOP
-              │            ▼               │
-              │         REPORT             │
-              ▼                            ▼
-           COMPLETE ◄─────────────────────(paused→resume)
-              ▼
+              ┌────────┼───────────┬────────────┐
+              ▼        ▼           ▼            ▼
+           RESUME   EVALUATE      PAUSE        STOP
+              │        ▼        (parked,      (terminal,
+              │     REPORT      resumable)     spend resume)
+               ▼        │           │            │
+            COMPLETE ◄──┘           └──resume──► ▼
+               ▼                          (new run via RETRAIN)
            MODEL #1
       ┌──────┼───────────────┬────────────┐
       ▼      ▼               ▼            ▼
@@ -143,10 +143,16 @@ mlforge prepare <MODEL_DEF>             Transform raw → model-ready
 TRAINING
 ────────────────────────────────────────────────────────────
 mlforge train [--config F] [--attach]   Start new run (from scratch)
-mlforge resume <RUN>                    Continue paused run
-mlforge stop <RUN>                      Graceful stop → PAUSED
+mlforge resume <RUN>                    Continue paused/interrupted run
+mlforge pause <RUN>                     Graceful pause → PAUSED (resumable)
+mlforge stop <RUN>                      Graceful stop → STOPPED (terminal)
 mlforge retrain <MODEL> [--dataset D]   New run, fresh init
 mlforge finetune <MODEL> [--dataset D]  New run, from model weights
+
+LEASES (concurrency — architecture §23)
+────────────────────────────────────────────────────────────
+mlforge lease status <RUN>              Who holds the run lease
+mlforge lease break <RUN> --force       Break stale lease (--yes, logged)
 
 MODEL
 ────────────────────────────────────────────────────────────
@@ -188,6 +194,8 @@ mlforge events <RUN> [--follow]         Structured event stream
 | **`--yes`** | Skip confirmation prompts (for automation) |
 | **Semantic changes** | Always require confirmation unless `--yes` |
 | **No interactive menu** | Intent is the command name, never a "what do you want?" prompt |
+| **Idempotent by `--command-id`** | State-changing commands dedupe on a client-supplied id (§4.4) |
+| **No auto-anything** | Nothing in this contract starts, restarts, or reconfigures training implicitly |
 
 ### 4.3 Object Reference Syntax
 
@@ -197,6 +205,32 @@ MODEL     model://rf_detr_s:v2    or rf_detr_s:v2
 DATASET   dataset://coco_2017:v1  or coco_2017:v1
 EVAL      evaluation://eval_001
 ```
+
+### 4.4 Command Idempotency (Safe Retries)
+
+Networks and shells drop. Retrying a command must never duplicate work or create a second run:
+
+```bash
+$ mlforge train --config X.yaml --command-id 01JABC...
+→ started run_01JDEF...
+
+# same command re-submitted (script retry, double-Enter, flaky SSH):
+$ mlforge train --config X.yaml --command-id 01JABC...
+→ command 01JABC... already completed → returning run_01JDEF...   (exit 0)
+```
+
+| Command | Dedupe key | Duplicate behavior |
+|---|---|---|
+| `train` / `retrain` / `finetune` | `command_id` | return original run id — **never a second run** |
+| `evaluate` / `export` / `package` | `command_id` | return original result id — never recompute |
+| `prepare` | `command_id` (+ content-addressed result) | return cached artifact identity |
+| `pause` / `stop` / `resume` / `fork` | run state (natural key) | idempotent: already in target state → success, no-op, exit 0 |
+| `status` / `inspect` / `list` / `events` | n/a | read-only, always safe |
+
+Rules:
+- No `--command-id` → CLI generates one per invocation (dedupe covers internal retries only).
+- A `command_id` whose command **failed** may be retried (failures are retryable); a `command_id` that **succeeded** returns its original result and never re-executes.
+- Duplicates are recorded in the command journal — visible in `mlforge events` as `COMMAND_DEDUPED`.
 
 ---
 
@@ -220,24 +254,38 @@ REGISTERED → VERIFIED → PREPARED
 
 ```text
 CREATED → VALIDATING → READY → RUNNING
-                              │  │  │
-              ┌───────────────┘  │  └───────────────┐
-              ▼                  ▼                  ▼
-          PAUSING            CHECKPOINTING        FAILED
-              │                  │                  │
-              ▼                  │                  ▼
-          PAUSED ───resume──►VALIDATING        (recover)→ VALIDATING
-              │
-              ▼
-          STOPPED (terminal)
-                             ┌────────────────────┐
-                             │                    ▼
-                             │               COMPLETED
-                             │                    │
-                             └────────────► MODEL CREATED
+                               │  │  │
+               ┌───────────────┘  │  └──────────┬────────────┐
+               ▼                  ▼             ▼            ▼
+           PAUSING          CHECKPOINTING    FAILED     INTERRUPTED
+               │                                 ▲            │
+               ▼                                 │            ▼
+           PAUSED ────resume────►VALIDATING      (no          RECONCILING
+               │                                valid             │
+               ▼                                ckpt)             ▼
+           STOPPING ──► STOPPED (terminal)                 VALIDATING
+               ▲
+               │ (only from RUNNING / PAUSED via `mlforge stop`)
+
+RUNNING ──epochs complete──► COMPLETED ──► MODEL CREATED
 ```
 
-Transitions:
+#### Lifecycle Terms (Never Interchangeable)
+
+| State | Cause | Terminal? | Resumable? | Meaning to user |
+|---|---|---|---|---|
+| `PAUSED` | you ran `mlforge pause` | no | yes — `resume` is ordinary | "your run, safely parked" |
+| `INTERRUPTED` | crash / power loss / kill -9 | no | yes — after automatic reconciliation | "something died; here's what I found" |
+| `FAILED` | unrecoverable error (validation BLOCK, no valid checkpoint) | yes | no — fork or restart | "stopped; cause is in `mlforge events`" |
+| `STOPPED` | you ran `mlforge stop` | yes | no — continue via `retrain`/new run | "you ended this run" |
+| `COMPLETED` | reached end condition | yes | no | "done" |
+
+**Confusable pairs:**
+- `PAUSED` vs `STOPPED` — both user-caused; pause keeps resume, stop spends it.
+- `FAILED` vs `INTERRUPTED` — both unexpected; interrupted is recoverable, failed is not.
+- `INTERRUPTED` vs "still running" — a stale `status.json` saying RUNNING after a crash is `INTERRUPTED` the moment the heartbeat expires; the system reconciles before showing you anything (§9.4).
+
+#### Transitions
 
 | From | Event | To |
 |---|---|---|
@@ -245,16 +293,23 @@ Transitions:
 | VALIDATING | all checks pass | READY |
 | VALIDATING | any check fails | FAILED (blocked, never RUNNING) |
 | READY | preflight pass | RUNNING |
-| RUNNING | `stop` command | PAUSING |
+| RUNNING | `pause` command | PAUSING |
 | PAUSING | checkpoint committed | PAUSED |
+| RUNNING | `stop` command | STOPPING |
+| STOPPING | final checkpoint committed | STOPPED |
 | RUNNING | checkpoint cycle | CHECKPOINTING → RUNNING |
 | RUNNING | unrecoverable error | FAILED |
 | RUNNING | epochs complete | COMPLETED |
 | PAUSED | `resume` + validation pass | VALIDATING → READY → RUNNING |
-| PAUSED | `stop` (final) | STOPPED |
+| RUNNING (or any live state) | crash / power loss detected | **INTERRUPTED** (via heartbeat expiry) |
+| INTERRUPTED | reconciliation scan | RECONCILING |
+| RECONCILING | valid checkpoint found | VALIDATING → READY → RUNNING (after `resume`) |
+| RECONCILING | no valid checkpoint | FAILED |
 | FAILED | `resume` + cause resolved | VALIDATING |
+| FAILED / STOPPED / COMPLETED | `retrain` / `finetune` | **new run** (never mutates this one) |
 
 **Resume IS a state transition. Retrain/fine-tune are NOT** — they create new runs.
+**`stop` and `pause` are different commands** — the old behavior of `stop → PAUSED` was ambiguous and is removed.
 
 ### 5.4 Model
 
@@ -330,8 +385,10 @@ Start training? [Y/n]
 
 ### 6.2 RESUME
 
+`resume` accepts a run in `PAUSED` or `INTERRUPTED` state. For `INTERRUPTED`, reconciliation (12 §12.3) runs *before* validation: it derives the true state from checkpoint manifests, reports any skipped checkpoints, then the 19-step gate proceeds.
+
 ```text
-User              CLI            Orchestrator         Validation Gate (17 steps)
+User              CLI            Orchestrator         Validation Gate (19 steps)
  │                 │                   │                      │
  ├──mlforge resume─┤                   │                      │
  │                 ├──RESUME──────────►│                      │
@@ -339,6 +396,8 @@ User              CLI            Orchestrator         Validation Gate (17 steps)
  │                 │                   │◄──PASS (mode=EXACT    │
  │                 │                   │    or PORTABLE)───────┤
  │                 │                   │  (any FAIL → STOP, no execution)
+ │                 │                   ├──ACQUIRE RUN LEASE    │
+ │                 │                   ├──REVALIDATE volatile  │
  │                 │                   ├──CREATE SEGMENT       │
  │                 │                   ├──RESTORE full state   │
  │                 │                   ├──RUNNING              │
@@ -356,7 +415,7 @@ RESUME BLOCKED
   Found:    sha256:def... at /home/daksh/data/coco
   Reason:   different content (same count, different files)
 
-No changes were made. Run remains PAUSED.
+No changes were made. Run state unchanged.
 ```
 
 **Migration-impossible output:**
@@ -437,13 +496,13 @@ Fine-tuning strategy:  1. Full  2. Freeze backbone  3. Freeze encoder
 
 **Default source:** `model://rf_detr_s:v1` (model artifact). Specific checkpoint (`--from run_001/checkpoint/37`) is supported but non-default.
 
-### 6.5 STOP
+### 6.5 PAUSE / STOP
 
 ```text
 User          CLI          Orchestrator      Runtime
  │             │                 │               │
- ├──stop RUN──►│                 │               │
- │             ├──STOP──────────►│               │
+ ├──pause RUN──┤                 │               │
+ │             ├──PAUSE─────────►│               │
  │             │                 ├──STOP REQUEST─►
  │             │                 │               ├──finish safe boundary
  │             │                 │               ├──save checkpoint.tmp
@@ -453,7 +512,20 @@ User          CLI          Orchestrator      Runtime
  │◄──checkpoint VALID, PAUSED────┤               │
 ```
 
-Same protocol for Ctrl+C, SIGTERM, SLURM preemption, power loss — the only difference is whether the last checkpoint committed.
+`mlforge stop` runs the same sequence but ends in **STOPPED (terminal)** — resume capability is spent; continue only via `retrain`/`finetune`.
+
+**Only graceful signals use this protocol:**
+
+```text
+pause / stop / Ctrl+C / SIGTERM / SLURM preemption signal:
+    → safe boundary → checkpoint → commit → PAUSED or STOPPED
+
+kill -9 / power loss / host crash (NO graceful path):
+    → nothing is saved → heartbeat expires → INTERRUPTED
+    → reconciliation scan → resume from last COMMITTED checkpoint (12 §11.2)
+```
+
+A crash is never reported as `PAUSED` — it did not stop gracefully, so the system must reconcile before it can promise a resume point.
 
 ### 6.6 PREPARE
 
@@ -486,7 +558,7 @@ User                    CLI              Orchestrator
  │                       │◄──evaluation://eval_001
 ```
 
-Evaluation artifact records `model_hash + dataset_hash + code_hash + environment_hash` → reproducible metrics.
+Evaluation artifact records `model_hash + dataset_hash + code_hash + environment_hash + evaluation_protocol_hash` → reproducible, **and comparable only when the protocol hash matches** (`12` §15.4). The protocol shown at confirmation includes split, metric definitions, thresholds, NMS settings, and seed — if the user later evaluates the same model with a different protocol, that is a *different* evaluation artifact, not an update.
 
 ### 6.8 INFER
 
@@ -534,13 +606,15 @@ Training data ...
 (descriptive only — does not choose a winner for the user)
 ```
 
+**Comparability gate:** if any two evaluated models used different `evaluation_protocol_hash` values (different split, metrics, thresholds, or harness), their metric columns are marked `NOT_COMPARABLE` — shown, never averaged together. Same protocol = comparable numbers; different protocol = different measurement.
+
 ---
 
 ## 7. Failure Behavior Matrix
 
 Every transition has defined failure behavior. **Fail-closed: no partial execution, no silent degradation.**
 
-> **The invariants these failures enforce are defined in `12_training_system.md` §17; the 17-step resume validation gate is §18; checkpoint transactionality is §11.** This matrix defines the *product-visible behavior* when those mechanisms fail.
+> **The invariants these failures enforce are defined in `12_training_system.md` §17; the 19-step resume validation gate is §18; checkpoint transactionality is §11; leases are §23.** This matrix defines the *product-visible behavior* when those mechanisms fail.
 
 | Transition | Failure | Behavior |
 |---|---|---|
@@ -549,13 +623,17 @@ Every transition has defined failure behavior. **Fail-closed: no partial executi
 | VALIDATING → READY | disk insufficient | → FAILED before execution. Show required vs available. |
 | READY → RUNNING | preflight fails | → FAILED. No training started. |
 | RUNNING → CHECKPOINTING | write fails / disk full | → attempt rollback to last committed checkpoint; if repeated → FAILED. Run remains resumable from last commit. |
-| RUNNING → CHECKPOINTING | power loss mid-write | On restart: incomplete ckpt detected (no commit marker) → auto-report `resume point: N-1`. |
-| RUNNING → PAUSING | stop during checkpoint | Wait for in-flight checkpoint to commit, then PAUSED. |
+| RUNNING → CHECKPOINTING | power loss mid-write | On restart: incomplete ckpt detected (no commit marker) → newest-valid identity predicate selects resume point, all skips reported (`12` §11.2). |
+| RUNNING | crash / power loss / kill -9 | Heartbeat expires → **INTERRUPTED** (never reported as PAUSED or RUNNING). Reconciliation scan → valid checkpoint → user may `resume`; no valid checkpoint → **FAILED**. |
+| RUNNING → PAUSING | pause during checkpoint | Wait for in-flight checkpoint to commit, then PAUSED. |
 | PAUSING → PAUSED | checkpoint fails | Retry once; if fails → FAILED with last-good checkpoint recorded. |
 | PAUSED → VALIDATING | resume, dataset hash mismatch | → **BLOCK**. Stays PAUSED. Exit 1. No changes. |
 | PAUSED → VALIDATING | resume, environment unavailable | → **BLOCK** through compatibility resolver. No "probably compatible." |
 | PAUSED → VALIDATING | global batch unachievable | → **BLOCK** with migration options (other machine / fork / cancel). |
-| PAUSED → VALIDATING | checkpoint corrupt | → fall back to N-1, N-2; record `recovery_from_checkpoint`. If all corrupt → BLOCK. |
+| PAUSED → VALIDATING | checkpoint corrupt | → newest-valid predicate skips corrupt generations (with per-skip report); if none valid → **BLOCK** with `NO VALID CHECKPOINT` (fork or restart). |
+| Any → RUNNING | resume while already executing | → **BLOCK**: `run lease held by pid N on host H`. Suggest `mlforge status`. Explicit `mlforge lease break` required to override. |
+| Any | duplicate `--command-id` | → return original result; no second run created. Exit 0 with `COMMAND_DEDUPED` event. |
+| RESUME on INTERRUPTED | state.json stale vs checkpoint manifest | Manifest wins; state.json rebuilt from journal during reconciliation. User sees reconciled state, never the stale one. |
 | RUNNING (OOM) | GPU OOM | Capture failure → rollback to last committed checkpoint → planner adjusts **execution only** (micro_batch/accum) → validate global batch preserved → new execution segment. Never touches LR/optimizer/loss/dataset. |
 | RUNNING → FAILED | unrecoverable error | State FAILED; last committed checkpoint intact; `resume` allowed after cause resolved. |
 | RUNNING → COMPLETED | epochs done | → MODEL CREATED (validate → AVAILABLE). |
@@ -625,12 +703,15 @@ The system explains consequences; it never silently chooses.
 
 | Term | Meaning | Authority |
 |---|---|---|
-| **State** | What's required to recover training | checkpoint manifest + `state.json` |
+| **State** | What's required to recover training | checkpoint manifest (+ commit marker); `state.json` is a projection (`12` §16.1) |
+| **Liveness** | Is a process running *right now* | supervisor heartbeat (not `state.json`) |
 | **Status** | What is happening right now | live projection (never authoritative) |
 | **Metrics** | Historical observations | `metrics/metrics.jsonl` |
 | **Events** | What happened and when | `events/events.jsonl` (append-only) |
 
 **Core invariant: `STATUS DOWN → TRAINING CONTINUES`.** GUI crash, closed terminal, lost network — none can corrupt or alter the run.
+
+**Liveness rule: `state.json` never proves a live process.** Only a fresh heartbeat does; expired heartbeat + `RUNNING` on disk → reconciled to `INTERRUPTED` before display (`12` §12.3).
 
 ### 9.2 Control Plane vs Training Plane
 
@@ -650,6 +731,12 @@ The system explains consequences; it never silently chooses.
 ```
 
 The training plane continues if the control plane disappears. **Commands are asynchronous** — `mlforge train` returns a run ID and releases the terminal; `--attach` opts into the viewer.
+
+**Process ownership:** the training worker is never a child of your shell. `mlforge train` submits to a per-user **supervisor daemon**, which spawns and owns the worker and emits heartbeats (`12` §12.4). Consequences:
+
+- closing the terminal / dropping SSH does not kill training (`--attach` viewer detaches; worker lives on);
+- the supervisor **never auto-restarts** a dead worker — restart = `resume` = your decision;
+- if the supervisor itself dies, workers keep running and status rebuilds from run folders on next command.
 
 ### 9.3 Local State Server (instant, decoupled status)
 
@@ -684,13 +771,17 @@ Different purposes, different files. **Metrics are never used to reconstruct sta
  "last_seen":"...","global_step":18492,"state":"RUNNING"}
 ```
 
-Stale heartbeat ≠ failure:
+Stale heartbeat → `INTERRUPTED`, **not** `FAILED` (unexpected ≠ unrecoverable):
 
 ```text
 WARNING — no heartbeat for 120s.
 Possible: stalled process / hung kernel / machine unreachable / crash.
-Training state has NOT been marked failed.
-Last committed checkpoint: step 18,492.
+Run marked INTERRUPTED (not failed) — awaiting reconciliation.
+Last committed checkpoint: step 18,492 (integrity verified).
+
+$ mlforge resume run_01JABC
+  reconciliation: state.json said RUNNING, no live worker → INTERRUPTED
+  checkpoint 18,492: VERIFIED → resume point
 ```
 
 **Never infer state from telemetry** — `GPU=0%` may mean checkpointing, validation, data loading, or CPU preprocessing. Lifecycle state comes only from the orchestrator.
@@ -794,6 +885,7 @@ my-project/
 ├── runs/
 │   └── run_01JABC.../        # portable run (see architecture §5)
 │       ├── run_spec.json     # immutable identity
+│       ├── .lease             # single-writer run lease (architecture §23)
 │       ├── state/            # state.json · heartbeat.json · live.json
 │       ├── events/ · metrics/
 │       ├── checkpoints/ · segments/ · code/ · environment/
@@ -802,6 +894,7 @@ my-project/
 ├── artifacts/                # model artifacts (content-addressed refs)
 └── ~/.mlforge/
     ├── datasets_<project>.yaml   # machine-local paths (never in identity)
+    ├── commands.jsonl            # idempotency journal (§4.4)
     └── store/sha256/...          # content-addressed artifact store
 ```
 
@@ -818,13 +911,15 @@ Given this spec + the architecture spec (`12_training_system.md`), build order:
 2. Artifact registry + content store + run_spec canonical hashing
 3. Validation gate + preflight (fail-closed core)
 4. CLI contract implementation (thin layer over Workflow API)
-5. Training runtime + transactional checkpoints + heartbeat/state server
-6. Status layer (L1/L2/L3, watch, events) — read-only
-7. Ingestion/transform DAG
-8. Execution planner (capability negotiation)
-9. Resume/retrain/finetune flows + lineage DAG
-10. Evaluate/compare/infer/export/package
-11. TUI/GUI over the same Workflow API
+5. Supervisor daemon + run leases + idempotency journal (§4.4, 12 §23)
+6. Training runtime + transactional checkpoints + heartbeat/state server
+   + reconciliation scan (12 §12.3)
+7. Status layer (L1/L2/L3, watch, events) — read-only
+8. Ingestion/transform DAG
+9. Execution planner (capability negotiation)
+10. Resume/retrain/finetune flows + lineage DAG
+11. Evaluate/compare/infer/export/package (incl. evaluation protocol identity)
+12. TUI/GUI over the same Workflow API
 ```
 
 The invariant machinery (architecture spec) is the foundation; this product spec defines how the human drives it. Neither exists without the other.

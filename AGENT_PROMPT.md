@@ -480,7 +480,7 @@ EVENT TRIGGERED (R ≥ 0.5)
 | **Permanent** | H100 ~80GB | Day 10+ | Full-quality retraining, VLM LoRA, everything fast |
 | **Future** | Multi-GPU (2-4× H100) | If needed | DDP/FSDP — auto-detected, no code changes |
 
-Training system design: `10_training_plan/12_training_system.md` (MLForge v1.0 — immutable runs, cryptographic artifact identities, fail-closed validation, exact vs portable resume modes).
+Training system design: `10_training_plan/12_training_system.md` (MLForge v1.0 — immutable runs, cryptographic artifact identities, fail-closed validation, exact vs portable resume modes, run/execution leases, deterministic crash recovery via newest-valid checkpoint predicate, semantic-invariant matrix, host compatibility profiles, five-layer identity stack). Product layer: `10_training_plan/13_product_specification.md` (CLI contract with command idempotency, PAUSED/INTERRUPTED/FAILED/STOPPED lifecycle terms, sequence diagrams, failure matrix, supervisor daemon + heartbeat liveness).
 
 ### Inference Hardware (Tier 1: Single RTX 4090 24GB — Production Target)
 
