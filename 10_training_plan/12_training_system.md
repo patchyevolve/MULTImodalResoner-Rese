@@ -911,13 +911,14 @@ CREATED → VALIDATING → PREPARING → READY → RUNNING
                                         ├── STOPPING → STOPPED      (user, terminal)
                                         ├── CHECKPOINTING
                                         ├── INTERRUPTED             (unexpected, needs reconciliation)
-                                        ├── FAILED                  (terminal, no auto-resume)
+                                        ├── FAILED                  (recovery disposition recorded)
                                         └── COMPLETED
 ```
 
 ```text
 Resume:    PAUSED → VALIDATING → READY → RUNNING
 Recover:   INTERRUPTED → RECONCILING → (explicit resume) → VALIDATING → READY → RUNNING
+Retry:     FAILED (recovery: RESUME) → VALIDATING → READY → RUNNING
 Fork:      CHECKPOINT → FORK → NEW RUN → VALIDATE → TRAIN
 Inference: MODEL ARTIFACT → ENV VALIDATION → SCHEMA VALIDATION → INFERENCE
 ```
@@ -928,11 +929,36 @@ Inference: MODEL ARTIFACT → ENV VALIDATION → SCHEMA VALIDATION → INFERENCE
 |---|---|---|---|---|
 | `PAUSED` | user ran `mlforge pause` | no | yes, ordinary resume path | none |
 | `INTERRUPTED` | crash, power loss, kill -9, host reboot | no | yes, but only after **reconciliation scan** | verify checkpoint, reconcile state, resume |
-| `FAILED` | unrecoverable error (validation BLOCK, no valid checkpoint, invariant violation) | yes | no — fork or restart | inspect `events.jsonl` + logs |
+| `FAILED` | error stopped the run | yes | **per recorded `failure.recovery`** (RESUME / FORK_ONLY) | inspect `events.jsonl` + logs; `resume` or `fork` |
 | `STOPPED` | user ran `mlforge stop` (graceful, final checkpoint committed) | yes | no — continue only via `mlforge retrain` / new run | optional: `evaluate` / `export` / `retrain` |
 | `COMPLETED` | training reached its end condition | yes | no — continue only via `retrain` | optional: `evaluate` / `export` |
 
-`STOPPED` and `PAUSED` are both user-initiated but differ in intent: pause preserves resume capability; stop consumes it. `FAILED` and `INTERRUPTED` are both unexpected but differ in cause: interrupted leaves recoverable state; failed does not.
+*Terminal* = no automatic continuation, ever. States exit only via explicit command: `resume` for `PAUSED`/`INTERRUPTED`/`FAILED(RESUME)`; `retrain`/`finetune` (new run) for `FAILED(FORK_ONLY)`/`STOPPED`/`COMPLETED`.
+
+#### FAILED Carries `failure.recovery` (One Meaning, Recorded Disposition)
+
+`FAILED` must not mean both "terminal" and "resumable." It is a single terminal state whose **disposition is recorded when the state is entered**:
+
+```yaml
+failure:
+    cause: "CUDA OOM at step 41200"      # always recorded
+    recovery: RESUME | FORK_ONLY         # decided once, at entry
+    valid_checkpoint: ckpt-000021         # or null
+```
+
+```text
+failure.recovery =
+    FORK_ONLY   if NO valid checkpoint exists OR the cause is semantic
+                (fixing it would change the experiment → must fork)
+    RESUME      otherwise (valid checkpoint + cause resolvable without
+                semantic change)
+```
+
+- `RESUME` → `mlforge resume` re-runs the full 19-step gate (§18). An unfixed cause blocks again — disposition never bypasses validation.
+- `FORK_ONLY` → `mlforge resume` exits `3`: `NO VALID CONTINUATION — use mlforge fork or retrain.` Never silently starts from step 0.
+- Pre-first-checkpoint failures (validation gate, preflight, artifact resolution) are structurally `FORK_ONLY` — there is nothing to resume.
+
+`STOPPED` and `PAUSED` are both user-initiated but differ in intent: pause preserves resume capability; stop consumes it. `FAILED` and `INTERRUPTED` are both unexpected but differ in protocol: interrupted always recovers *through reconciliation* (resume iff a valid checkpoint exists); failed enters with an explicit disposition recorded at failure time.
 
 #### Checkpoint Manifest Is Recovery Authority; `state.json` Is a Projection
 
@@ -1009,7 +1035,7 @@ Invariants:
 - **Reconciliation is idempotent** — running it twice produces identical results and no duplicate events (event has deterministic `reconciliation_id = SHA256(run + authority_state)`).
 - **Reconciliation never mutates checkpoints or run_spec** — it only writes the event and projects run state.
 - **Reconciliation never starts training** — it only reports. Resume remains an explicit user action (§13.3, `resume = explicit`).
-- A run in `INTERRUPTED` with no valid checkpoint → `FAILED` transition on reconciliation, never silent restart.
+- A run in `INTERRUPTED` with no valid checkpoint → `FAILED` (`recovery: FORK_ONLY`) transition on reconciliation, never silent restart.
 
 ### 12.4 Process Ownership (The CLI Is Not the Parent)
 

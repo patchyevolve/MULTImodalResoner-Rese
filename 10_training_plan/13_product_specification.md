@@ -143,7 +143,7 @@ mlforge prepare <MODEL_DEF>             Transform raw → model-ready
 TRAINING
 ────────────────────────────────────────────────────────────
 mlforge train [--config F] [--attach]   Start new run (from scratch)
-mlforge resume <RUN>                    Continue paused/interrupted run
+mlforge resume <RUN>                    Continue paused/interrupted/FAILED(RESUME) run
 mlforge pause <RUN>                     Graceful pause → PAUSED (resumable)
 mlforge stop <RUN>                      Graceful stop → STOPPED (terminal)
 mlforge retrain <MODEL> [--dataset D]   New run, fresh init
@@ -253,21 +253,27 @@ REGISTERED → VERIFIED → PREPARED
 ### 5.3 Training Run (core)
 
 ```text
-CREATED → VALIDATING → READY → RUNNING
-                               │  │  │
-               ┌───────────────┘  │  └──────────┬────────────┐
-               ▼                  ▼             ▼            ▼
-           PAUSING          CHECKPOINTING    FAILED     INTERRUPTED
-               │                                 ▲            │
-               ▼                                 │            ▼
-           PAUSED ────resume────►VALIDATING      (no          RECONCILING
-               │                                valid             │
-               ▼                                ckpt)             ▼
-           STOPPING ──► STOPPED (terminal)                 VALIDATING
-               ▲
-               │ (only from RUNNING / PAUSED via `mlforge stop`)
+CREATED → VALIDATING → READY → RUNNING ──epochs complete──► COMPLETED
+                │                     │
+                │                     ├── pause ──► PAUSING ──► PAUSED ──resume──► VALIDATING
+                │                     │                              │
+                │                     │                              └── stop ──► STOPPING ──► STOPPED
+                │                     │
+                │                     ├── checkpoint cycle ──► CHECKPOINTING ──► RUNNING
+                │                     │
+                │                     ├── crash / power loss ──► INTERRUPTED ──► RECONCILING
+                │                     │                              (reconciliation scan)
+                │                     │                         ├─ valid ckpt ─► (resume) VALIDATING
+                │                     │                         └─ none ───────► FAILED[FORK_ONLY]
+                │                     │
+                │                     └── runtime error ──► FAILED[RESUME | FORK_ONLY]
+                │
+                └── gate BLOCK ──► FAILED[FORK_ONLY]
 
-RUNNING ──epochs complete──► COMPLETED ──► MODEL CREATED
+FAILED[RESUME]     ── resume + cause resolved + 19-step gate pass ──► VALIDATING
+FAILED[RESUME]     ── resume, cause unresolved ──► BLOCK (exit 1), stays FAILED
+FAILED[FORK_ONLY]  ── resume ──► BLOCK (exit 3): fork / retrain only (new run)
+FAILED | STOPPED | COMPLETED ── retrain / finetune ──► new run (this run never mutates)
 ```
 
 #### Lifecycle Terms (Never Interchangeable)
@@ -276,13 +282,38 @@ RUNNING ──epochs complete──► COMPLETED ──► MODEL CREATED
 |---|---|---|---|---|
 | `PAUSED` | you ran `mlforge pause` | no | yes — `resume` is ordinary | "your run, safely parked" |
 | `INTERRUPTED` | crash / power loss / kill -9 | no | yes — after automatic reconciliation | "something died; here's what I found" |
-| `FAILED` | unrecoverable error (validation BLOCK, no valid checkpoint) | yes | no — fork or restart | "stopped; cause is in `mlforge events`" |
+| `FAILED` | error stopped the run | yes | **depends on `failure.recovery`** (below) | "stopped; cause is in `mlforge events`" |
 | `STOPPED` | you ran `mlforge stop` | yes | no — continue via `retrain`/new run | "you ended this run" |
 | `COMPLETED` | reached end condition | yes | no | "done" |
 
+*Terminal?* means: **no automatic continuation, ever.** Every non-`RUNNING` state exits only through an explicit command — `resume` for `PAUSED`/`INTERRUPTED`/`FAILED(recovery: RESUME)`, and only `retrain`/`finetune` (a new run) for `FAILED(recovery: FORK_ONLY)`/`STOPPED`/`COMPLETED`. Nothing in the system transitions a run on its own.
+
+#### FAILED Carries a Recovery Disposition (Not Resumability-by-Guesswork)
+
+`FAILED` is one state with an explicit, recorded disposition — never two contradictory meanings:
+
+```yaml
+failure:
+    cause: "CUDA OOM at step 41200"        # always recorded
+    recovery: RESUME | FORK_ONLY           # recorded when the state is entered
+    valid_checkpoint: ckpt-000021           # or null
+```
+
+```text
+failure.recovery =
+    FORK_ONLY   if NO valid checkpoint exists
+             OR the cause is semantic (run_spec / invariant violation —
+                 fixing it would change the experiment)
+    RESUME      otherwise (valid checkpoint + cause resolvable without
+                 semantic change: OOM, disk full, env unavailable, transient I/O)
+```
+
+- `FAILED + recovery=RESUME` → `mlforge resume` re-runs the full 19-step gate; if the cause is not actually fixed, the gate blocks again. Entry to `resume` never bypasses validation.
+- `FAILED + recovery=FORK_ONLY` → `mlforge resume` exits `3` (precondition failed): `NO VALID CONTINUATION — use mlforge fork or retrain (new run).` Never silently starts from step 0.
+
 **Confusable pairs:**
 - `PAUSED` vs `STOPPED` — both user-caused; pause keeps resume, stop spends it.
-- `FAILED` vs `INTERRUPTED` — both unexpected; interrupted is recoverable, failed is not.
+- `FAILED` vs `INTERRUPTED` — both unexpected; interrupted *always* recovers through reconciliation (resume if any valid checkpoint), failed carries an explicit disposition set at failure time.
 - `INTERRUPTED` vs "still running" — a stale `status.json` saying RUNNING after a crash is `INTERRUPTED` the moment the heartbeat expires; the system reconciles before showing you anything (§9.4).
 
 #### Transitions
@@ -291,7 +322,7 @@ RUNNING ──epochs complete──► COMPLETED ──► MODEL CREATED
 |---|---|---|
 | CREATED | start validation | VALIDATING |
 | VALIDATING | all checks pass | READY |
-| VALIDATING | any check fails | FAILED (blocked, never RUNNING) |
+| VALIDATING | any check fails | FAILED (blocked, never RUNNING; `recovery` disposition per §5.3) |
 | READY | preflight pass | RUNNING |
 | RUNNING | `pause` command | PAUSING |
 | PAUSING | checkpoint committed | PAUSED |
@@ -304,8 +335,11 @@ RUNNING ──epochs complete──► COMPLETED ──► MODEL CREATED
 | RUNNING (or any live state) | crash / power loss detected | **INTERRUPTED** (via heartbeat expiry) |
 | INTERRUPTED | reconciliation scan | RECONCILING |
 | RECONCILING | valid checkpoint found | VALIDATING → READY → RUNNING (after `resume`) |
-| RECONCILING | no valid checkpoint | FAILED |
-| FAILED | `resume` + cause resolved | VALIDATING |
+| RECONCILING | no valid checkpoint | FAILED (`recovery: FORK_ONLY`) |
+| VALIDATING / READY / RUNNING | failure recorded | FAILED with `recovery` disposition (§5.3) |
+| FAILED (`recovery: RESUME`) | `resume` + cause resolved + gate pass | VALIDATING → READY → RUNNING |
+| FAILED (`recovery: RESUME`) | `resume`, cause unresolved | BLOCK — stays FAILED, exit 1 |
+| FAILED (`recovery: FORK_ONLY`) | `resume` attempted | BLOCK — exit 3, `NO VALID CONTINUATION` |
 | FAILED / STOPPED / COMPLETED | `retrain` / `finetune` | **new run** (never mutates this one) |
 
 **Resume IS a state transition. Retrain/fine-tune are NOT** — they create new runs.
@@ -385,7 +419,7 @@ Start training? [Y/n]
 
 ### 6.2 RESUME
 
-`resume` accepts a run in `PAUSED` or `INTERRUPTED` state. For `INTERRUPTED`, reconciliation (12 §12.3) runs *before* validation: it derives the true state from checkpoint manifests, reports any skipped checkpoints, then the 19-step gate proceeds.
+`resume` accepts a run in `PAUSED`, `INTERRUPTED`, or `FAILED (recovery: RESUME)` state — `FAILED (FORK_ONLY)` is blocked with exit 3 (§5.3). For `INTERRUPTED`, reconciliation (12 §12.3) runs *before* validation: it derives the true state from checkpoint manifests, reports any skipped checkpoints, then the 19-step gate proceeds.
 
 ```text
 User              CLI            Orchestrator         Validation Gate (19 steps)
@@ -618,24 +652,25 @@ Every transition has defined failure behavior. **Fail-closed: no partial executi
 
 | Transition | Failure | Behavior |
 |---|---|---|
-| CREATED → VALIDATING | artifact resolution fails | → FAILED. Report missing artifact. Nothing written beyond run folder creation (cleaned up). |
-| VALIDATING → READY | any invariant fails | → FAILED, `exit 1`. Run stays inspectable. **Never reaches READY.** |
-| VALIDATING → READY | disk insufficient | → FAILED before execution. Show required vs available. |
-| READY → RUNNING | preflight fails | → FAILED. No training started. |
-| RUNNING → CHECKPOINTING | write fails / disk full | → attempt rollback to last committed checkpoint; if repeated → FAILED. Run remains resumable from last commit. |
+| CREATED → VALIDATING | artifact resolution fails | → FAILED (`recovery: FORK_ONLY` — no checkpoint exists). Report missing artifact. Nothing written beyond run folder creation (cleaned up). |
+| VALIDATING → READY | any invariant fails | → FAILED (`recovery: FORK_ONLY` — semantic cause), `exit 1`. Run stays inspectable. **Never reaches READY.** |
+| VALIDATING → READY | disk insufficient | → FAILED before execution (`recovery: FORK_ONLY` — no checkpoint yet). Show required vs available. |
+| READY → RUNNING | preflight fails | → FAILED (`recovery: FORK_ONLY` — no checkpoint yet). No training started. |
+| RUNNING → CHECKPOINTING | write fails / disk full | → attempt rollback to last committed checkpoint; if repeated → FAILED (`recovery: RESUME`, last-good commit recorded). |
 | RUNNING → CHECKPOINTING | power loss mid-write | On restart: incomplete ckpt detected (no commit marker) → newest-valid identity predicate selects resume point, all skips reported (`12` §11.2). |
-| RUNNING | crash / power loss / kill -9 | Heartbeat expires → **INTERRUPTED** (never reported as PAUSED or RUNNING). Reconciliation scan → valid checkpoint → user may `resume`; no valid checkpoint → **FAILED**. |
+| RUNNING | crash / power loss / kill -9 | Heartbeat expires → **INTERRUPTED** (never reported as PAUSED or RUNNING). Reconciliation scan → valid checkpoint → user may `resume`; no valid checkpoint → **FAILED** (`recovery: FORK_ONLY`). |
 | RUNNING → PAUSING | pause during checkpoint | Wait for in-flight checkpoint to commit, then PAUSED. |
-| PAUSING → PAUSED | checkpoint fails | Retry once; if fails → FAILED with last-good checkpoint recorded. |
+| PAUSING → PAUSED | checkpoint fails | Retry once; if fails → FAILED (`recovery: RESUME` — last-good checkpoint recorded). |
 | PAUSED → VALIDATING | resume, dataset hash mismatch | → **BLOCK**. Stays PAUSED. Exit 1. No changes. |
 | PAUSED → VALIDATING | resume, environment unavailable | → **BLOCK** through compatibility resolver. No "probably compatible." |
 | PAUSED → VALIDATING | global batch unachievable | → **BLOCK** with migration options (other machine / fork / cancel). |
 | PAUSED → VALIDATING | checkpoint corrupt | → newest-valid predicate skips corrupt generations (with per-skip report); if none valid → **BLOCK** with `NO VALID CHECKPOINT` (fork or restart). |
-| Any → RUNNING | resume while already executing | → **BLOCK**: `run lease held by pid N on host H`. Suggest `mlforge status`. Explicit `mlforge lease break` required to override. |
+| RESUME (any state) | execution lease held | → **BLOCK** `RUN_ALREADY_EXECUTING`: `run lease held by pid N on host H`. Suggest `mlforge status`. Explicit `mlforge lease break` required to override. |
 | Any | duplicate `--command-id` | → return original result; no second run created. Exit 0 with `COMMAND_DEDUPED` event. |
 | RESUME on INTERRUPTED | state.json stale vs checkpoint manifest | Manifest wins; state.json rebuilt from journal during reconciliation. User sees reconciled state, never the stale one. |
 | RUNNING (OOM) | GPU OOM | Capture failure → rollback to last committed checkpoint → planner adjusts **execution only** (micro_batch/accum) → validate global batch preserved → new execution segment. Never touches LR/optimizer/loss/dataset. |
-| RUNNING → FAILED | unrecoverable error | State FAILED; last committed checkpoint intact; `resume` allowed after cause resolved. |
+| RUNNING → FAILED | runtime error, valid checkpoint intact | → FAILED (`recovery: RESUME`); cause recorded; `resume` re-runs the full gate after cause is resolved. |
+| RUNNING → FAILED | unrecoverable / no valid checkpoint | → FAILED (`recovery: FORK_ONLY`); `resume` exits 3 with `NO VALID CONTINUATION — use mlforge fork or retrain`. |
 | RUNNING → COMPLETED | epochs done | → MODEL CREATED (validate → AVAILABLE). |
 | TRAIN (semantic) | user changes LR/batch mid-flow | Not possible in-place — `fork` only → new run with parent. |
 | RETRAIN | dataset changed | Delta shown, confirmation required, labeled "new experiment." |
@@ -814,6 +849,23 @@ RUNNING
 ```
 
 Stages: `TRAINING · VALIDATING · CHECKPOINTING · EVALUATING · PREPARING_DATA`.
+
+**FAILED runs always display their disposition** — no guessing whether `resume` is allowed:
+
+```text
+FAILED
+Model RF-DETR-S · Run run_01JABC
+Cause:      CUDA OOM at step 41200
+Recovery:   RESUME (valid checkpoint: step 41,200)
+Action:     mlforge resume run_01JABC   (after resolving cause)
+```
+
+```text
+FAILED
+Cause:      invariant violation (run_spec mismatch)
+Recovery:   FORK_ONLY — no valid continuation exists
+Action:     mlforge fork run_01JABC  |  mlforge retrain rf_detr_s
+```
 
 ### 9.6 Watch (primary interactive view)
 
