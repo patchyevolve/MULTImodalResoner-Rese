@@ -2,6 +2,8 @@
 
 > A hardware-agnostic, project-agnostic training platform built on **immutable artifacts, cryptographic identities, explicit execution modes, and fail-closed validation**. Install on any OS, train on any GPU, move between machines via portable run folders — with a hard guarantee: **if the system cannot prove a continuation is valid, it refuses to run.**
 
+**Companion document:** `13_product_specification.md` — the product layer for this architecture: user mental model, exact CLI contract, full state machines, sequence diagrams for every operation, failure behavior matrix, and the status/telemetry plane. This document (12) defines **the machinery**; the product spec (13) defines **how the human drives it**. Neither exists without the other.
+
 ---
 
 ## 1. Guarantees
@@ -53,6 +55,8 @@ We **can** guarantee:
 ---
 
 ## 2. Core Architecture
+
+> **The two-layer view — USER WORKFLOW → CLI/TUI/GUI (one Workflow API) → Workflow Orchestrator → the machinery below — is specified in `13_product_specification.md` §1.** CLI, TUI, and GUI are thin clients over this orchestrator; no business logic per interface.
 
 ```
                         ┌───────────────────────┐
@@ -693,6 +697,8 @@ Without RNG/sampler/dataloader state, "resume" means *same weights + different f
 
 CLI commands never manipulate training directly — they drive the state machine:
 
+> **Full state machines for project, dataset, run, and model — plus transition tables and the status/telemetry plane — are specified in `13_product_specification.md` §5 and §9.** This section covers the run machine as it relates to the execution machinery.
+
 ```text
 CREATED → VALIDATING → PREPARING → READY → RUNNING
                                         ├── PAUSING → PAUSED
@@ -797,6 +803,8 @@ precision_policy:
 ---
 
 ## 15. Lineage & Operations
+
+> **Sequence diagrams for every operation (train, resume, retrain, finetune, stop, prepare, evaluate, infer, export, compare) are in `13_product_specification.md` §6, with the failure behavior matrix in §7.** This section defines the operations' semantics and lineage semantics.
 
 ### 15.1 Three Distinct Operations (Never Ambiguous CLI)
 
@@ -974,6 +982,8 @@ Every edge recorded in lineage.
 
 ## 20. CLI Surface
 
+> **The complete, normative CLI contract — all commands, arguments, behavior rules, exit codes, and object reference syntax — is defined in `13_product_specification.md` §4.** The surface below is the architecture-level view; the product spec is authoritative for implementation.
+
 ```bash
 # Setup
 mlforge init                          # create project
@@ -1065,3 +1075,16 @@ corrupting a training run. Everything above — immutable specs,
 cryptographic identities, transactional checkpoints, execution
 segments, fail-closed validation — exists to make that refusal
 correct, informative, and rare.
+
+---
+
+## 23. Related Documents
+
+| Document | Contains | Relationship |
+|---|---|---|
+| **`13_product_specification.md`** | User mental model, CLI contract, state machines, sequence diagrams, failure matrix, status/telemetry plane | **Product layer for this architecture** — how the human drives the machinery below |
+| `11_model_weights_and_disk_space.md` | Model weight sizes, disk budgets, download order | Feeds preflight disk-space validation (§7.3) |
+| `02_dataset_preparation.md` | Dataset research, download URLs, quality checks | Feeds dataset registration (§10) |
+| `00_master_plan.md` | Training strategy, model inventory, timeline | Governs what gets trained and when |
+
+**Reading order:** `00_master_plan` (what/why) → `02_dataset_preparation` (data) → **`12_training_system`** (machinery) → **`13_product_specification`** (interface + behavior) → implementation.

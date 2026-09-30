@@ -540,6 +540,8 @@ Training data ...
 
 Every transition has defined failure behavior. **Fail-closed: no partial execution, no silent degradation.**
 
+> **The invariants these failures enforce are defined in `12_training_system.md` §17; the 17-step resume validation gate is §18; checkpoint transactionality is §11.** This matrix defines the *product-visible behavior* when those mechanisms fail.
+
 | Transition | Failure | Behavior |
 |---|---|---|
 | CREATED → VALIDATING | artifact resolution fails | → FAILED. Report missing artifact. Nothing written beyond run folder creation (cleaned up). |
@@ -601,6 +603,8 @@ The system explains consequences; it never silently chooses.
 ---
 
 ## 9. Status & Telemetry Plane
+
+> **Authoritative source-of-truth rules (state from checkpoint manifests, metrics as observations, append-only event journal) are defined in `12_training_system.md` §16.** This section specifies how that state is *presented and observed* without ever becoming authoritative itself.
 
 ### 9.1 Separation of Concerns
 
