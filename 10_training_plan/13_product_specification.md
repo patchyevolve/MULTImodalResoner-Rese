@@ -175,6 +175,8 @@ ARTIFACT
 mlforge export <MODEL> --format F       ONNX / TensorRT / etc.
 mlforge validate <RUN|MODEL>            Run validation gate
 mlforge package <MODEL>                 Build inference bundle
+mlforge store gc [--execute]            Collect unreachable artifacts (dry-run
+                                         default; blocked by active leases)
 
 OBSERVABILITY
 ────────────────────────────────────────────────────────────

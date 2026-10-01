@@ -29,8 +29,8 @@ mlforge/
 │   ├── machine.py            # 4 transition tables (13 §5)        ✅
 │   ├── run_spec.py           # immutable semantic identity        ✅
 │   ├── workflow.py           # Workflow API facade (13 §1)        ✅
-│   ├── cli/                  # status/inspect/events (+stubs)     ✅ minimal
-│   ├── store/                # CAS + registry + GC                ⛔ step 2
+│   ├── cli/                  # status/inspect/events/store gc      ✅ minimal
+│   ├── store/                # CAS + registry + GC                ✅
 │   ├── validation/           # 19-step gate + preflight           ⛔ step 3
 │   ├── leases/               # run/execution leases               ⛔ step 5
 │   ├── commands/             # idempotency journal                ⛔ step 5
@@ -43,9 +43,9 @@ mlforge/
 ## Build order (13 §11) — status
 
 1. ✅ Workflow API + state machines (project/dataset/run/model)
-2. ⛔ Artifact registry + content store + run_spec canonical hashing *(hashing done, store pending)*
+2. ✅ Artifact registry + content store + run_spec canonical hashing
 3. ⛔ Validation gate + preflight (fail-closed core)
-4. 🟡 CLI contract — `status` / `inspect` / `events` work; other commands exit 4 with `NOT_IMPLEMENTED` (never fake success)
+4. 🟡 CLI contract — `status` / `inspect` / `events` / `store gc` work; other commands exit 4 with `NOT_IMPLEMENTED` (never fake success)
 5. ⛔ Supervisor daemon + run leases + idempotency journal
 6. ⛔ Training runtime + transactional checkpoints + heartbeat + reconciliation scan
 7. ⛔ Status layer (read-only L1/L2/L3)
@@ -69,6 +69,14 @@ mlforge/
 * **Crash ≠ pause** — crash from any live state → `INTERRUPTED`;
   reconciliation never starts training (12 §12.3).
 * **Illegal transitions change nothing** and list the legal actions (exit 3).
+* **GC is reachability-only** — never age/size; run-folder `refs.json` are
+  the roots (portable), grace protects fresh orphans, active run leases
+  block execution-mode GC outright (12 §6.1).
+* **Blobs are atomic and verified** — staging → fsync → rename; identity
+  claimed at `put_file` must match (mismatch → BLOCK); corruption detected
+  by `verify()`, never trusted.
+* **Registry registration is transactional** — entry written to temp,
+  renamed to commit; crash orphans swept by `recover()`.
 
 ## Develop
 

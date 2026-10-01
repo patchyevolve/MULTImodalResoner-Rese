@@ -40,6 +40,11 @@ def content_hash(obj: Any) -> str:
     return f"{ALGO}:{sha256_hex(canonical_json(obj))}"
 
 
+def content_hash_bytes(data: bytes) -> str:
+    """`sha256:<hex>` identity of raw bytes (blobs in the content store)."""
+    return f"{ALGO}:{sha256_hex(data)}"
+
+
 def run_spec_hash(run_spec: dict[str, Any]) -> str:
     """Semantic identity of an experiment (12 §4).
 

@@ -14,13 +14,15 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from pathlib import Path
 
 import mlforge
 from mlforge.errors import MlforgeError
+from mlforge.store import ArtifactRegistry, ContentStore
 from mlforge.workflow import WorkflowAPI
 
 # 13 §11 build-order gates: implemented vs pending.
-_IMPLEMENTED = {"status", "inspect", "events"}
+_IMPLEMENTED = {"status", "inspect", "events", "store"}
 _PENDING = {
     "init": 1,
     "configure": 1,
@@ -71,6 +73,24 @@ def _build_parser() -> argparse.ArgumentParser:
     tr = sub.add_parser("train", help="(pending build step 6)")
     tr.add_argument("--config")
     tr.add_argument("--command-id", default=None)
+
+    st_gc_parent = sub.add_parser("store", help="artifact store operations")
+    st_gc = st_gc_parent.add_subparsers(dest="store_command").add_parser(
+        "gc",
+        help="garbage-collect unreachable artifacts (dry-run by default)",
+    )
+    st_gc.add_argument(
+        "--execute",
+        action="store_true",
+        help="actually delete (default: report only — deletion is an explicit decision)",
+    )
+    st_gc.add_argument(
+        "--grace-days",
+        type=float,
+        default=7.0,
+        help="keep unreachable artifacts younger than this many days (default: 7)",
+    )
+    st_gc.add_argument("--json", action="store_true")
     return p
 
 
@@ -115,6 +135,39 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "events":
             for e in wf.get_run_events(args.run_id):
                 print(json.dumps(e, sort_keys=True))
+            return 0
+
+        if args.command == "store":
+            if getattr(args, "store_command", None) != "gc":
+                print(
+                    "[NOT_IMPLEMENTED] `mlforge store` has only the `gc` "
+                    "subcommand in this build step. Nothing was executed.",
+                    file=sys.stderr,
+                )
+                return 4
+            # 12 §6.1: GC is a command, never automatic during training.
+            root = Path(args.root)
+            store = ContentStore(root / "store")
+            registry = ArtifactRegistry(root, store)
+            report = registry.gc(
+                grace_seconds=args.grace_days * 86400.0,
+                dry_run=not args.execute,
+            )
+            if args.json:
+                print(json.dumps(report.to_dict(), indent=2, sort_keys=True))
+            else:
+                mode = "DRY-RUN (use --execute to delete)" if report.dry_run else "EXECUTED"
+                print(f"GC {mode}")
+                print(f"  reachable:     {report.reachable}")
+                print(f"  swept:         {len(report.swept)}")
+                for h in report.swept:
+                    print(f"    - {h}")
+                print(f"  kept (grace):  {len(report.kept_grace)}")
+                if report.skipped_lease:
+                    print(
+                        "  blocked by active lease: "
+                        + ", ".join(report.skipped_lease)
+                    )
             return 0
 
         return 4
