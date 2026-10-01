@@ -168,3 +168,75 @@ def test_preflight_report_only_and_fails_closed(tmp_path, capsys):
     # report-only: no transition, no events (runtime wires READY→RUNNING)
     assert wf.get_run_state(h.run_id) == "CREATED"
     assert [e["event"] for e in wf.get_run_events(h.run_id)] == ["run_created"]
+
+
+# -- lease CLI (12 §23, 13 §4.1) ------------------------------------------
+
+
+def test_lease_status_free(tmp_path, capsys):
+    from mlforge.workflow import WorkflowAPI
+
+    wf = WorkflowAPI(tmp_path)
+    h = wf.create_run(_spec())
+    assert main(["--root", str(tmp_path), "lease", "status", h.run_id]) == 0
+    assert "no lease (FREE)" in capsys.readouterr().out
+
+
+def test_lease_status_held_json(tmp_path, capsys):
+    from mlforge.leases import RunLeaseManager
+    from mlforge.workflow import WorkflowAPI
+
+    wf = WorkflowAPI(tmp_path)
+    h = wf.create_run(_spec())
+    RunLeaseManager(tmp_path).acquire(h.run_id)
+    assert main(["--root", str(tmp_path), "lease", "status", h.run_id, "--json"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["state"] == "HELD" and out["pid"]
+
+
+def test_lease_break_requires_force_and_yes(tmp_path, capsys):
+    from mlforge.leases import RunLeaseManager
+    from mlforge.workflow import WorkflowAPI
+
+    wf = WorkflowAPI(tmp_path)
+    h = wf.create_run(_spec())
+    RunLeaseManager(tmp_path).acquire(h.run_id)
+    assert main(["--root", str(tmp_path), "lease", "break", h.run_id]) == 3
+    assert main(["--root", str(tmp_path), "lease", "break", h.run_id, "--force"]) == 3
+    assert "requires --force and --yes" in capsys.readouterr().err
+    assert wf.lease_status(h.run_id)["state"] == "HELD"  # no silent escalation
+
+
+def test_lease_break_executed_and_logged(tmp_path, capsys):
+    from mlforge.leases import RunLeaseManager
+    from mlforge.workflow import WorkflowAPI
+
+    wf = WorkflowAPI(tmp_path)
+    h = wf.create_run(_spec())
+    RunLeaseManager(tmp_path).acquire(h.run_id)
+    assert main([
+        "--root", str(tmp_path), "lease", "break", h.run_id,
+        "--force", "--yes", "--reason", "worker confirmed dead",
+    ]) == 0
+    assert "LEASE BROKEN" in capsys.readouterr().out
+    events = wf.get_run_events(h.run_id)
+    assert events[-1]["event"] == "LEASE_BROKEN"
+    assert wf.lease_status(h.run_id)["state"] == "FREE"
+
+
+def test_lease_break_without_lease_exits_3(tmp_path, capsys):
+    from mlforge.workflow import WorkflowAPI
+
+    wf = WorkflowAPI(tmp_path)
+    h = wf.create_run(_spec())
+    code = main([
+        "--root", str(tmp_path), "lease", "break", h.run_id, "--force", "--yes",
+    ])
+    assert code == 3
+
+
+def test_lease_without_subcommand_exits_4(tmp_path, capsys):
+    # argparse rejects unknown subchoices itself (usage error, exit 2);
+    # a bare `mlforge lease` reaches our dispatch → NOT_IMPLEMENTED (4).
+    assert main(["--root", str(tmp_path), "lease"]) == 4
+    assert "NOT_IMPLEMENTED" in capsys.readouterr().err

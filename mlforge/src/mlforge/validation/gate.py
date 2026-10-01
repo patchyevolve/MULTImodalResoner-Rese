@@ -42,7 +42,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
-from mlforge.errors import ValidationBlock
+from mlforge.errors import PreconditionFailed, ValidationBlock
 from mlforge.hashing import content_hash
 from mlforge.run_spec import SCHEMA_VERSION, RunSpec
 from mlforge.validation.report import FAIL, PASS, WARN, Check, ValidationReport
@@ -242,6 +242,15 @@ class ValidationGate:
             )
         try:
             result = provider(ctx)
+        except PreconditionFailed:
+            # Concurrency/state preconditions (RUN_ALREADY_EXECUTING, ...)
+            # are exit-3 product contracts (13 §7), not gate verdicts —
+            # they propagate instead of becoming an exit-1 FAIL.
+            raise
+        except ValidationBlock as exc:
+            # A provider that refuses via the validation contract becomes a
+            # FAIL at its step (the gate's own block semantics).
+            return Check(step.number, step.id, step.label, FAIL, exc.message)
         except Exception as exc:  # a throwing check is a failed check
             return Check(step.number, step.id, step.label, FAIL,
                          f"check raised: {type(exc).__name__}: {exc}")

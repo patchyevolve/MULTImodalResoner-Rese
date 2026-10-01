@@ -1,13 +1,29 @@
-"""Run / execution / artifact / command leases — build step 5 (pending).
+"""Run lease (single-writer) + gate providers — build step 5 (leases half).
 
-Normative: 12_training_system.md §23.
+Normative: 12_training_system.md §23.1 (lease types), §23.2 (protocol),
+§23.3 (preflight → acquisition → revalidation), §17 (single-writer
+invariant).
 
-Critical invariant: at most one live worker may write a run folder's
-checkpoints at any time. A second resume on a leased run →
-BLOCK RUN_ALREADY_EXECUTING (mlforge.errors.RunAlreadyExecuting).
-
-Rules:
-  * lease = atomic create (O_EXCL) + heartbeat renewal + owner token
-  * stale ≠ free: expired lease is SUSPECT → reconciliation first (§12.3)
-  * breaking a lease requires explicit user action and is always logged
+API:
+    RunLeaseManager(root).acquire/renew/release/status/force_release
+        FREE | HELD | SUSPECT — stale ≠ free; owner-checked by token.
+    provide_run_lease(leases)       gate step 15 provider (12 §18)
+    provide_revalidation(...)       gate step 16 provider (volatile subset)
 """
+
+from mlforge.leases.providers import provide_revalidation, provide_run_lease
+from mlforge.leases.run_lease import (
+    DEFAULT_HEARTBEAT_TIMEOUT,
+    LeaseInfo,
+    LeaseState,
+    RunLeaseManager,
+)
+
+__all__ = [
+    "RunLeaseManager",
+    "LeaseInfo",
+    "LeaseState",
+    "DEFAULT_HEARTBEAT_TIMEOUT",
+    "provide_run_lease",
+    "provide_revalidation",
+]

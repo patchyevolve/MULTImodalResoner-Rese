@@ -31,12 +31,15 @@ import json
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
-from mlforge.errors import NotFound, ValidationBlock
+from mlforge.commands import CommandJournal
+from mlforge.commands.idempotency import DedupDecision, execute as _execute_once
+from mlforge.errors import NotFound, PreconditionFailed, RunAlreadyExecuting, ValidationBlock
 from mlforge.hashing import content_hash
 from mlforge.ids import new_model_id, new_run_id
 from mlforge.journal import EventJournal
+from mlforge.leases import LeaseState, RunLeaseManager
 from mlforge.machine import (
     DATASET_MACHINE,
     MODEL_MACHINE,
@@ -419,11 +422,34 @@ class WorkflowAPI:
             )
         return self.get_run_status(run_id)
 
-    def resume(self, run_id: str, *, has_valid_checkpoint: bool | None = None) -> str:
+    def resume(
+        self,
+        run_id: str,
+        *,
+        has_valid_checkpoint: bool | None = None,
+        session_token: str | None = None,
+    ) -> str:
         """Explicit resume (13 §6.2). Guards (machine):
         FAILED(FORK_ONLY) → exit 3 NO VALID CONTINUATION;
         RECONCILING without a valid checkpoint → same block;
-        PAUSED → ordinary path. Lease checks arrive with step 5."""
+        PAUSED → ordinary path.
+
+        Lease guard (12 §23.2 hard invariant, 13 §7): a second resume of a
+        leased run → BLOCK RUN_ALREADY_EXECUTING (exit 3); a SUSPECT
+        (stale) lease → block until broken explicitly — stale ≠ free.
+        `session_token` proves THIS caller owns the lease (the validation
+        gate's step 15 acquired it)."""
+        lease = RunLeaseManager(self.root)
+        info = lease.status(run_id)
+        if info.state == LeaseState.HELD and info.session_token != session_token:
+            raise RunAlreadyExecuting(run_id, holder=info.holder)
+        if info.state == LeaseState.SUSPECT:
+            raise PreconditionFailed(
+                f"run {run_id}: lease is SUSPECT (held by {info.holder}, "
+                f"heartbeat {info.age_seconds:.0f}s old)",
+                hint="stale ≠ free: confirm the worker is dead, then "
+                     "`mlforge lease break RUN --force --yes` (12 §23.2)",
+            )
         proj = self._load_projection("run", run_id)
         if has_valid_checkpoint is None:
             has_valid_checkpoint = self._last_reconciliation(run_id)
@@ -444,6 +470,86 @@ class WorkflowAPI:
             if ev.event == "reconciliation_scan":
                 return bool(ev.data.get("has_valid_checkpoint"))
         return None
+
+    # -- run lease (12 §23, 13 §4.1 LEASES) ------------------------------
+
+    def lease_status(self, run_id: str) -> dict[str, Any]:
+        """`mlforge lease status RUN` — who holds the lease (read-only)."""
+        return RunLeaseManager(self.root).status(run_id).to_dict()
+
+    def lease_break(
+        self,
+        run_id: str,
+        *,
+        force: bool = False,
+        yes: bool = False,
+        reason: str = "unspecified",
+        operator: str | None = None,
+    ) -> dict[str, Any]:
+        """Break a lease — ALWAYS requires --force AND --yes and is ALWAYS
+        logged as LEASE_BROKEN (12 §23.2; 12 §24: no silent escalation)."""
+        if not force or not yes:
+            raise PreconditionFailed(
+                "`mlforge lease break` requires --force and --yes",
+                hint="breaking a lease overrides single-writer safety — "
+                     "no silent escalation (12 §24)",
+            )
+        if operator is None:
+            import getpass
+
+            operator = getpass.getuser()
+        mgr = RunLeaseManager(self.root)
+        previous = mgr.force_release(run_id)  # raises exit 3 if FREE
+        self._journal("run", run_id).append(
+            "LEASE_BROKEN",
+            action="lease_break",
+            previous_owner={
+                "pid": previous.get("pid"),
+                "host": previous.get("host"),
+                "session_token": previous.get("session_token"),
+            },
+            reason=reason,
+            operator=operator,
+        )
+        return {"previous_owner": previous, "reason": reason, "operator": operator}
+
+    # -- command idempotency (13 §4.4, 12 §23.4) -------------------------
+
+    def execute_idempotent(
+        self,
+        command_id: str,
+        command: str,
+        fn: Callable[[], Any],
+        *,
+        run_id: str | None = None,
+        meta: dict[str, Any] | None = None,
+    ) -> Any:
+        """Run `fn` exactly once per successful command_id.
+
+        Duplicate success → returns the ORIGINAL result and journals
+        COMMAND_DEDUPED into the run's events (13 §4.4). Failure → the
+        same command_id may be retried. In flight → exit 3."""
+
+        def _on_dedup(d: DedupDecision) -> None:
+            if run_id and (self.root / "runs" / run_id).is_dir():
+                # Visible in `mlforge events` as COMMAND_DEDUPED (13 §4.4).
+                # Carries no `to` → never changes run state.
+                self._journal("run", run_id).append(
+                    "COMMAND_DEDUPED",
+                    action="dedupe",
+                    command_id=d.command_id,
+                    command=d.command,
+                    original_ts=d.original_ts,
+                )
+
+        return _execute_once(
+            CommandJournal(self.root),
+            command_id,
+            command,
+            fn,
+            meta=meta,
+            on_dedup=_on_dedup,
+        )
 
     @staticmethod
     def _make_failure(
@@ -494,9 +600,8 @@ class WorkflowAPI:
         flow = "TRAIN" if state in (
             RunState.CREATED.value, RunState.VALIDATING.value
         ) else "RESUME"
-        report = gate.run(
-            GateContext(run_id=run_id, root=self.root, run_spec=spec, flow=flow)
-        )
+        ctx = GateContext(run_id=run_id, root=self.root, run_spec=spec, flow=flow)
+        report = gate.run(ctx)
         rep = report.to_dict()
 
         if state == RunState.CREATED.value:
@@ -527,7 +632,11 @@ class WorkflowAPI:
                 self.validation_blocked(run_id, rep)  # NO state change (13 §7)
             else:
                 # Gate passed → the resume transition itself is now legal.
-                self.resume(run_id)
+                # If the gate acquired the lease (step 15), present its
+                # session token so the lease guard knows we own it.
+                self.resume(
+                    run_id, session_token=ctx.facts.get("session_token")
+                )
                 self.validation_pass(run_id, report=rep)
             return report
 

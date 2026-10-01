@@ -32,6 +32,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
+from mlforge.errors import PreconditionFailed, ValidationBlock
 from mlforge.validation.gate import GateContext, Provider, scan_for_secrets
 from mlforge.validation.report import FAIL, PASS, WARN, Check, ValidationReport
 
@@ -252,6 +253,12 @@ class Preflight:
                     break
                 try:
                     result = provider(ctx)
+                except PreconditionFailed:
+                    raise  # exit-3 preconditions propagate (13 §7)
+                except ValidationBlock as exc:
+                    checks.append(Check(base + i + 1, key, label, FAIL, exc.message))
+                    blocked = True
+                    break
                 except Exception as exc:
                     checks.append(Check(base + i + 1, key, label, FAIL,
                                         f"check raised: {type(exc).__name__}: {exc}"))

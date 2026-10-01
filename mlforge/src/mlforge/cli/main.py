@@ -23,7 +23,7 @@ from mlforge.validation import Preflight, ValidationGate
 from mlforge.workflow import WorkflowAPI
 
 # 13 §11 build-order gates: implemented vs pending.
-_IMPLEMENTED = {"status", "inspect", "events", "store", "validate", "preflight"}
+_IMPLEMENTED = {"status", "inspect", "events", "store", "validate", "preflight", "lease"}
 _PENDING = {
     "init": 1,
     "configure": 1,
@@ -39,7 +39,6 @@ _PENDING = {
     "infer": 11,
     "export": 11,
     "package": 11,
-    "lease": 5,
     "watch": 7,
     "hardware": 7,
 }
@@ -86,6 +85,20 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="this operation does not require a GPU (GPU/driver checks become WARN)",
     )
+
+    lease_parent = sub.add_parser("lease", help="run lease operations (12 §23)")
+    lease_sub = lease_parent.add_subparsers(dest="lease_command")
+    lease_status = lease_sub.add_parser("status", help="who holds the run lease")
+    lease_status.add_argument("run_id")
+    lease_status.add_argument("--json", action="store_true")
+    lease_break = lease_sub.add_parser(
+        "break", help="break a lease (requires --force AND --yes; logged)"
+    )
+    lease_break.add_argument("run_id")
+    lease_break.add_argument("--force", action="store_true")
+    lease_break.add_argument("--yes", action="store_true")
+    lease_break.add_argument("--reason", default="unspecified")
+    lease_break.add_argument("--json", action="store_true")
 
     tr = sub.add_parser("train", help="(pending build step 6)")
     tr.add_argument("--config")
@@ -170,6 +183,45 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 print(report.render())
             return 1 if report.blocked else 0
+
+        if args.command == "lease":
+            sub_cmd = getattr(args, "lease_command", None)
+            if sub_cmd == "status":
+                info = wf.lease_status(args.run_id)
+                if args.json:
+                    print(json.dumps(info, indent=2, sort_keys=True))
+                elif info["state"] == "FREE":
+                    print(f"{args.run_id}: no lease (FREE)")
+                else:
+                    print(
+                        f"{args.run_id}: {info['state']} — held by "
+                        f"pid {info['pid']} on {info['host']} "
+                        f"(heartbeat {info['age_seconds']:.0f}s ago)"
+                    )
+                return 0
+            if sub_cmd == "break":
+                result = wf.lease_break(
+                    args.run_id,
+                    force=args.force,
+                    yes=args.yes,
+                    reason=args.reason,
+                )
+                if args.json:
+                    print(json.dumps(result, indent=2, sort_keys=True, default=str))
+                else:
+                    prev = result["previous_owner"]
+                    print(
+                        f"LEASE BROKEN — was pid {prev.get('pid')} on "
+                        f"{prev.get('host')} (reason: {result['reason']}, "
+                        f"operator: {result['operator']}) — LEASE_BROKEN logged"
+                    )
+                return 0
+            print(
+                "[NOT_IMPLEMENTED] `mlforge lease` supports `status` and "
+                "`break` in this build step. Nothing was executed.",
+                file=sys.stderr,
+            )
+            return 4
 
         if args.command == "store":
             if getattr(args, "store_command", None) != "gc":

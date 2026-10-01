@@ -29,12 +29,13 @@ mlforge/
 │   ├── machine.py            # 4 transition tables (13 §5)        ✅
 │   ├── run_spec.py           # immutable semantic identity        ✅
 │   ├── workflow.py           # Workflow API facade (13 §1)        ✅
-│   ├── cli/                  # status/inspect/events/store gc/validate/preflight ✅
+│   ├── cli/                  # status/inspect/events/store/validate/preflight/lease ✅
 │   ├── store/                # CAS + registry + GC                ✅
 │   ├── validation/           # 19-step gate + preflight           ✅
-│   ├── leases/               # run/execution leases               ⛔ step 5
-│   ├── commands/             # idempotency journal                ⛔ step 5
-│   ├── runtime/              # checkpoints, heartbeat, supervisor  ⛔ step 6
+│   ├── leases/               # run lease + gate providers 15–16   ✅
+│   ├── commands/             # idempotency journal                ✅
+│   ├── supervisor.py         # heartbeat → crash detection        ✅
+│   ├── runtime/              # checkpoints, heartbeat writer      ⛔ step 6
 │   ├── status/               # L1/L2/L3, watch                    ⛔ step 7
 │   └── planner/              # capability feasibility solver      ⛔ step 9
 └── tests/                    # specs as executable tests
@@ -46,9 +47,9 @@ mlforge/
 2. ✅ Artifact registry + content store + run_spec canonical hashing
 3. ✅ Validation gate + preflight (fail-closed core)
 4. 🟡 CLI contract — `status` / `inspect` / `events` / `store gc` /
-   `validate` / `preflight` work; other commands exit 4 with
-   `NOT_IMPLEMENTED` (never fake success)
-5. ⛔ Supervisor daemon + run leases + idempotency journal
+   `validate` / `preflight` / `lease status` / `lease break` work; other
+   commands exit 4 with `NOT_IMPLEMENTED` (never fake success)
+5. ✅ Supervisor daemon + run leases + idempotency journal
 6. ⛔ Training runtime + transactional checkpoints + heartbeat + reconciliation scan
 7. ⛔ Status layer (read-only L1/L2/L3)
 8. ⛔ Ingestion/transform DAG
@@ -94,6 +95,16 @@ mlforge/
   ⇒ BLOCK, never "train until disk fills" (12 §7.3).
 * **Preflight is report-only until the runtime exists** — it never moves
   a run to RUNNING (only after PREFLIGHT PASSED does training proceed).
+* **Single-writer run lease** — `runs/<id>/.lease` acquired atomically
+  (tmp → fsync → link); second resume → exit 3 `RUN_ALREADY_EXECUTING`;
+  stale heartbeat → **SUSPECT, never auto-free** (stale ≠ free); break
+  requires `--force --yes` and always journals `LEASE_BROKEN` (12 §23).
+* **Command idempotency** — duplicate `command_id` of a success returns
+  the original result (never a second run) and journals
+  `COMMAND_DEDUPED`; in flight → exit 3; failures are retryable (13 §4.4).
+* **Supervisor detects crashes, never continues runs** — expired/missing
+  heartbeat → INTERRUPTED; it never resumes, reconciles, or starts
+  anything (13 §1 automatic continuation = NO).
 
 ## Develop
 
