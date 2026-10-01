@@ -39,7 +39,7 @@ mlforge/
 │   ├── supervisor.py         # crash detection + spawn queue daemon  ✅
 │   ├── runtime/              # checkpoints, worker, control, trainer ✅
 │   ├── status/               # L1/L2/L3, watch, events --follow   ✅
-│   └── planner/              # capability feasibility solver      ⛔ step 9
+│   └── planner/              # capability feasibility solver      ✅
 └── tests/                    # specs as executable tests
 ```
 
@@ -77,7 +77,18 @@ mlforge/
    reregister), `prepare` (resolve → cache → transform → derived
    `<model>_prepared` REGISTERED→VERIFIED→PREPARED, `--command-id`
    dedupe), and the gate's step-4 builtin dataset provider
-9. ⛔ Execution planner
+9. ✅ Execution planner — measured capabilities (`nvidia-smi` query,
+   never VRAM tables; absent ⇒ determinate CPU-only set, broken ⇒
+   BLOCK; unknown arch ⇒ fp32 only, 12 §13.1), feasibility solver
+   (micro × accum × world == frozen global_batch s.t. VRAM/precision/
+   model-min, deterministic pick: max world then max micro, 12 §13.2),
+   `ExecutionPlan` artifact persisted on validation pass (identity-
+   gated — unchanged plan never journals twice), gate builtins for
+   steps 10–13 (`plan`/`global_batch`/`precision`/`topology`), disk
+   estimate for step 16 now includes registered dataset bytes,
+   execution segments (`segments/segment_<NNNN>.json` — hardware
+   context recorded by the worker only AFTER preflight passes,
+   12 §12.2), and `SHOW PLAN` in `train` before confirmation (13 §6.1)
 10. ⛔ Resume/retrain/finetune flows + lineage DAG
 11. ⛔ Evaluate/compare/infer/export/package
 12. ⛔ TUI/GUI over the same Workflow API
@@ -149,6 +160,21 @@ mlforge/
   `dataset add --force` (journaled `dataset_reregistered`); a tampered
   verified dataset becomes REJECTED, never silently reinterpreted
   (13 §5.2).
+* **global_batch is input AND output** — the solver may only touch
+  execution fields (micro/accum/world); `micro × accum × world` must
+  equal the frozen semantic `global_batch` or gate step 11 FAILs
+  (12 §8.3, §13.3: execution → semantic mutation is forbidden).
+* **Capabilities are measured, never assumed** — VRAM comes from the
+  device query; unknown compute capability supports nothing beyond
+  fp32 (fail-closed); `nvidia-smi` present but broken ⇒ BLOCK, absent
+  ⇒ a determinate CPU-only set (12 §13.1, §21).
+* **Precision fallback and CPU runs are PORTABLE, never EXACT** —
+  bf16→fp32 fallback or a world_size of 1 CPU records
+  `exact_compatible: False` (12 §14, §21).
+* **An infeasible plan BLOCKs with migration options** — "run on
+  another machine / fork with a different global_batch / cancel"
+  (13 §7), never a silent shrink of the batch; execution segments are
+  created only after preflight passes, one per start (12 §12.2).
 
 ## Develop
 

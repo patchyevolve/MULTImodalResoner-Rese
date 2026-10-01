@@ -53,6 +53,14 @@ from mlforge.machine import (
     RUN_MACHINE,
     StateMachine,
 )
+from mlforge.planner import (
+    PLAN_FILENAME,
+    Capabilities,
+    ExecutionPlan,
+    detect_capabilities,
+    estimate_required_disk_bytes,
+    load_runtime,
+)
 from mlforge.run_spec import RunSpec
 from mlforge.states import (
     LIVE_STATES,
@@ -70,6 +78,10 @@ from mlforge.validation import (
     ValidationGate,
     ValidationReport,
     provide_dataset_identity,
+    provide_global_batch,
+    provide_plan,
+    provide_precision,
+    provide_topology,
 )
 
 _KINDS = {
@@ -109,10 +121,17 @@ class WorkflowAPI:
 
         Step 4 (`dataset`) has a real builtin from build step 8: it
         re-hashes every configured source against its registration
-        (12 §6.2). Explicit providers always win (`setdefault`) — callers
-        that can verify more honestly keep their wiring."""
+        (12 §6.2). Steps 10–13 (`plan`, `global_batch`, `precision`,
+        `topology`) come from build step 9: measured capabilities +
+        the feasibility solver (12 §13). Explicit providers always win
+        (`setdefault`) — callers that can verify more honestly keep
+        their wiring."""
         providers = dict(self.gate_providers or {})
         providers.setdefault("dataset", provide_dataset_identity(self.root))
+        providers.setdefault("plan", provide_plan())
+        providers.setdefault("global_batch", provide_global_batch())
+        providers.setdefault("precision", provide_precision())
+        providers.setdefault("topology", provide_topology())
         return providers
 
     # ------------------------------------------------------------------
@@ -764,13 +783,18 @@ class WorkflowAPI:
         ) else "RESUME"
         ctx = GateContext(run_id=run_id, root=self.root, run_spec=spec, flow=flow)
         # Step 16 (revalidate) needs the worst-case disk requirement — the
-        # same formula preflight mandates (12 §7.3); the planner replaces
-        # this estimate when it arrives (13 §11 step 9).
-        ctx.facts["required_disk_bytes"] = PreflightContext(
-            run_id=run_id, root=self.root, run_spec=spec
-        ).required_disk_bytes
+        # 12 §7.3 formula, now extended by the planner with registered
+        # dataset bytes (13 §11 step 9, `estimate_required_disk_bytes`).
+        ctx.facts["required_disk_bytes"] = estimate_required_disk_bytes(
+            self.root, spec, runtime=load_runtime(ctx.run_dir)
+        )
         report = gate.run(ctx)
         rep = report.to_dict()
+        plan = ctx.facts.get("execution_plan")
+        if plan is not None and not report.blocked:
+            # 13 §6.1: the plan artifact lands with the validated run;
+            # unchanged plans never journal twice (identity-gated).
+            self._persist_execution_plan(run_id, plan)
 
         if state == RunState.CREATED.value:
             self.begin_validation(run_id)
@@ -826,6 +850,92 @@ class WorkflowAPI:
             RunLeaseManager(self.root).release(ctx.run_id, str(token))
         except MlforgeError:
             pass  # never owned / already gone
+
+    # ------------------------------------------------------------------
+    # execution plan + segments (build step 9, 12 §12.2, §13)
+    # ------------------------------------------------------------------
+
+    def _persist_execution_plan(self, run_id: str, plan: Any) -> None:
+        """Write `runs/<id>/execution_plan.json` (atomic) — only when the
+        identity changed, so a re-validate on the same host is quiet and
+        a resume on new hardware rewrites with one `plan_generated`."""
+        path = self._dir("run", run_id) / PLAN_FILENAME
+        if path.is_file():
+            try:
+                if ExecutionPlan.read(path).identity == plan.identity:
+                    return  # identical plan already on disk
+            except MlforgeError:
+                pass  # unreadable/corrupt → rewrite (repair, fail-closed)
+            except (KeyError, ValueError, TypeError):
+                pass
+        plan.write(path)
+        self._journal("run", run_id).append(
+            "plan_generated",
+            action="plan",
+            plan_hash=plan.identity,
+            micro_batch=plan.micro_batch,
+            grad_accum=plan.grad_accum,
+            world_size=plan.world_size,
+            precision=plan.precision_effective,
+            portable=plan.portable_required,
+        )
+
+    def get_execution_plan(self, run_id: str) -> dict[str, Any] | None:
+        """The persisted plan artifact, or None if never validated."""
+        path = self._dir("run", run_id) / PLAN_FILENAME
+        if not path.is_file():
+            return None
+        return ExecutionPlan.read(path).to_dict()
+
+    def create_execution_segment(
+        self,
+        run_id: str,
+        *,
+        capabilities: Capabilities | None = None,
+        plan: Any = None,
+    ) -> int:
+        """Create `runs/<id>/segments/segment_<NNNN>.json` (12 §12.2).
+
+        Called by the worker AFTER `preflight_pass` succeeds: a failed
+        preflight must leave the run in READY with no segment. Resume on
+        new hardware appends a new ordinal — every execution context is
+        preserved, never overwritten.
+        """
+        self._require("run", run_id)
+        if capabilities is None:
+            capabilities = detect_capabilities()
+        if plan is None:
+            plan_path = self._dir("run", run_id) / PLAN_FILENAME
+            if plan_path.is_file():
+                plan = ExecutionPlan.read(plan_path)
+        seg_dir = self._dir("run", run_id) / "segments"
+        seg_dir.mkdir(parents=True, exist_ok=True)
+        existing = sorted(seg_dir.glob("segment_*.json"))
+        ordinal = len(existing) + 1
+        payload = {
+            "schema_version": 1,
+            "ordinal": ordinal,
+            "created_ts": time.time(),
+            "capabilities": capabilities.to_dict(),
+            "capabilities_identity": capabilities.identity,
+            "plan_hash": plan.identity if plan is not None else None,
+            "micro_batch": plan.micro_batch if plan is not None else None,
+            "grad_accum": plan.grad_accum if plan is not None else None,
+            "world_size": plan.world_size if plan is not None else None,
+            "precision_effective": (
+                plan.precision_effective if plan is not None else None
+            ),
+        }
+        path = seg_dir / f"segment_{ordinal:04d}.json"
+        path.write_text(json.dumps(payload, indent=2, sort_keys=True),
+                        encoding="utf-8")
+        self._journal("run", run_id).append(
+            "segment_created",
+            action="create_segment",
+            ordinal=ordinal,
+            capabilities_identity=capabilities.identity,
+        )
+        return ordinal
 
     def preflight_run(
         self, run_id: str, preflight: Preflight | None = None, **ctx_kwargs: Any

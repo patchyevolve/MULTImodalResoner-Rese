@@ -39,6 +39,7 @@ from mlforge.ingest import (
 )
 from mlforge.ingest.config import set_path as ingest_set_path, write_registry as ingest_write_registry
 from mlforge.leases import LeaseState, RunLeaseManager
+from mlforge.planner import build_plan
 from mlforge.run_spec import RunSpec
 from mlforge.runtime.control import wait_for_state, write_control
 from mlforge.store import ArtifactRegistry, ContentStore
@@ -270,6 +271,20 @@ def _print_plan(spec: RunSpec, runtime: dict) -> None:
     if runtime:
         print("\nExecution (runtime overrides)")
         print("  " + " · ".join(f"{k} {v}" for k, v in runtime.items()))
+    # 13 §6.1 SHOW PLAN — the feasibility solver's answer, shown before
+    # the user confirms. Infeasible (ValidationBlock) propagates to
+    # exit 1 BEFORE anything is created — never show an unsolved plan.
+    plan = build_plan(spec, runtime=runtime)
+    print("\nExecution plan")
+    print("  " + plan.summary_line())
+    bits = [f"precision {plan.precision_effective}"]
+    if plan.precision_fallback_used:
+        bits.append(f"fallback from {plan.precision_preferred} — PORTABLE")
+    elif plan.portable_required:
+        bits.append("CPU-only — PORTABLE")
+    else:
+        bits.append("PORTABLE-capable")
+    print("  " + " · ".join(bits))
     print()
 
 

@@ -44,6 +44,7 @@ from typing import Any, Callable, Mapping
 
 from mlforge.errors import NotFound, PreconditionFailed, ValidationBlock
 from mlforge.hashing import content_hash
+from mlforge.planner.plan import PLAN_FILENAME
 from mlforge.run_spec import SCHEMA_VERSION, RunSpec
 from mlforge.validation.report import FAIL, PASS, WARN, Check, ValidationReport
 
@@ -382,3 +383,132 @@ def make_gate(providers: Mapping[str, Provider], **kwargs: Any) -> ValidationGat
     """Convenience: providers for the listed steps, unverifiable elsewhere."""
     merged = dict(providers)
     return ValidationGate(merged, **kwargs)
+
+
+# ---------------------------------------------------------------------------
+# Execution planner providers — gate steps 10–13 (12 §13, §18; build 9)
+# ---------------------------------------------------------------------------
+
+
+def _plan_for(ctx: GateContext) -> Any:
+    """Plan from ctx.facts, building it once per gate run (capabilities
+    are measured once and shared — 12 §13.1 negotiation happens here)."""
+    plan = ctx.facts.get("execution_plan")
+    if plan is None:
+        from mlforge.planner import build_plan, detect_capabilities, load_runtime
+
+        caps = ctx.facts.get("capabilities")
+        if caps is None:
+            caps = detect_capabilities()  # ValidationBlock ⇒ engine FAIL
+            ctx.facts["capabilities"] = caps
+        plan = build_plan(ctx.run_spec, caps, runtime=load_runtime(ctx.run_dir))
+        ctx.facts["execution_plan"] = plan
+    return plan
+
+
+def provide_plan() -> Provider:
+    """Step 10: generate the execution plan (feasibility solver)."""
+    def _p(ctx: GateContext) -> Check:
+        plan = _plan_for(ctx)
+        detail = plan.summary_line() + f" · precision {plan.precision_effective}"
+        if plan.precision_fallback_used:
+            detail += (f" (from {plan.precision_preferred} — PORTABLE, "
+                       f"12 §14)")
+        elif plan.portable_required:
+            detail += " (CPU-only — PORTABLE, 12 §21)"
+        detail += f" · {len(plan.solutions)} feasible solution(s)"
+        # portable_required is an explicit PORTABLE signal (never EXACT)
+        data = {"exact_compatible": False} if plan.portable_required else {}
+        return Check(0, "", "", PASS, detail, data)
+    return _p
+
+
+def provide_global_batch() -> Provider:
+    """Step 11: micro × accum × world == frozen global_batch (12 §8.3)."""
+    def _p(ctx: GateContext) -> Check:
+        plan = _plan_for(ctx)
+        frozen = int(ctx.run_spec.semantic["global_batch"])
+        if plan.product != frozen or plan.global_batch != frozen:
+            return Check(
+                0, "", "", FAIL,
+                f"plan {plan.micro_batch}×{plan.grad_accum}×"
+                f"{plan.world_size} = {plan.product} != frozen "
+                f"global_batch {frozen}",
+            )
+        # persisted artifact (resume path) must state the same invariant
+        artifact = ctx.run_dir / PLAN_FILENAME
+        if artifact.is_file():
+            from mlforge.planner import ExecutionPlan
+
+            on_disk = ExecutionPlan.read(artifact)  # schema check inside
+            if on_disk.global_batch != frozen or on_disk.product != frozen:
+                return Check(
+                    0, "", "", FAIL,
+                    f"persisted plan artifact violates the invariant: "
+                    f"{on_disk.product} != frozen global_batch {frozen}",
+                )
+        return Check(
+            0, "", "", PASS,
+            f"{plan.micro_batch} × {plan.grad_accum} × "
+            f"{plan.world_size} = {frozen} preserved",
+            {"global_batch": frozen},
+        )
+    return _p
+
+
+def provide_precision() -> Provider:
+    """Step 12: precision policy supported (12 §14 — fallback ⇒ PORTABLE)."""
+    def _p(ctx: GateContext) -> Check:
+        plan = _plan_for(ctx)
+        if not plan.precision_fallback_used \
+                and plan.precision_effective != plan.precision_preferred:
+            return Check(0, "", "", FAIL,
+                         f"effective precision {plan.precision_effective!r} "
+                         f"is not the preferred "
+                         f"{plan.precision_preferred!r} without a recorded "
+                         f"fallback")
+        if plan.precision_fallback_used:
+            return Check(
+                0, "", "", PASS,
+                f"{plan.precision_preferred} → {plan.precision_effective} "
+                f"fallback — execution_mode PORTABLE (12 §14)",
+                {"exact_compatible": False},
+            )
+        return Check(0, "", "", PASS,
+                     f"{plan.precision_effective} supported by capabilities")
+    return _p
+
+
+def provide_topology() -> Provider:
+    """Step 13: distributed topology compatible (12 §8.5) — the plan's
+    world_size must fit the measured device set, backend must match."""
+    def _p(ctx: GateContext) -> Check:
+        from mlforge.planner import Capabilities
+
+        plan = _plan_for(ctx)
+        topo = plan.topology
+        caps = Capabilities.from_dict(plan.capabilities)
+        if topo.get("world_size") != plan.world_size:
+            return Check(0, "", "", FAIL,
+                         f"topology world_size {topo.get('world_size')} != "
+                         f"plan world_size {plan.world_size}")
+        if caps.gpu_count == 0:
+            if plan.world_size != 1 or topo.get("collective_backend") != "gloo":
+                return Check(0, "", "", FAIL,
+                             "CPU-only plan must use world_size 1 + gloo")
+        elif plan.world_size > caps.gpu_count:
+            return Check(0, "", "", FAIL,
+                         f"world_size {plan.world_size} exceeds measured "
+                         f"gpu_count {caps.gpu_count}")
+        elif topo.get("collective_backend") != "nccl":
+            return Check(0, "", "", FAIL,
+                         "GPU plan must use the nccl collective backend")
+        devices = (f"1 node × {topo['gpus_per_node']} GPU"
+                   if caps.gpu_count else "CPU-only")
+        return Check(
+            0, "", "", PASS,
+            f"{devices} (world {plan.world_size}, "
+            f"{topo['collective_backend']}/{topo['network_fabric']})",
+            {"topology": topo},
+        )
+    return _p

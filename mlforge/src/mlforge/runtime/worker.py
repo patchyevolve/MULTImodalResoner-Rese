@@ -35,6 +35,7 @@ from typing import Any
 
 from mlforge.errors import MlforgeError, NotFound, PreconditionFailed, ValidationBlock
 from mlforge.leases import LeaseState, RunLeaseManager
+from mlforge.planner import PLAN_FILENAME, ExecutionPlan, detect_capabilities
 from mlforge.runtime.checkpoints import REQUIRED_COMPONENTS, CheckpointStore
 from mlforge.runtime.control import clear_control, read_control
 from mlforge.runtime.heartbeat import DEFAULT_HEARTBEAT_INTERVAL, HeartbeatWriter
@@ -122,6 +123,22 @@ class Worker:
     def _clear_live(self) -> None:
         (self.run_dir / "state" / "live.json").unlink(missing_ok=True)
 
+    def _load_plan(self) -> Any:
+        """The persisted execution plan (build step 9) — absent is fine
+        (caller-passed gate wiring may not have written one), corrupt is
+        not: fail-closed before touching any state (12 §17)."""
+        p = self.run_dir / PLAN_FILENAME
+        if not p.is_file():
+            return None
+        try:
+            return ExecutionPlan.read(p)
+        except ValidationBlock:
+            raise
+        except (KeyError, ValueError, TypeError) as exc:
+            raise ValidationBlock(
+                f"persisted execution plan unreadable: {p}: {exc}"
+            ) from exc
+
     # -- lifecycle ------------------------------------------------------------
 
     def run(self) -> int:
@@ -140,7 +157,16 @@ class Worker:
             # 2. Start contract: READY is the only startable state.
             state = wf.get_run_state(self.run_id)
             if state == RunState.READY.value:
+                # Capability negotiation (12 §13.1) BEFORE the transition:
+                # detection/plan failure must leave the run in READY with
+                # no segment behind (12 §12.2 execution segments are
+                # created only once the run actually starts).
+                caps = detect_capabilities()
+                plan = self._load_plan()
                 wf.preflight_pass(self.run_id)  # READY → RUNNING (runtime's step)
+                wf.create_execution_segment(
+                    self.run_id, capabilities=caps, plan=plan
+                )
             elif state == RunState.RUNNING.value:
                 if not self._heartbeat_fresh(hb):
                     raise PreconditionFailed(

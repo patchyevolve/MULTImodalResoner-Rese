@@ -23,7 +23,11 @@ from mlforge.validation.gate import (
     make_gate,
     provide_dataset_identity,
     provide_fail,
+    provide_global_batch,
     provide_pass,
+    provide_plan,
+    provide_precision,
+    provide_topology,
     provide_unverifiable,
     scan_for_secrets,
 )
@@ -56,5 +60,9 @@ __all__ = [
     "provide_fail",
     "provide_unverifiable",
     "provide_dataset_identity",
+    "provide_plan",
+    "provide_global_batch",
+    "provide_precision",
+    "provide_topology",
     "scan_for_secrets",
 ]
