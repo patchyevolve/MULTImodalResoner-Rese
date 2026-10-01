@@ -19,10 +19,11 @@ from pathlib import Path
 import mlforge
 from mlforge.errors import MlforgeError
 from mlforge.store import ArtifactRegistry, ContentStore
+from mlforge.validation import Preflight, ValidationGate
 from mlforge.workflow import WorkflowAPI
 
 # 13 §11 build-order gates: implemented vs pending.
-_IMPLEMENTED = {"status", "inspect", "events", "store"}
+_IMPLEMENTED = {"status", "inspect", "events", "store", "validate", "preflight"}
 _PENDING = {
     "init": 1,
     "configure": 1,
@@ -38,8 +39,6 @@ _PENDING = {
     "infer": 11,
     "export": 11,
     "package": 11,
-    "validate": 3,
-    "preflight": 3,
     "lease": 5,
     "watch": 7,
     "hardware": 7,
@@ -69,6 +68,24 @@ def _build_parser() -> argparse.ArgumentParser:
 
     ev = sub.add_parser("events", help="structured event stream for a run")
     ev.add_argument("run_id")
+
+    val = sub.add_parser(
+        "validate", help="run the 19-step validation gate for a run (fail-closed)"
+    )
+    val.add_argument("run_id")
+    val.add_argument("--json", action="store_true")
+
+    pf = sub.add_parser(
+        "preflight",
+        help="host + identity preflight before any expensive operation (report-only)",
+    )
+    pf.add_argument("run_id")
+    pf.add_argument("--json", action="store_true")
+    pf.add_argument(
+        "--no-gpu",
+        action="store_true",
+        help="this operation does not require a GPU (GPU/driver checks become WARN)",
+    )
 
     tr = sub.add_parser("train", help="(pending build step 6)")
     tr.add_argument("--config")
@@ -136,6 +153,23 @@ def main(argv: list[str] | None = None) -> int:
             for e in wf.get_run_events(args.run_id):
                 print(json.dumps(e, sort_keys=True))
             return 0
+
+        if args.command == "validate":
+            report = wf.validate_run(args.run_id)
+            if args.json:
+                print(json.dumps(report.to_dict(), indent=2, sort_keys=True))
+            else:
+                print(report.render())
+            # 12 §7.2: any FAIL → training does not start (exit 1).
+            return 1 if report.blocked else 0
+
+        if args.command == "preflight":
+            report = wf.preflight_run(args.run_id, gpu_required=not args.no_gpu)
+            if args.json:
+                print(json.dumps(report.to_dict(), indent=2, sort_keys=True))
+            else:
+                print(report.render())
+            return 1 if report.blocked else 0
 
         if args.command == "store":
             if getattr(args, "store_command", None) != "gc":

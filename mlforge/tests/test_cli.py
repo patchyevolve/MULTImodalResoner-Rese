@@ -117,3 +117,54 @@ def test_store_gc_blocked_by_lease_exits_3(tmp_path, capsys):
 def test_store_without_gc_subcommand_exits_4(tmp_path, capsys):
     assert main(["--root", str(tmp_path), "store"]) == 4
     assert "NOT_IMPLEMENTED" in capsys.readouterr().err
+
+
+# -- validate / preflight CLI (12 §7, step 3) -----------------------------
+
+
+def test_validate_fails_closed_on_fresh_run(tmp_path, capsys):
+    """No identity providers in this build step ⇒ unverifiable ⇒ BLOCK.
+    Fail-closed demo: exit 1, report printed, run left FAILED[FORK_ONLY]."""
+    from mlforge.workflow import WorkflowAPI
+
+    wf = WorkflowAPI(tmp_path)
+    h = wf.create_run(_spec())
+    assert main(["--root", str(tmp_path), "validate", h.run_id]) == 1
+    out = capsys.readouterr().out
+    assert "VALIDATION REPORT" in out
+    assert "[PASS] Run manifest integrity" in out
+    assert "[FAIL] Source artifact + code hash" in out
+    assert "TRAINING BLOCKED" in out          # flow=TRAIN for a CREATED run
+    # train path: gate BLOCK → FAILED[FORK_ONLY] (13 §7)
+    assert wf.get_run_state(h.run_id) == "FAILED"
+    assert wf.get_run_status(h.run_id)["failure"]["recovery"] == "FORK_ONLY"
+
+
+def test_validate_json_report(tmp_path, capsys):
+    from mlforge.workflow import WorkflowAPI
+
+    wf = WorkflowAPI(tmp_path)
+    h = wf.create_run(_spec())
+    assert main(["--root", str(tmp_path), "validate", h.run_id, "--json"]) == 1
+    out = json.loads(capsys.readouterr().out)
+    assert out["blocked"] is True
+    assert out["failed_step"] == 3
+    assert out["run_id"] == h.run_id
+
+
+def test_validate_missing_run_exits_2(tmp_path, capsys):
+    assert main(["--root", str(tmp_path), "validate", "run_MISSING"]) == 2
+
+
+def test_preflight_report_only_and_fails_closed(tmp_path, capsys):
+    from mlforge.workflow import WorkflowAPI
+
+    wf = WorkflowAPI(tmp_path)
+    h = wf.create_run(_spec())
+    code = main(["--root", str(tmp_path), "preflight", h.run_id, "--no-gpu"])
+    assert code == 1  # identity providers unverifiable in this build step
+    out = capsys.readouterr().out
+    assert "PREFLIGHT REPORT" in out
+    # report-only: no transition, no events (runtime wires READY→RUNNING)
+    assert wf.get_run_state(h.run_id) == "CREATED"
+    assert [e["event"] for e in wf.get_run_events(h.run_id)] == ["run_created"]

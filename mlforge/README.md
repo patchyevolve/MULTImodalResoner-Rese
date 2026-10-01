@@ -29,9 +29,9 @@ mlforge/
 │   ├── machine.py            # 4 transition tables (13 §5)        ✅
 │   ├── run_spec.py           # immutable semantic identity        ✅
 │   ├── workflow.py           # Workflow API facade (13 §1)        ✅
-│   ├── cli/                  # status/inspect/events/store gc      ✅ minimal
+│   ├── cli/                  # status/inspect/events/store gc/validate/preflight ✅
 │   ├── store/                # CAS + registry + GC                ✅
-│   ├── validation/           # 19-step gate + preflight           ⛔ step 3
+│   ├── validation/           # 19-step gate + preflight           ✅
 │   ├── leases/               # run/execution leases               ⛔ step 5
 │   ├── commands/             # idempotency journal                ⛔ step 5
 │   ├── runtime/              # checkpoints, heartbeat, supervisor  ⛔ step 6
@@ -44,8 +44,10 @@ mlforge/
 
 1. ✅ Workflow API + state machines (project/dataset/run/model)
 2. ✅ Artifact registry + content store + run_spec canonical hashing
-3. ⛔ Validation gate + preflight (fail-closed core)
-4. 🟡 CLI contract — `status` / `inspect` / `events` / `store gc` work; other commands exit 4 with `NOT_IMPLEMENTED` (never fake success)
+3. ✅ Validation gate + preflight (fail-closed core)
+4. 🟡 CLI contract — `status` / `inspect` / `events` / `store gc` /
+   `validate` / `preflight` work; other commands exit 4 with
+   `NOT_IMPLEMENTED` (never fake success)
 5. ⛔ Supervisor daemon + run leases + idempotency journal
 6. ⛔ Training runtime + transactional checkpoints + heartbeat + reconciliation scan
 7. ⛔ Status layer (read-only L1/L2/L3)
@@ -77,6 +79,21 @@ mlforge/
   by `verify()`, never trusted.
 * **Registry registration is transactional** — entry written to temp,
   renamed to commit; crash orphans swept by `recover()`.
+* **Unverifiable == failed verification** — a missing provider, a throwing
+  check, or a missing probe records FAIL, never SKIP (12 §7.1: "probably
+  compatible does not exist"). First FAIL stops the run, so the
+  side-effect lease step (15) never executes after an earlier failure.
+* **Gate BLOCK has two distinct behaviors** — train path:
+  CREATED → VALIDATING → FAILED[FORK_ONLY], never READY; resume path:
+  **no state change** ("No changes were made" — 13 §7 failure matrix:
+  Stays PAUSED / stays FAILED), journaled as `validation_blocked`.
+* **EXACT continuation is opt-in, PORTABLE is the default** — EXACT only
+  when every check reports `exact_compatible: True` (12 §8).
+* **Disk-space check is worst-case and mandatory** —
+  `2×checkpoint + dataset_cache + logs + safety_margin`; free < required
+  ⇒ BLOCK, never "train until disk fills" (12 §7.3).
+* **Preflight is report-only until the runtime exists** — it never moves
+  a run to RUNNING (only after PREFLIGHT PASSED does training proceed).
 
 ## Develop
 

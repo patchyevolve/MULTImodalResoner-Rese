@@ -53,6 +53,13 @@ from mlforge.states import (
     RunState,
     compute_recovery,
 )
+from mlforge.validation import (
+    GateContext,
+    Preflight,
+    PreflightContext,
+    ValidationGate,
+    ValidationReport,
+)
 
 _KINDS = {
     "run": ("runs", RunState.CREATED.value, RUN_MACHINE),
@@ -246,21 +253,64 @@ class WorkflowAPI:
     def begin_validation(self, run_id: str) -> str:
         return self._fire("run", run_id, "begin_validation", "validation_started")
 
-    def validation_pass(self, run_id: str) -> str:
-        return self._fire("run", run_id, "validation_pass", "validation_passed")
+    def validation_pass(self, run_id: str, report: dict[str, Any] | None = None) -> str:
+        """All checks passed → READY.
 
-    def validation_fail(self, run_id: str, cause: str) -> str:
-        """Gate BLOCK before any checkpoint exists → structurally FORK_ONLY
-        (13 §5.3: pre-first-checkpoint failures have nothing to resume)."""
+        The event explicitly records `failure: null` so a successful gate
+        clears any stale FAILED disposition from the projection (the
+        disposition's job — gating resume — is finished). Journal history
+        keeps every prior failure event."""
+        data: dict[str, Any] = {"failure": None}
+        if report is not None:
+            data["report"] = report
+        return self._fire(
+            "run", run_id, "validation_pass", "validation_passed", data=data
+        )
+
+    def validation_fail(
+        self, run_id: str, cause: str, report: dict[str, Any] | None = None
+    ) -> str:
+        """Gate BLOCK while in VALIDATING → FAILED (13 §5.3: "gate BLOCK →
+        FAILED[FORK_ONLY]" — the train path has no checkpoint yet, and the
+        cause is semantic: an invariant could not be verified."""
         failure = self._make_failure(cause, has_valid_checkpoint=False, cause_is_semantic=True)
-        return self._fire("run", run_id, "validation_fail", "validation_failed", failure=failure)
+        data = {"report": report} if report is not None else None
+        return self._fire(
+            "run", run_id, "validation_fail", "validation_failed",
+            failure=failure, data=data,
+        )
+
+    def validation_blocked(self, run_id: str, report: dict[str, Any]) -> str:
+        """Gate BLOCK on the resume path — NO state change (13 §7 failure
+        matrix: "resume, dataset hash mismatch → BLOCK. Stays PAUSED.
+        Exit 1. No changes." / "resume, cause unresolved → BLOCK, stays
+        FAILED").
+
+        The journal records the attempt (visible in `mlforge events`);
+        the event carries no `to`, so the projected state is untouched."""
+        f = next(
+            (c for c in report.get("checks", []) if c.get("verdict") == "FAIL"), None
+        )
+        self._journal("run", run_id).append(
+            "validation_blocked",
+            action="validate",
+            failed_step=f.get("step") if f else None,
+            failed_check=f.get("label") if f else None,
+            report=report,
+        )
+        return self.get_run_state(run_id)
 
     def preflight_pass(self, run_id: str) -> str:
-        return self._fire("run", run_id, "preflight_pass", "preflight_passed")
+        return self._fire("run", run_id, "preflight_pass", "preflight_passed",
+                          data={"failure": None})
 
-    def preflight_fail(self, run_id: str, cause: str) -> str:
+    def preflight_fail(self, run_id: str, cause: str, report: dict[str, Any] | None = None) -> str:
         failure = self._make_failure(cause, has_valid_checkpoint=False, cause_is_semantic=False)
-        return self._fire("run", run_id, "preflight_fail", "preflight_failed", failure=failure)
+        data = {"report": report} if report is not None else None
+        return self._fire(
+            "run", run_id, "preflight_fail", "preflight_failed",
+            failure=failure, data=data,
+        )
 
     # -- execution ------------------------------------------------------
 
@@ -407,6 +457,102 @@ class WorkflowAPI:
             "recovery": recovery.value,
             "valid_checkpoint": has_valid_checkpoint,
         }
+
+    # -- gate orchestration (12 §18, 13 §6.1–6.2) -----------------------
+
+    def _run_spec(self, run_id: str) -> RunSpec:
+        p = self._dir("run", run_id) / "run_spec.json"
+        if not p.is_file():
+            raise ValidationBlock(
+                f"run {run_id}: run_spec.json missing — cannot validate",
+                hint="the run folder is incomplete; recreate the run",
+            )
+        return RunSpec.from_dict(json.loads(p.read_text(encoding="utf-8")))
+
+    def validate_run(self, run_id: str, gate: ValidationGate | None = None) -> ValidationReport:
+        """Run the 19-step validation gate (12 §18) for this run's state.
+
+        State-dependent semantics (13 §5.3, §7):
+
+        * CREATED / VALIDATING (train path): enter VALIDATING (if not
+          already), run the gate; PASS → READY; FAIL → FAILED[FORK_ONLY]
+          and the run never reaches READY.
+        * PAUSED / RECONCILING / FAILED(resume: RESUME) (resume path):
+          run the gate BEFORE any transition; FAIL → **no state change**
+          (recorded `validation_blocked`, exit 1, "No changes were made");
+          PASS → `resume` → VALIDATING → validation_pass → READY.
+        * any other state (report-only): the gate runs and the report is
+          returned; the run is never moved by `validate`.
+
+        The report is always returned (caller decides the exit code);
+        the run's state follows the rules above — never anything else.
+        """
+        gate = gate or ValidationGate()
+        proj = self.get_run_status(run_id)
+        state = proj["state"]
+        spec = self._run_spec(run_id)
+        flow = "TRAIN" if state in (
+            RunState.CREATED.value, RunState.VALIDATING.value
+        ) else "RESUME"
+        report = gate.run(
+            GateContext(run_id=run_id, root=self.root, run_spec=spec, flow=flow)
+        )
+        rep = report.to_dict()
+
+        if state == RunState.CREATED.value:
+            self.begin_validation(run_id)
+            state = RunState.VALIDATING.value
+
+        if state == RunState.VALIDATING.value:
+            # Train path (incl. crash-recovery of a gate interrupted mid-run).
+            if report.blocked:
+                self.validation_blocked(run_id, rep)  # journal attempt (still VALIDATING)
+                self.validation_fail(
+                    run_id,
+                    f"gate BLOCK at step {report.failed_step}: "
+                    f"{report.first_failure.label}",
+                    report=rep,
+                )
+            else:
+                self.validation_pass(run_id, report=rep)
+            return report
+
+        resumable = state in (RunState.PAUSED.value, RunState.RECONCILING.value) or (
+            state == RunState.FAILED.value
+            and (proj.get("failure") or {}).get("recovery")
+            == FailureRecovery.RESUME.value
+        )
+        if resumable:
+            if report.blocked:
+                self.validation_blocked(run_id, rep)  # NO state change (13 §7)
+            else:
+                # Gate passed → the resume transition itself is now legal.
+                self.resume(run_id)
+                self.validation_pass(run_id, report=rep)
+            return report
+
+        # Report-only states (RUNNING/READY/STOPPED/COMPLETED/INTERRUPTED/
+        # FAILED[FORK_ONLY]): `validate` never moves them.
+        if report.blocked:
+            self.validation_blocked(run_id, rep)
+        return report
+
+    def preflight_run(
+        self, run_id: str, preflight: Preflight | None = None, **ctx_kwargs: Any
+    ) -> ValidationReport:
+        """Host + identity preflight (12 §7.3) — REPORT ONLY.
+
+        The READY → RUNNING transition stays with the runtime (build step
+        6): firing `preflight_pass` here would put a run in RUNNING with
+        no process behind it. Only after PREFLIGHT PASSED does train/
+        resume launch (12 §7.3)."""
+        self._require("run", run_id)
+        spec = self._run_spec(run_id)
+        ctx = PreflightContext(
+            run_id=run_id, root=self.root, run_spec=spec, **ctx_kwargs
+        )
+        preflight = preflight or Preflight()
+        return preflight.run(ctx)
 
     # ------------------------------------------------------------------
     # PROJECT (13 §5.1)
