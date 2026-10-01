@@ -10,6 +10,8 @@
 
 **Where you are working:** The code lives in `src/` at the project root. Everything else (`00_core/` through `10_training_plan/`) is research, architecture, and planning documents that define WHAT to build. You build HOW.
 
+**Separate package:** `mlforge/` at the project root is the standalone ML training system (build in progress, tests in `mlforge/tests/`). Its ground truth is `10_training_plan/12_training_system.md` (architecture) + `10_training_plan/13_product_specification.md` (product) — where code and those docs disagree, the docs win until amended. Build order and status: `mlforge/README.md`.
+
 **Repository:** `https://github.com/patchyevolve/MULTImodalResoner-Rese`
 
 ---

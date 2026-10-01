@@ -1,0 +1,127 @@
+"""`mlforge` command-line interface.
+
+Normative contract: 13_product_specification.md §4.
+This is the minimal step-4 slice: commands that the Workflow API already
+supports. The rest exit 4 (runtime error: not implemented in this build
+step) rather than pretending to work — fail loudly, never fake success.
+
+Exit codes (§4.2): 0 ok · 1 validation BLOCK · 2 not found ·
+3 precondition failed · 4 runtime error.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+
+import mlforge
+from mlforge.errors import MlforgeError
+from mlforge.workflow import WorkflowAPI
+
+# 13 §11 build-order gates: implemented vs pending.
+_IMPLEMENTED = {"status", "inspect", "events"}
+_PENDING = {
+    "init": 1,
+    "configure": 1,
+    "prepare": 8,
+    "train": 6,
+    "resume": 6,
+    "pause": 6,
+    "stop": 6,
+    "retrain": 10,
+    "finetune": 10,
+    "evaluate": 11,
+    "compare": 11,
+    "infer": 11,
+    "export": 11,
+    "package": 11,
+    "validate": 3,
+    "preflight": 3,
+    "lease": 5,
+    "watch": 7,
+    "hardware": 7,
+}
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="mlforge",
+        description="MLForge — hardware-agnostic ML training system "
+        "(spec: 10_training_plan/12 + 13)",
+    )
+    p.add_argument("--version", action="version", version=f"mlforge {mlforge.__version__}")
+    p.add_argument(
+        "--root",
+        default=".",
+        help="workspace root (default: current directory)",
+    )
+    sub = p.add_subparsers(dest="command")
+
+    st = sub.add_parser("status", help="overview of all runs (read-only, L1)")
+    st.add_argument("--json", action="store_true", help="machine-readable output")
+
+    insp = sub.add_parser("inspect", help="detailed report for one object")
+    insp.add_argument("object_id")
+    insp.add_argument("--json", action="store_true")
+
+    ev = sub.add_parser("events", help="structured event stream for a run")
+    ev.add_argument("run_id")
+
+    tr = sub.add_parser("train", help="(pending build step 6)")
+    tr.add_argument("--config")
+    tr.add_argument("--command-id", default=None)
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+
+    if not args.command:
+        parser.print_help()
+        return 0
+
+    if args.command in _PENDING:
+        step = _PENDING[args.command]
+        print(
+            f"[NOT_IMPLEMENTED] `mlforge {args.command}` arrives in build step {step} "
+            f"(13 §11). Nothing was executed.",
+            file=sys.stderr,
+        )
+        return 4
+
+    try:
+        wf = WorkflowAPI(args.root)
+        if args.command == "status":
+            runs = wf.list_runs()
+            if args.json:
+                print(json.dumps(runs, indent=2, sort_keys=True))
+            elif not runs:
+                print("No runs.")
+            else:
+                for r in runs:
+                    fail = r.get("failure")
+                    line = f"{r['id']}  {r['state']}"
+                    if fail:
+                        line += f"  recovery={fail.get('recovery')}  cause={fail.get('cause')}"
+                    print(line)
+            return 0
+
+        if args.command == "inspect":
+            print(json.dumps(wf.get_run_status(args.object_id), indent=2, sort_keys=True))
+            return 0
+
+        if args.command == "events":
+            for e in wf.get_run_events(args.run_id):
+                print(json.dumps(e, sort_keys=True))
+            return 0
+
+        return 4
+    except MlforgeError as exc:
+        print(exc.render(), file=sys.stderr)
+        return exc.exit_code
+
+
+if __name__ == "__main__":
+    sys.exit(main())
