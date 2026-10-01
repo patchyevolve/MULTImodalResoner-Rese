@@ -908,7 +908,7 @@ CLI commands never manipulate training directly — they drive the state machine
 ```text
 CREATED → VALIDATING → PREPARING → READY → RUNNING
                                         ├── PAUSING → PAUSED        (user, resumable)
-                                        ├── STOPPING → STOPPED      (user, terminal)
+                                        ├── STOPPING → STOPPED      (user; no resume)
                                         ├── CHECKPOINTING
                                         ├── INTERRUPTED             (unexpected, needs reconciliation)
                                         ├── FAILED                  (recovery disposition recorded)
@@ -925,19 +925,19 @@ Inference: MODEL ARTIFACT → ENV VALIDATION → SCHEMA VALIDATION → INFERENCE
 
 #### Lifecycle Terms Are Never Interchangeable
 
-| Term | Cause | Terminal? | Resumable? | Action required |
-|---|---|---|---|---|
-| `PAUSED` | user ran `mlforge pause` | no | yes, ordinary resume path | none |
-| `INTERRUPTED` | crash, power loss, kill -9, host reboot | no | yes, but only after **reconciliation scan** | verify checkpoint, reconcile state, resume |
-| `FAILED` | error stopped the run | yes | **per recorded `failure.recovery`** (RESUME / FORK_ONLY) | inspect `events.jsonl` + logs; `resume` or `fork` |
-| `STOPPED` | user ran `mlforge stop` (graceful, final checkpoint committed) | yes | no — continue only via `mlforge retrain` / new run | optional: `evaluate` / `export` / `retrain` |
-| `COMPLETED` | training reached its end condition | yes | no — continue only via `retrain` | optional: `evaluate` / `export` |
+| Term | Cause | Automatic continuation | Explicit recovery action |
+|---|---|---|---|
+| `PAUSED` | user ran `mlforge pause` | **NO** | `resume` → 19-step gate → RUNNING |
+| `INTERRUPTED` | crash, power loss, kill -9, host reboot | **NO** | reconciliation scan (§12.3), then `resume` |
+| `FAILED` | error stopped the run | **NO** | **per recorded `failure.recovery`**: `resume` (RESUME) or `fork`/`retrain` (FORK_ONLY) |
+| `STOPPED` | user ran `mlforge stop` (graceful, final checkpoint committed) | **NO** | `retrain` / `finetune` — new run only; optional `evaluate` / `export` first |
+| `COMPLETED` | training reached its end condition | **NO** | `retrain` — new run only; optional `evaluate` / `export` first |
 
-*Terminal* = no automatic continuation, ever. States exit only via explicit command: `resume` for `PAUSED`/`INTERRUPTED`/`FAILED(RESUME)`; `retrain`/`finetune` (new run) for `FAILED(FORK_ONLY)`/`STOPPED`/`COMPLETED`.
+*Automatic continuation* is `NO` for every non-`RUNNING` state — the system never transitions a run on its own. The *Explicit recovery action* column is the only legal exit. Do not read `FAILED` as "no transition out": its exit is the recorded disposition plus an explicit command plus a fresh gate (§5.3 disposition rule below).
 
 #### FAILED Carries `failure.recovery` (One Meaning, Recorded Disposition)
 
-`FAILED` must not mean both "terminal" and "resumable." It is a single terminal state whose **disposition is recorded when the state is entered**:
+`FAILED` must not carry two contradictory meanings ("no exit" vs "freely resumable"). It is a single state whose **disposition is recorded when the state is entered**:
 
 ```yaml
 failure:

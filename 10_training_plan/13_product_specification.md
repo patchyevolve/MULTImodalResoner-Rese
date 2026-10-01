@@ -83,8 +83,8 @@ Each maps to exactly one command. **The command expresses intent** — no generi
               ┌────────┼───────────┬────────────┐
               ▼        ▼           ▼            ▼
            RESUME   EVALUATE      PAUSE        STOP
-              │        ▼        (parked,      (terminal,
-              │     REPORT      resumable)     spend resume)
+              │        ▼        (parked,      (resume
+              │     REPORT      resumable)     spent)
                ▼        │           │            │
             COMPLETE ◄──┘           └──resume──► ▼
                ▼                          (new run via RETRAIN)
@@ -145,7 +145,7 @@ TRAINING
 mlforge train [--config F] [--attach]   Start new run (from scratch)
 mlforge resume <RUN>                    Continue paused/interrupted/FAILED(RESUME) run
 mlforge pause <RUN>                     Graceful pause → PAUSED (resumable)
-mlforge stop <RUN>                      Graceful stop → STOPPED (terminal)
+mlforge stop <RUN>                      Graceful stop → STOPPED (no resume)
 mlforge retrain <MODEL> [--dataset D]   New run, fresh init
 mlforge finetune <MODEL> [--dataset D]  New run, from model weights
 
@@ -278,15 +278,15 @@ FAILED | STOPPED | COMPLETED ── retrain / finetune ──► new run (this r
 
 #### Lifecycle Terms (Never Interchangeable)
 
-| State | Cause | Terminal? | Resumable? | Meaning to user |
+| State | Cause | Automatic continuation | Explicit recovery action | Meaning to user |
 |---|---|---|---|---|
-| `PAUSED` | you ran `mlforge pause` | no | yes — `resume` is ordinary | "your run, safely parked" |
-| `INTERRUPTED` | crash / power loss / kill -9 | no | yes — after automatic reconciliation | "something died; here's what I found" |
-| `FAILED` | error stopped the run | yes | **depends on `failure.recovery`** (below) | "stopped; cause is in `mlforge events`" |
-| `STOPPED` | you ran `mlforge stop` | yes | no — continue via `retrain`/new run | "you ended this run" |
-| `COMPLETED` | reached end condition | yes | no | "done" |
+| `PAUSED` | you ran `mlforge pause` | **NO** | `resume` — ordinary gate path | "your run, safely parked" |
+| `INTERRUPTED` | crash / power loss / kill -9 | **NO** | reconciliation scan, then `resume` | "something died; here's what I found" |
+| `FAILED` | error stopped the run | **NO** | **depends on `failure.recovery`** (below) | "stopped; cause is in `mlforge events`" |
+| `STOPPED` | you ran `mlforge stop` | **NO** | `retrain` / `finetune` — new run only | "you ended this run" |
+| `COMPLETED` | reached end condition | **NO** | `retrain` / `finetune` — new run only | "done" |
 
-*Terminal?* means: **no automatic continuation, ever.** Every non-`RUNNING` state exits only through an explicit command — `resume` for `PAUSED`/`INTERRUPTED`/`FAILED(recovery: RESUME)`, and only `retrain`/`finetune` (a new run) for `FAILED(recovery: FORK_ONLY)`/`STOPPED`/`COMPLETED`. Nothing in the system transitions a run on its own.
+*Automatic continuation* is `NO` for **every** non-`RUNNING` state: nothing in the system transitions a run on its own. The *Explicit recovery action* column is the only legal way out of each state — for `FAILED`, that action is determined by the recorded `failure.recovery` disposition (never by the state name alone). Do not read `FAILED` as "no legal transition out"; read it as "the transition requires the recorded disposition + an explicit command + a fresh validation gate."
 
 #### FAILED Carries a Recovery Disposition (Not Resumability-by-Guesswork)
 
@@ -546,7 +546,7 @@ User          CLI          Orchestrator      Runtime
  │◄──checkpoint VALID, PAUSED────┤               │
 ```
 
-`mlforge stop` runs the same sequence but ends in **STOPPED (terminal)** — resume capability is spent; continue only via `retrain`/`finetune`.
+`mlforge stop` runs the same sequence but ends in **STOPPED (no resume)** — resume capability is spent; continue only via `retrain`/`finetune`.
 
 **Only graceful signals use this protocol:**
 
