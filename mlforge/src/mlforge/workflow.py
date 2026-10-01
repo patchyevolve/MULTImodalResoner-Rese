@@ -49,6 +49,7 @@ from mlforge.machine import (
 )
 from mlforge.run_spec import RunSpec
 from mlforge.states import (
+    LIVE_STATES,
     DatasetState,
     FailureRecovery,
     ModelState,
@@ -404,7 +405,9 @@ class WorkflowAPI:
             self.begin_reconciliation(run_id)
         elif state != RunState.RECONCILING.value:
             raise ValidationBlock(
-                f"reconciliation only applies to INTERRUPTED runs (run is {state})"
+                f"reconciliation only applies to INTERRUPTED runs (run is {state})",
+                hint="if the worker is dead, heartbeat expiry (supervisor) "
+                     "marks the run INTERRUPTED first — 12 §12.3",
             )
         self._journal("run", run_id).append(
             "reconciliation_scan",
@@ -438,7 +441,19 @@ class WorkflowAPI:
         leased run → BLOCK RUN_ALREADY_EXECUTING (exit 3); a SUSPECT
         (stale) lease → block until broken explicitly — stale ≠ free.
         `session_token` proves THIS caller owns the lease (the validation
-        gate's step 15 acquired it)."""
+        gate's step 15 acquired it).
+
+        INTERRUPTED runs are reconciled from disk FIRST (13 §6.2,
+        12 §12.3): derive resume_point + skipped checkpoints, journal them,
+        then the normal flow continues (RECONCILING → resume). Idempotent
+        — a prior full reconciliation is replayed from its RECONCILED
+        event, never re-run."""
+        state = self.get_run_state(run_id)
+        if state == RunState.INTERRUPTED.value:
+            # Step 7 of §12.3: reconcile before any resume promise. This
+            # moves the run to RECONCILING (valid checkpoint) or
+            # FAILED[FORK_ONLY] (none) — the resume guard below decides.
+            self.reconcile_from_disk(run_id)
         lease = RunLeaseManager(self.root)
         info = lease.status(run_id)
         if info.state == LeaseState.HELD and info.session_token != session_token:
@@ -467,9 +482,119 @@ class WorkflowAPI:
 
     def _last_reconciliation(self, run_id: str) -> bool | None:
         for ev in reversed(self._journal("run", run_id).read()):
-            if ev.event == "reconciliation_scan":
-                return bool(ev.data.get("has_valid_checkpoint"))
+            if ev.event in ("reconciliation_scan", "RECONCILED"):
+                if "has_valid_checkpoint" in ev.data:
+                    return bool(ev.data.get("has_valid_checkpoint"))
+                if ev.event == "RECONCILED":
+                    # RECONCILED after a full scan: valid ⇔ a resume point
+                    return ev.data.get("resume_point") is not None
         return None
+
+    # -- full §12.3 reconciliation (deterministic, idempotent) -------------
+
+    def reconcile_from_disk(self, run_id: str) -> dict[str, Any]:
+        """Deterministic crash recovery (12 §12.3) — derive everything from
+        the run folder on disk:
+
+            1–3. checkpoint scan → §11.2 newest-valid predicate → resume_point
+            4–5. projection vs journal authority → consistent | stale
+            6.   CHECKPOINT_SKIPPED events + RECONCILED event
+            7.   report (never starts training — `resume` stays explicit)
+
+        Idempotent: if the journal's last event is already RECONCILED,
+        nothing is appended and the stored report is returned. Stale
+        projections are rebuilt from the journal (authority wins, §16).
+        """
+        from mlforge.runtime.reconcile import ReconcileReport, scan_checkpoints
+
+        j = self._journal("run", run_id)
+        events = j.read()  # raises NotFound via _require below if missing
+        if events and events[-1].event == "RECONCILED":
+            data = dict(events[-1].data)
+            data.setdefault("stored", True)
+            data["skips"] = data.get("skipped", [])
+            return data
+
+        self._require("run", run_id)
+        prior = self.get_run_state(run_id)
+        initial = _KINDS["run"][1]
+        authority = j.project_state(initial)
+        consistent = prior == authority
+
+        if consistent:
+            derived = authority
+        else:
+            # §12.3 step 5: inconsistent → INTERRUPTED (when the authority
+            # is a live state — a live-state divergence means the recorded
+            # picture is broken); otherwise the journal's truth wins.
+            # Rebuild the projection FIRST so the machine fires from the
+            # authority state, not the stale one (13 §9.4).
+            failure = self._current_failure("run", run_id)
+            self._write_projection(
+                "run", run_id, authority,
+                failure=failure,
+                run_spec_hash=self.get_run_status(run_id).get("run_spec_hash"),
+            )
+            if authority in {s.value for s in LIVE_STATES}:
+                # Record the divergence as an explicit crash — the journal
+                # must stay the single authority for state.
+                self.crash(
+                    run_id,
+                    "reconciliation: recorded state stale vs journal authority",
+                )
+                derived = RunState.INTERRUPTED.value
+            else:
+                derived = authority
+
+        selection = scan_checkpoints(self._dir("run", run_id))
+        reconciliation_id = content_hash(
+            {"run": run_id, "authority_state": authority}
+        )
+
+        # §11.2 rule 4: every skip is an event, written BEFORE resume.
+        for s in selection.skips:
+            j.append(
+                "CHECKPOINT_SKIPPED",
+                action="reconcile",
+                checkpoint=f"ckpt-{s.ordinal:06d}",
+                ordinal=s.ordinal,
+                reason=s.reason,
+            )
+
+        # Reconcile transitions (INTERRUPTED → RECONCILING, or → FAILED
+        # when no valid checkpoint exists) — via the normative machine.
+        self.reconcile(
+            run_id,
+            has_valid_checkpoint=not selection.no_valid_checkpoint,
+            resume_point=selection.resume_point,
+        )
+
+        state_after = self.get_run_state(run_id)
+        j.append(
+            "RECONCILED",
+            action="reconcile",
+            reconciliation_id=reconciliation_id,
+            prior_recorded_state=prior,
+            authority_state=authority,
+            derived_state=derived,
+            consistent=consistent,
+            resume_point=selection.resume_point,
+            skipped=[s.to_dict() for s in selection.skips],
+            has_valid_checkpoint=not selection.no_valid_checkpoint,
+            state_after=state_after,
+        )
+        report = ReconcileReport(
+            run_id=run_id,
+            prior_recorded_state=prior,
+            authority_state=authority,
+            derived_state=state_after,
+            selection=selection,
+            consistent=consistent,
+            reconciliation_id=reconciliation_id,
+        )
+        out = report.to_dict()
+        out["state_after"] = state_after
+        return out
 
     # -- run lease (12 §23, 13 §4.1 LEASES) ------------------------------
 

@@ -50,7 +50,11 @@ mlforge/
    `validate` / `preflight` / `lease status` / `lease break` work; other
    commands exit 4 with `NOT_IMPLEMENTED` (never fake success)
 5. ✅ Supervisor daemon + run leases + idempotency journal
-6. ⛔ Training runtime + transactional checkpoints + heartbeat + reconciliation scan
+6. 🟡 Training runtime — ✅ transactional checkpoints (12 §11 write
+   protocol / newest-valid predicate / verify / components), heartbeat
+   writer, deterministic reconciliation (`reconcile_from_disk`, wired
+   into `resume`); ⛳ worker process + `train`/`resume`/`pause`/`stop`
+   CLI wiring (12 §12.4) still to come
 7. ⛔ Status layer (read-only L1/L2/L3)
 8. ⛔ Ingestion/transform DAG
 9. ⛔ Execution planner
