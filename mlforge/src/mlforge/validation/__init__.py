@@ -21,6 +21,7 @@ from mlforge.validation.gate import (
     GateStep,
     ValidationGate,
     make_gate,
+    provide_dataset_identity,
     provide_fail,
     provide_pass,
     provide_unverifiable,
@@ -54,5 +55,6 @@ __all__ = [
     "provide_pass",
     "provide_fail",
     "provide_unverifiable",
+    "provide_dataset_identity",
     "scan_for_secrets",
 ]

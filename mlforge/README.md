@@ -29,7 +29,9 @@ mlforge/
 │   ├── machine.py            # 4 transition tables (13 §5)        ✅
 │   ├── run_spec.py           # immutable semantic identity        ✅
 │   ├── workflow.py           # Workflow API facade (13 §1)        ✅
-│   ├── cli/                  # status/inspect/events/store/validate/preflight/lease/train/resume/pause/stop/watch/hardware ✅
+│   ├── cli/                  # status/inspect/events/store/validate/preflight/lease/train/resume/pause/stop/watch/hardware/dataset/prepare ✅
+│   ├── yamlmini.py           # strict YAML subset (fail-closed)   ✅
+│   ├── ingest/               # identity, paths, DAG, transforms, prepare ✅
 │   ├── store/                # CAS + registry + GC                ✅
 │   ├── validation/           # 19-step gate + preflight           ✅
 │   ├── leases/               # run lease + gate providers 15–16   ✅
@@ -47,8 +49,9 @@ mlforge/
 2. ✅ Artifact registry + content store + run_spec canonical hashing
 3. ✅ Validation gate + preflight (fail-closed core)
 4. 🟡 CLI contract — `status` / `inspect` / `events` / `store gc` /
-   `validate` / `preflight` / `lease status` / `lease break` work; other
-   commands exit 4 with `NOT_IMPLEMENTED` (never fake success)
+   `validate` / `preflight` / `lease status` / `lease break` /
+   `dataset add|list|verify` / `prepare` work; other commands exit 4
+   with `NOT_IMPLEMENTED` (never fake success)
 5. ✅ Supervisor daemon + run leases + idempotency journal
 6. ✅ Training runtime — transactional checkpoints (12 §11 write
    protocol / newest-valid predicate / verify / components), heartbeat
@@ -64,7 +67,16 @@ mlforge/
    write control intents, `q` quits the viewer), `events --follow`;
    worker publishes `state/heartbeat.json` (global_step/state) +
    `state/live.json` (transient metrics) per 13 §9.4
-8. ⛔ Ingestion/transform DAG
+8. ✅ Ingestion/transform DAG — cryptographic dataset identity
+   (every file hashed; counts are never identity, 12 §6.2), strict YAML
+   config subset (`yamlmini`), machine-local paths at `$MLFORGE_HOME`
+   vs portable `datasets.yaml` (12 §6.3), `ingestion.yaml` DAG
+   (sources/depends_on, cycle detection), closed transform registry
+   with code-hash identity + four-field cache key (12 §6.4),
+   `dataset add|list|verify` (tamper → REJECTED, `--force`
+   reregister), `prepare` (resolve → cache → transform → derived
+   `<model>_prepared` REGISTERED→VERIFIED→PREPARED, `--command-id`
+   dedupe), and the gate's step-4 builtin dataset provider
 9. ⛔ Execution planner
 10. ⛔ Resume/retrain/finetune flows + lineage DAG
 11. ⛔ Evaluate/compare/infer/export/package
@@ -121,6 +133,22 @@ mlforge/
 * **Supervisor detects crashes, never continues runs** — expired/missing
   heartbeat → INTERRUPTED; it never resumes, reconciles, or starts
   anything (13 §1 automatic continuation = NO).
+* **Dataset identity is cryptographic** — every file's sha256 (sorted,
+  POSIX-relative paths only; absolute paths never enter identity); sample
+  counts are never identity. Symlinks and empty trees are refused —
+  an identity we cannot walk deterministically is a guess (12 §6.2–§6.3).
+* **Paths are configuration, never identity** — dataset paths live in
+  `$MLFORGE_HOME` (default `~/.mlforge`), verified against registration
+  on every gate/preflight/prepare; wrong path = mismatch, never a
+  discovery scan (13 §10).
+* **Transforms run only from a closed registry** — unknown transform
+  ⇒ exit 1; code-hash + config-hash + input identities + env fingerprint
+  form the cache key (12 §6.4); a transform that skips a source or
+  emits 0 records is BLOCKed, never published.
+* **Re-registration is explicit** — changed content requires
+  `dataset add --force` (journaled `dataset_reregistered`); a tampered
+  verified dataset becomes REJECTED, never silently reinterpreted
+  (13 §5.2).
 
 ## Develop
 

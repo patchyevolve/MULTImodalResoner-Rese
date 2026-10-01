@@ -15,7 +15,7 @@ Build order follows 13_product_specification.md §11:
     5. Supervisor + leases + idempotency      (mlforge.leases / mlforge.commands — done)
     6. Training runtime + checkpoints         (mlforge.runtime — done)
     7. Status layer                           (mlforge.status — done)
-    8. Ingestion/transform DAG                (pending)
+    8. Ingestion/transform DAG                (mlforge.ingest — done)
     9. Execution planner                      (mlforge.planner — pending)
    10. Resume/retrain/finetune flows + lineage (partial: via workflow)
    11. Evaluate/compare/infer/export/package  (pending)

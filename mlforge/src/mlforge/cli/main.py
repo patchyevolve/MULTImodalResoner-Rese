@@ -21,10 +21,23 @@ import json
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 import mlforge
 import mlforge.status as status_layer
-from mlforge.errors import MlforgeError, NoValidContinuation, NotFound, PreconditionFailed
+from mlforge.errors import (
+    MlforgeError,
+    NoValidContinuation,
+    NotFound,
+    PreconditionFailed,
+    ValidationBlock,
+)
+from mlforge.ingest import (
+    load_paths as ingest_load_paths,
+    prepare as ingest_prepare,
+    recompute_identity as ingest_recompute_identity,
+)
+from mlforge.ingest.config import set_path as ingest_set_path, write_registry as ingest_write_registry
 from mlforge.leases import LeaseState, RunLeaseManager
 from mlforge.run_spec import RunSpec
 from mlforge.runtime.control import wait_for_state, write_control
@@ -36,12 +49,12 @@ from mlforge.workflow import WorkflowAPI
 # 13 §11 build-order gates: implemented vs pending.
 _IMPLEMENTED = {
     "status", "inspect", "events", "store", "validate", "preflight", "lease",
-    "train", "resume", "pause", "stop", "watch", "hardware",
+    "train", "resume", "pause", "stop", "watch", "hardware", "dataset",
+    "prepare",
 }
 _PENDING = {
     "init": 1,
     "configure": 1,
-    "prepare": 8,
     "retrain": 10,
     "finetune": 10,
     "evaluate": 11,
@@ -177,6 +190,41 @@ def _build_parser() -> argparse.ArgumentParser:
         help="keep unreachable artifacts younger than this many days (default: 7)",
     )
     st_gc.add_argument("--json", action="store_true")
+
+    # 13 §4.1 DATA: dataset registration is explicit, content-addressed,
+    # and always verifies a CONFIGURED path (never discovers one).
+    ds = sub.add_parser("dataset", help="dataset registration commands (13 §4.1)")
+    ds_sub = ds.add_subparsers(dest="dataset_command", required=True)
+
+    ds_add = ds_sub.add_parser("add", help="register a dataset identity at PATH")
+    ds_add.add_argument("dataset_id")
+    ds_add.add_argument("path", help="machine-local directory to hash")
+    ds_add.add_argument("--version", default="v1", help="dataset version (default v1)")
+    ds_add.add_argument("--schema", default=None,
+                        help="annotation format label (part of the identity)")
+    ds_add.add_argument("--force", action="store_true",
+                        help="re-register when content changed since last add")
+    ds_add.add_argument("--yes", action="store_true", help="skip the confirmation")
+    ds_add.add_argument("--command-id", default=None,
+                        help="dedupe key: a retry returns the original result (§4.4)")
+    ds_add.add_argument("--json", action="store_true")
+
+    ds_list = ds_sub.add_parser("list", help="registered datasets + local paths")
+    ds_list.add_argument("--json", action="store_true")
+
+    ds_ver = ds_sub.add_parser("verify", help="re-hash PATH against registration")
+    ds_ver.add_argument("dataset_id")
+    ds_ver.add_argument("--command-id", default=None)
+    ds_ver.add_argument("--json", action="store_true")
+
+    pr = sub.add_parser(
+        "prepare",
+        help="transform VERIFIED sources into <model>_prepared (13 §6.6)",
+    )
+    pr.add_argument("model", help="model name from ingestion.yaml")
+    pr.add_argument("--command-id", default=None,
+                    help="dedupe key: a retry returns the original result (§4.4)")
+    pr.add_argument("--json", action="store_true")
 
     # Pending build-order commands (13 §11): registered so they answer
     # NOT_IMPLEMENTED (exit 4) instead of an argparse "invalid choice".
@@ -615,6 +663,234 @@ def _do_stop(wf: WorkflowAPI, args) -> int:
     return 0 if state in ("STOPPED", "PAUSED", "COMPLETED") else 4
 
 
+# ---------------------------------------------------------------------------
+# dataset / prepare (13 §4.1 DATA, §6.6; 12 §6.2–§6.4)
+# ---------------------------------------------------------------------------
+
+
+def _dataset_add(wf: WorkflowAPI, args) -> int:
+    # Hash FIRST — a missing/unreadable path must fail before any
+    # registration exists (verify, never discover: 13 §10).
+    identity, manifest = ingest_recompute_identity(
+        args.path, args.dataset_id, args.version, schema=args.schema
+    )
+    root = Path(wf.root)
+    reg_path = root / "datasets" / args.dataset_id / "identity.json"
+    existed = reg_path.is_file()
+    same_identity = False
+    if existed:
+        reg = json.loads(reg_path.read_text(encoding="utf-8"))
+        same_identity = reg.get("identity") == identity
+        if not same_identity and not args.force:
+            raise ValidationBlock(
+                f"dataset {args.dataset_id!r} already registered with a "
+                f"different identity (registered {reg.get('identity')}, "
+                f"found {identity})",
+                hint="use --force to re-register the changed content "
+                     "(13 §5.2: never silently reinterpret)",
+            )
+
+    if not args.yes and not args.json:
+        action = "Re-register" if existed and not same_identity else "Register"
+        print(f"{action} dataset {args.dataset_id} "
+              f"({manifest.file_count} files, {manifest.total_bytes} bytes)")
+        print(f"  path:     {args.path}")
+        print(f"  identity: {identity}")
+        if not _confirm("Proceed? [Y/n] "):
+            print("Cancelled — nothing was registered.")
+            return 0
+
+    def _add() -> dict:
+        if not existed:
+            wf.register_dataset(
+                args.dataset_id, identity, version=args.version,
+                schema=args.schema, file_count=manifest.file_count,
+                total_bytes=manifest.total_bytes,
+            )
+            status = "registered"
+        elif same_identity:
+            # Same bytes: only the machine-local path may move (12 §6.3) —
+            # identity untouched, no state transition.
+            status = "path_updated"
+        else:
+            wf.reregister_dataset(
+                args.dataset_id, identity, version=args.version,
+                schema=args.schema, file_count=manifest.file_count,
+                total_bytes=manifest.total_bytes,
+            )
+            status = "reregistered"
+        ingest_set_path(root, args.dataset_id, args.path)
+        ingest_write_registry(root, args.dataset_id, {
+            "version": args.version,
+            "identity": identity,
+            "schema": args.schema,
+            "file_count": manifest.file_count,
+            "total_bytes": manifest.total_bytes,
+        })
+        wf.note_dataset_path(args.dataset_id, args.path)
+        return {
+            "status": status,
+            "dataset": args.dataset_id,
+            "version": args.version,
+            "identity": identity,
+            "file_count": manifest.file_count,
+            "total_bytes": manifest.total_bytes,
+            "path": str(args.path),
+        }
+
+    result = (
+        wf.execute_idempotent(args.command_id, "dataset_add", _add,
+                              kind="dataset", run_id=args.dataset_id)
+        if args.command_id else _add()
+    )
+    if args.json:
+        print(json.dumps(result, indent=2, sort_keys=True))
+    else:
+        print(f"{args.dataset_id}: {result['status'].upper()} — "
+              f"{result['identity']}")
+    return 0
+
+
+def _dataset_list(wf: WorkflowAPI, args) -> int:
+    paths = ingest_load_paths(wf.root)
+    rows = []
+    for proj in wf.list_datasets():
+        did = proj["id"]
+        reg: dict[str, Any] = {}
+        p = Path(wf.root) / "datasets" / did / "identity.json"
+        if p.is_file():
+            try:
+                reg = json.loads(p.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                reg = {}
+        rows.append({
+            "dataset": did,
+            "state": proj["state"],
+            "version": reg.get("version", "v1"),
+            "identity": reg.get("identity"),
+            "file_count": reg.get("file_count"),
+            "path": paths.get(did),
+        })
+    if args.json:
+        print(json.dumps(rows, indent=2, sort_keys=True))
+        return 0
+    if not rows:
+        print("no datasets registered — mlforge dataset add <ID> <PATH>")
+        return 0
+    w_name = max(len("NAME"), max(len(r["dataset"]) for r in rows))
+    w_state = max(len("STATE"), max(len(r["state"]) for r in rows))
+    print(f"{'NAME':<{w_name}}  {'STATE':<{w_state}}  VERSION  FILES  PATH")
+    for r in rows:
+        print(f"{r['dataset']:<{w_name}}  {r['state']:<{w_state}}  "
+              f"{r['version']:<7}  {str(r['file_count'] or '-'):>5}  "
+              f"{r['path'] or '(not configured)'}")
+    return 0
+
+
+def _dataset_verify(wf: WorkflowAPI, args) -> int:
+    root = Path(wf.root)
+    reg_path = root / "datasets" / args.dataset_id / "identity.json"
+    if not reg_path.is_file():
+        raise NotFound(
+            f"dataset {args.dataset_id!r} not registered",
+            hint=f"mlforge dataset add {args.dataset_id} <PATH>",
+        )
+    reg = json.loads(reg_path.read_text(encoding="utf-8"))
+    state = wf.get_dataset_status(args.dataset_id)["state"]
+    if state in ("PREPARED", "REJECTED"):
+        raise PreconditionFailed(
+            f"dataset {args.dataset_id!r} is {state} — verify applies before "
+            f"prepare; re-register to re-verify",
+            hint=f"mlforge dataset add {args.dataset_id} <PATH> --force",
+        )
+    path = ingest_load_paths(root).get(args.dataset_id)
+    if not path:
+        raise PreconditionFailed(
+            f"dataset {args.dataset_id!r}: no machine-local path configured",
+            hint=f"mlforge dataset add {args.dataset_id} <PATH>",
+        )
+
+    def _verify() -> dict:
+        found, manifest = ingest_recompute_identity(
+            path, args.dataset_id, str(reg.get("version", "v1")),
+            schema=reg.get("schema"),
+        )
+        matches = found == reg.get("identity")
+        if matches:
+            if state == "REGISTERED":
+                wf.verify_dataset(args.dataset_id, identity_matches=True,
+                                  found_identity=found)
+            return {
+                "status": "verified",
+                "dataset": args.dataset_id,
+                "state": "VERIFIED",
+                "identity": found,
+                "file_count": manifest.file_count,
+                "path": str(path),
+            }
+        # Mismatch → REJECTED (13 §5.2), recorded, exit 1 (never a guess).
+        wf.verify_dataset(args.dataset_id, identity_matches=False,
+                          found_identity=found)
+        return {
+            "status": "rejected",
+            "dataset": args.dataset_id,
+            "state": "REJECTED",
+            "registered_identity": reg.get("identity"),
+            "identity": found,
+            "file_count": manifest.file_count,
+            "path": str(path),
+        }
+
+    result = (
+        wf.execute_idempotent(args.command_id, "dataset_verify", _verify,
+                              kind="dataset", run_id=args.dataset_id)
+        if args.command_id else _verify()
+    )
+    if args.json:
+        print(json.dumps(result, indent=2, sort_keys=True))
+    elif result["status"] == "verified":
+        print(f"{args.dataset_id}: VERIFIED — {result['file_count']} files "
+              f"hashed ({result['identity']})")
+    else:
+        print(f"{args.dataset_id}: REJECTED — content at {path} does not "
+              f"match its registration (found {result['identity']}, "
+              f"registered {result['registered_identity']})")
+        print("  nothing was silently reinterpreted — re-register with "
+              "dataset add --force if the change is intended")
+    return 0 if result["status"] == "verified" else 1
+
+
+def _do_dataset(wf: WorkflowAPI, args) -> int:
+    if args.dataset_command == "add":
+        return _dataset_add(wf, args)
+    if args.dataset_command == "list":
+        return _dataset_list(wf, args)
+    if args.dataset_command == "verify":
+        return _dataset_verify(wf, args)
+    return 4  # argparse required=True keeps this unreachable
+
+
+def _do_prepare(wf: WorkflowAPI, args) -> int:
+    def _prep() -> dict:
+        return ingest_prepare(wf.root, args.model, workflow=wf).to_dict()
+
+    result = (
+        wf.execute_idempotent(args.command_id, "prepare", _prep,
+                              kind="dataset",
+                              run_id=lambda r: (r or {}).get("dataset_id"))
+        if args.command_id else _prep()
+    )
+    if args.json:
+        print(json.dumps(result, indent=2, sort_keys=True))
+    elif result.get("cache") == "hit":
+        print(f"{result['dataset']}: cache hit — artifact unchanged "
+              f"({result['record_count']} records)")
+    else:
+        print(f"prepared {result['dataset']} — {result['record_count']} "
+              f"records ({', '.join(result['sources'])})")
+    return 0
+
+
 def main(argv: list[str] | None = None, *, wf_factory=None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
@@ -642,6 +918,10 @@ def main(argv: list[str] | None = None, *, wf_factory=None) -> int:
             return _do_pause(wf, args)
         if args.command == "stop":
             return _do_stop(wf, args)
+        if args.command == "dataset":
+            return _do_dataset(wf, args)
+        if args.command == "prepare":
+            return _do_prepare(wf, args)
         if args.command == "status":
             return _do_status(wf, args)
 

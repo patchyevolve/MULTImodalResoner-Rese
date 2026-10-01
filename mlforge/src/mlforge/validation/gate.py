@@ -42,7 +42,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
-from mlforge.errors import PreconditionFailed, ValidationBlock
+from mlforge.errors import NotFound, PreconditionFailed, ValidationBlock
 from mlforge.hashing import content_hash
 from mlforge.run_spec import SCHEMA_VERSION, RunSpec
 from mlforge.validation.report import FAIL, PASS, WARN, Check, ValidationReport
@@ -296,6 +296,85 @@ def provide_pass(detail: str = "verified", **data: Any) -> Provider:
 def provide_fail(detail: str, **data: Any) -> Provider:
     def _p(ctx: GateContext) -> Check:
         return Check(0, "", "", FAIL, detail, dict(data))
+    return _p
+
+
+def provide_dataset_identity(root: str | Path) -> Provider:
+    """Step 4 (and preflight dataset re-verify): cryptographic identity
+    for every dataset in the run spec (12 §18 step 4, §6.2).
+
+    Check sequence per dataset — each failure mode has ONE message:
+      not registered  → FAIL (register first, `mlforge dataset add`)
+      version differs → FAIL (never reinterpret a version)
+      no path config  → FAIL (paths are explicit, never discovered)
+      hash mismatch   → FAIL (content changed since registration)
+      unreadable      → FAIL (path gone / symlink / empty — fail-closed)
+    Passes only when EVERY dataset re-hashes to its registration.
+    """
+    from mlforge.ingest import config as ingest_config
+    from mlforge.ingest.identity import parse_ref, recompute_identity
+
+    def _p(ctx: GateContext) -> Check:
+        spec = ctx.run_spec
+        refs: list[str] = list(spec.train_datasets)
+        if spec.val_dataset:
+            refs.append(spec.val_dataset)
+        try:
+            paths = ingest_config.load_paths(ctx.root)
+        except PreconditionFailed as exc:
+            return Check(0, "", "", FAIL, f"dataset path config unreadable: {exc}")
+        verified: list[str] = []
+        files_hashed = 0
+        for ref in refs:
+            name, version = parse_ref(ref)
+            reg_path = ctx.root / "datasets" / name / "identity.json"
+            if not reg_path.is_file():
+                return Check(
+                    0, "", "", FAIL,
+                    f"{ref}: not registered — "
+                    f"mlforge dataset add {name} <PATH>",
+                )
+            try:
+                reg = json.loads(reg_path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError as exc:
+                return Check(0, "", "", FAIL,
+                             f"{name}: registration unreadable ({exc})")
+            reg_version = reg.get("version")
+            if reg_version and str(reg_version) != version:
+                return Check(
+                    0, "", "", FAIL,
+                    f"{ref}: registered version {reg_version!r} != {version!r} "
+                    f"(versions are identity, never reinterpreted)",
+                )
+            path = paths.get(name)
+            if not path:
+                return Check(
+                    0, "", "", FAIL,
+                    f"{name}: no machine-local path configured — "
+                    f"mlforge dataset add {name} <PATH>",
+                )
+            try:
+                identity, manifest = recompute_identity(
+                    path, name, version, schema=reg.get("schema")
+                )
+            except (ValidationBlock, NotFound, OSError) as exc:
+                detail = exc.message if isinstance(exc, ValidationBlock) else str(exc)
+                return Check(0, "", "", FAIL, f"{ref}: cannot verify: {detail}")
+            if identity != reg.get("identity"):
+                return Check(
+                    0, "", "", FAIL,
+                    f"{ref}: identity mismatch — content at {path} hashes to "
+                    f"{identity}, registration says {reg.get('identity')} "
+                    f"(re-register with --force if intended)",
+                )
+            files_hashed += manifest.file_count
+            verified.append(ref)
+        return Check(
+            0, "", "", PASS,
+            f"{len(verified)} dataset(s) verified — {files_hashed} files hashed",
+            {"datasets": verified, "files_hashed": files_hashed},
+        )
+
     return _p
 
 

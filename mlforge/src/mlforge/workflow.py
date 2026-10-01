@@ -69,6 +69,7 @@ from mlforge.validation import (
     PreflightContext,
     ValidationGate,
     ValidationReport,
+    provide_dataset_identity,
 )
 
 _KINDS = {
@@ -102,6 +103,17 @@ class WorkflowAPI:
     ):
         self.root = Path(root)
         self.gate_providers = dict(gate_providers) if gate_providers else None
+
+    def _providers(self) -> dict[str, Any]:
+        """Provider set used when the caller supplies none.
+
+        Step 4 (`dataset`) has a real builtin from build step 8: it
+        re-hashes every configured source against its registration
+        (12 §6.2). Explicit providers always win (`setdefault`) — callers
+        that can verify more honestly keep their wiring."""
+        providers = dict(self.gate_providers or {})
+        providers.setdefault("dataset", provide_dataset_identity(self.root))
+        return providers
 
     # ------------------------------------------------------------------
     # plumbing
@@ -664,24 +676,26 @@ class WorkflowAPI:
         fn: Callable[[], Any],
         *,
         run_id: Any = None,
+        kind: str = "run",
         meta: dict[str, Any] | None = None,
     ) -> Any:
         """Run `fn` exactly once per successful command_id.
 
         Duplicate success → returns the ORIGINAL result and journals
-        COMMAND_DEDUPED into the run's events (13 §4.4). Failure → the
+        COMMAND_DEDUPED into the object's events (13 §4.4). Failure → the
         same command_id may be retried. In flight → exit 3.
 
         `run_id` may be a callable — for `train` the run id only exists
         INSIDE the deduplicated result (the event goes to the ORIGINAL
-        run, never to a second run)."""
+        run, never to a second run). `kind` selects whose journal the
+        dedupe lands in (`run` | `dataset` | ...)."""
 
         def _on_dedup(d: DedupDecision) -> None:
             rid = run_id(d.result) if callable(run_id) else run_id
-            if rid and (self.root / "runs" / rid).is_dir():
+            if rid and (self.root / _KINDS[kind][0] / rid).is_dir():
                 # Visible in `mlforge events` as COMMAND_DEDUPED (13 §4.4).
-                # Carries no `to` → never changes run state.
-                self._journal("run", rid).append(
+                # Carries no `to` → never changes object state.
+                self._journal(kind, rid).append(
                     "COMMAND_DEDUPED",
                     action="dedupe",
                     command_id=d.command_id,
@@ -740,7 +754,8 @@ class WorkflowAPI:
         The report is always returned (caller decides the exit code);
         the run's state follows the rules above — never anything else.
         """
-        gate = gate or ValidationGate(self.gate_providers)
+        if gate is None:
+            gate = ValidationGate(self._providers())
         proj = self.get_run_status(run_id)
         state = proj["state"]
         spec = self._run_spec(run_id)
@@ -829,7 +844,7 @@ class WorkflowAPI:
         ctx = PreflightContext(
             run_id=run_id, root=self.root, run_spec=spec, **ctx_kwargs
         )
-        preflight = preflight or Preflight(identity_providers=self.gate_providers or {})
+        preflight = preflight or Preflight(identity_providers=self._providers())
         return preflight.run(ctx)
 
     # ------------------------------------------------------------------
@@ -857,14 +872,23 @@ class WorkflowAPI:
     # DATASET (13 §5.2)
     # ------------------------------------------------------------------
 
-    def register_dataset(self, dataset_id: str, identity: str) -> str:
+    def register_dataset(
+        self,
+        dataset_id: str,
+        identity: str,
+        *,
+        version: str = "v1",
+        schema: str | None = None,
+        file_count: int | None = None,
+        total_bytes: int | None = None,
+    ) -> str:
         d = self._dir("dataset", dataset_id)
         if d.exists():
             raise ValidationBlock(f"dataset {dataset_id!r} already registered")
         d.mkdir(parents=True)
-        (d / "identity.json").write_text(
-            json.dumps({"dataset_id": dataset_id, "identity": identity}, indent=2),
-            encoding="utf-8",
+        self._write_identity(
+            d, dataset_id, identity, version=version, schema=schema,
+            file_count=file_count, total_bytes=total_bytes,
         )
         self._journal("dataset", dataset_id).append(
             "dataset_registered",
@@ -872,9 +896,98 @@ class WorkflowAPI:
             to=DatasetState.REGISTERED.value,
             action="create",
             identity=identity,
+            version=version,
         )
         self._write_projection("dataset", dataset_id, DatasetState.REGISTERED.value)
         return dataset_id
+
+    def reregister_dataset(
+        self,
+        dataset_id: str,
+        identity: str,
+        *,
+        version: str = "v1",
+        schema: str | None = None,
+        file_count: int | None = None,
+        total_bytes: int | None = None,
+    ) -> str:
+        """Explicit re-registration after content change / rejection.
+
+        13 §5.2 + §4.1: never silently reinterpret an existing
+        registration — the operator (or prepare for derived data) states
+        the new identity and the journal records who/what changed."""
+        d = self._require("dataset", dataset_id)
+        state = self._load_projection("dataset", dataset_id)["state"]
+        self._write_identity(
+            d, dataset_id, identity, version=version, schema=schema,
+            file_count=file_count, total_bytes=total_bytes,
+        )
+        self._journal("dataset", dataset_id).append(
+            "dataset_reregistered",
+            frm=state,
+            to=DatasetState.REGISTERED.value,
+            action="reregister",
+            identity=identity,
+            version=version,
+        )
+        self._write_projection("dataset", dataset_id, DatasetState.REGISTERED.value)
+        return dataset_id
+
+    @staticmethod
+    def _write_identity(
+        d: Path,
+        dataset_id: str,
+        identity: str,
+        *,
+        version: str,
+        schema: str | None,
+        file_count: int | None,
+        total_bytes: int | None,
+    ) -> None:
+        payload: dict[str, Any] = {
+            "dataset_id": dataset_id,
+            "identity": identity,
+            "version": version,
+        }
+        if schema is not None:
+            payload["schema"] = schema
+        if file_count is not None:
+            payload["file_count"] = file_count
+        if total_bytes is not None:
+            payload["total_bytes"] = total_bytes
+        p = d / "identity.json"
+        tmp = p.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+        tmp.replace(p)  # atomic — readers never see a half-written identity
+
+    def get_dataset_status(self, dataset_id: str) -> dict[str, Any]:
+        self._require("dataset", dataset_id)
+        return self._load_projection("dataset", dataset_id)
+
+    def note_dataset_path(self, dataset_id: str, path: str | Path) -> str:
+        """Audit the machine-local path config for a dataset.
+
+        Journal-only: NO state transition (12 §6.3 — paths are
+        machine-local and never part of identity)."""
+        state = self.get_dataset_status(dataset_id)["state"]
+        self._journal("dataset", dataset_id).append(
+            "dataset_path_configured",
+            frm=state,
+            to=state,
+            action="set_path",
+            path=str(path),
+        )
+        return dataset_id
+
+    def list_datasets(self) -> list[dict[str, Any]]:
+        ds = self.root / "datasets"
+        if not ds.is_dir():
+            return []
+        return [
+            self.get_dataset_status(d.name)
+            for d in sorted(ds.iterdir())
+            if d.is_dir()
+        ]
 
     def verify_dataset(self, dataset_id: str, *, identity_matches: bool, found_identity: str) -> str:
         """Verify content hash (10.1: system verifies identity, never scans)."""
