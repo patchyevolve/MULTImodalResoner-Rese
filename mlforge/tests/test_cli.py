@@ -58,7 +58,7 @@ def test_inspect_and_events(tmp_path, capsys):
 
 
 def test_pending_command_exits_4(tmp_path, capsys):
-    assert main(["--root", str(tmp_path), "train", "--config", "x.yaml"]) == 4
+    assert main(["--root", str(tmp_path), "evaluate", "model_m1"]) == 4
     assert "NOT_IMPLEMENTED" in capsys.readouterr().err
 
 

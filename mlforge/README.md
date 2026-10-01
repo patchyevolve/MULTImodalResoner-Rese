@@ -29,13 +29,13 @@ mlforge/
 │   ├── machine.py            # 4 transition tables (13 §5)        ✅
 │   ├── run_spec.py           # immutable semantic identity        ✅
 │   ├── workflow.py           # Workflow API facade (13 §1)        ✅
-│   ├── cli/                  # status/inspect/events/store/validate/preflight/lease ✅
+ │   ├── cli/                  # status/inspect/events/store/validate/preflight/lease/train/resume/pause/stop ✅
 │   ├── store/                # CAS + registry + GC                ✅
 │   ├── validation/           # 19-step gate + preflight           ✅
 │   ├── leases/               # run lease + gate providers 15–16   ✅
 │   ├── commands/             # idempotency journal                ✅
-│   ├── supervisor.py         # heartbeat → crash detection        ✅
-│   ├── runtime/              # checkpoints, heartbeat writer      ⛔ step 6
+ │   ├── supervisor.py         # crash detection + spawn queue daemon  ✅
+ │   ├── runtime/              # checkpoints, worker, control, trainer ✅
 │   ├── status/               # L1/L2/L3, watch                    ⛔ step 7
 │   └── planner/              # capability feasibility solver      ⛔ step 9
 └── tests/                    # specs as executable tests
@@ -50,11 +50,14 @@ mlforge/
    `validate` / `preflight` / `lease status` / `lease break` work; other
    commands exit 4 with `NOT_IMPLEMENTED` (never fake success)
 5. ✅ Supervisor daemon + run leases + idempotency journal
-6. 🟡 Training runtime — ✅ transactional checkpoints (12 §11 write
+6. ✅ Training runtime — transactional checkpoints (12 §11 write
    protocol / newest-valid predicate / verify / components), heartbeat
    writer, deterministic reconciliation (`reconcile_from_disk`, wired
-   into `resume`); ⛳ worker process + `train`/`resume`/`pause`/`stop`
-   CLI wiring (12 §12.4) still to come
+   into `resume`), worker process (start contract, control-channel
+   pause/stop, checkpoint loop), supervisor spawn queue + daemon
+   (`state/pending/` → detached worker, 12 §12.4 delegation), and
+   `train`/`resume`/`pause`/`stop` CLI (gate BLOCK train →
+   FAILED[FORK_ONLY], resume → state unchanged; `--command-id` dedupe)
 7. ⛔ Status layer (read-only L1/L2/L3)
 8. ⛔ Ingestion/transform DAG
 9. ⛔ Execution planner

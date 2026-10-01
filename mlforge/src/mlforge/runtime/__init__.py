@@ -9,9 +9,9 @@ Checkpoint write order (never torch.save directly):
 Recovery selection: newest VALID by identity predicate (§11.2) — never
 ordinal arithmetic (N-1).
 
-Part of build step 6: checkpoints + heartbeat + reconciliation scan are
-in; the worker process and train/resume/pause/stop CLI wiring arrive
-next (12 §12.4 process ownership).
+Part of build step 6: transactional checkpoints, heartbeat, reconciliation,
+the control channel, the pluggable trainer protocol, and the worker process
+(`mlforge.runtime.worker`, spawned by the supervisor daemon — 12 §12.4).
 """
 
 from mlforge.runtime.checkpoints import (
@@ -20,8 +20,15 @@ from mlforge.runtime.checkpoints import (
     CheckpointStore,
     Selection,
 )
+from mlforge.runtime.control import (
+    clear_control,
+    control_path,
+    read_control,
+    write_control,
+)
 from mlforge.runtime.heartbeat import DEFAULT_HEARTBEAT_INTERVAL, HeartbeatWriter
 from mlforge.runtime.reconcile import ReconcileReport, scan_checkpoints
+from mlforge.runtime.trainer import ScaffoldTrainer, StepResult, TrainState, Trainer
 
 __all__ = [
     "CheckpointStore",
@@ -32,4 +39,12 @@ __all__ = [
     "DEFAULT_HEARTBEAT_INTERVAL",
     "ReconcileReport",
     "scan_checkpoints",
+    "control_path",
+    "read_control",
+    "write_control",
+    "clear_control",
+    "Trainer",
+    "ScaffoldTrainer",
+    "TrainState",
+    "StepResult",
 ]

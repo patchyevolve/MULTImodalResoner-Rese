@@ -1,0 +1,408 @@
+"""Training worker — the process that owns a RUNNING run (12 §12.4).
+
+Ownership rules enforced here:
+  * the worker is spawned by the SUPERVISOR daemon, never by an
+    interactive shell (spawn happens in supervisor.py); closing a
+    terminal cannot kill training.
+  * single writer: startup re-proves lease ownership (session_token) —
+    without a valid renew the worker exits before touching anything.
+  * every state change goes through WorkflowAPI (single write path);
+    the worker never writes state.json or events itself.
+  * heartbeat + lease renew go TOGETHER every `heartbeat_interval`
+    (12 §23.2) — a dead worker stops beating → supervisor marks
+    INTERRUPTED → reconciliation derives the resume point (§12.3).
+  * pause/stop arrive as control intents (runtime/control.py) and are
+    performed as graceful machine transitions; the worker NEVER decides
+    to pause/stop by itself (13 §1 "no auto-anything").
+
+Start contract: the CLI's train/resume flow leaves the run in READY;
+the worker fires `preflight_pass` (READY → RUNNING) only AFTER lease
+ownership is proven — READY is the safe pre-start state (a run can sit
+in READY forever without anyone claiming it).
+
+Exit codes (13 §4.2): 0 ok/terminal · 1 validation block · 2 not found ·
+3 precondition (lease/state) · 4 runtime error.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+from mlforge.errors import MlforgeError, NotFound, PreconditionFailed, ValidationBlock
+from mlforge.leases import LeaseState, RunLeaseManager
+from mlforge.runtime.checkpoints import REQUIRED_COMPONENTS, CheckpointStore
+from mlforge.runtime.control import clear_control, read_control
+from mlforge.runtime.heartbeat import DEFAULT_HEARTBEAT_INTERVAL, HeartbeatWriter
+from mlforge.runtime.trainer import ScaffoldTrainer, TrainState, Trainer
+from mlforge.states import RunState
+from mlforge.workflow import WorkflowAPI
+
+#: worker → supervisor duplicate-spawn tolerance: a heartbeat fresher than
+#: twice the interval means another live worker owns the run.
+_DUPLICATE_GRACE = 2
+
+
+class WorkerExit(Exception):
+    """Worker finished with a specific exit code (already recorded)."""
+
+    def __init__(self, code: int, message: str = ""):
+        super().__init__(message)
+        self.code = code
+
+
+class Worker:
+    def __init__(
+        self,
+        root: str | Path,
+        run_id: str,
+        session_token: str,
+        *,
+        trainer: Trainer | None = None,
+        heartbeat_interval: float = DEFAULT_HEARTBEAT_INTERVAL,
+        checkpoint_interval: int = 5,
+        poll_interval: float = 0.02,
+        clock: Any = time.time,
+        sleep: Any = time.sleep,
+        max_iterations: int | None = None,
+    ):
+        self.root = Path(root)
+        self.run_id = run_id
+        self.session_token = session_token
+        self.trainer = trainer
+        self.heartbeat_interval = heartbeat_interval
+        self.checkpoint_interval = max(1, checkpoint_interval)
+        self.poll_interval = poll_interval
+        self.clock = clock
+        self.sleep = sleep
+        self.max_iterations = max_iterations
+        self._owns = False  # proven lease owner; gates cleanup rights
+
+    # -- plumbing -----------------------------------------------------------
+
+    @property
+    def run_dir(self) -> Path:
+        return self.root / "runs" / self.run_id
+
+    def _runtime_config(self) -> dict[str, Any]:
+        p = self.run_dir / "state" / "runtime.json"
+        if not p.is_file():
+            return {}
+        try:
+            return json.loads(p.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            return {}
+
+    def _append_metric(self, record: dict[str, Any]) -> None:
+        mdir = self.run_dir / "metrics"
+        mdir.mkdir(parents=True, exist_ok=True)
+        with open(mdir / "metrics.jsonl", "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, sort_keys=True) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+
+    # -- lifecycle ------------------------------------------------------------
+
+    def run(self) -> int:
+        wf = WorkflowAPI(self.root)
+        lease = RunLeaseManager(self.root, clock=self.clock)
+        hb = HeartbeatWriter(
+            self.root, self.run_id, self.session_token, lease=lease, clock=self.clock
+        )
+        store = CheckpointStore(self.run_dir)
+        try:
+            # 1. Single-writer proof — renew with OUR token (owner check).
+            #    Wrong/absent/SUSPECT lease ⇒ PreconditionFailed, nothing touched.
+            lease.renew(self.run_id, self.session_token)
+            self._owns = True
+
+            # 2. Start contract: READY is the only startable state.
+            state = wf.get_run_state(self.run_id)
+            if state == RunState.READY.value:
+                wf.preflight_pass(self.run_id)  # READY → RUNNING (runtime's step)
+            elif state == RunState.RUNNING.value:
+                if not self._heartbeat_fresh(hb):
+                    raise PreconditionFailed(
+                        f"run {self.run_id}: state RUNNING but no live heartbeat — "
+                        "reconcile first (12 §12.3); refusing to double-start"
+                    )
+                # Duplicate spawn: a live worker owns the run. Do NOT touch
+                # its lease or heartbeat — we merely stand down (the lease
+                # token is shared, so "releasing" would evict the owner).
+                self._owns = False
+                return 0
+            else:
+                raise PreconditionFailed(
+                    f"run {self.run_id}: worker cannot start from state {state} "
+                    "(expected READY — train/resume must validate first)"
+                )
+
+            # 3. Restore point: newest-valid predicate decides (§11.2) —
+            #    NEVER "start from step 0" when a valid checkpoint exists.
+            selection = store.newest_valid()
+            start_step = 0
+            start_epoch = 0
+            if selection.selected is not None and selection.selected.manifest:
+                start_step = int(selection.selected.manifest.get("global_step", 0) or 0)
+                start_epoch = int(selection.selected.manifest.get("epoch", 0) or 0)
+            trainer = self.trainer or ScaffoldTrainer(
+                max_steps=int(self._runtime_config().get("max_steps", 20)),
+                steps_per_epoch=int(self._runtime_config().get("steps_per_epoch", 10)),
+                start_step=start_step,
+                start_epoch=start_epoch,
+            )
+            tstate = TrainState(start_step, start_epoch, selection.resume_point)
+
+            # 4. First heartbeat (lease renewed with it), then the loop.
+            last_beat = hb.beat()["ts"]
+            return self._loop(wf, store, hb, trainer, tstate, last_beat)
+        except WorkerExit as exit_:
+            return exit_.code
+        except Exception as exc:
+            return self._fail(wf, store, hb, lease, exc)
+        finally:
+            # A worker that still owns the lease must never leave it stale.
+            if self._owns:
+                try:
+                    lease.release(self.run_id, self.session_token)
+                except MlforgeError:
+                    pass
+                hb.clear()
+
+    # -- main loop ------------------------------------------------------------
+
+    def _loop(
+        self,
+        wf: WorkflowAPI,
+        store: CheckpointStore,
+        hb: HeartbeatWriter,
+        trainer: Trainer,
+        tstate: TrainState,
+        last_beat: float,
+    ) -> int:
+        iterations = 0
+        while True:
+            iterations += 1
+            if self.max_iterations is not None and iterations > self.max_iterations:
+                raise PreconditionFailed(
+                    f"worker {self.run_id}: max_iterations ({self.max_iterations}) reached"
+                )
+
+            if hb.due(last_beat, self.heartbeat_interval):
+                hb.beat()  # renews the lease too — losing it raises
+                last_beat = self.clock()
+
+            ctrl = read_control(self.root, self.run_id)
+            if ctrl is not None:
+                action = ctrl.get("action")
+                if action == "pause":
+                    return self._do_pause(wf, store, trainer, tstate, hb)
+                if action == "stop":
+                    return self._do_stop(wf, hb)
+                # corrupt/unknown intents are quarantined by read_control;
+                # they must not crash training — but they must not be obeyed.
+
+            result = trainer.step(tstate)
+            self._append_metric({
+                "ts": self.clock(),
+                "global_step": result.global_step,
+                "epoch": result.epoch,
+                "loss": result.loss,
+                **result.metrics,
+            })
+
+            if result.global_step % self.checkpoint_interval == 0:
+                self._checkpoint(wf, store, trainer, tstate)
+
+            tstate = TrainState(result.global_step, result.epoch, tstate.resume_from)
+
+            if result.done:
+                wf.complete(self.run_id)
+                self._release(RunLeaseManager(self.root, clock=self.clock), hb)
+                self._owns = False
+                clear_control(self.root, self.run_id)
+                return 0
+
+            self.sleep(self.poll_interval)
+
+    # -- transitions ------------------------------------------------------------
+
+    def _checkpoint(
+        self, wf: WorkflowAPI, store: CheckpointStore, trainer: Trainer, tstate: TrainState
+    ) -> str:
+        """RUNNING → CHECKPOINTING → RUNNING. Write failure ⇒ one retry ⇒
+        FAILED[RESUME] with the last-good commit recorded (13 §7)."""
+        wf.checkpoint_begin(self.run_id)
+        try:
+            ordinal, name = self._store_checkpoint(store, trainer, tstate)
+        except Exception as exc:
+            try:  # rollback attempt: the failed staging write is replaceable
+                ordinal, name = self._store_checkpoint(store, trainer, tstate)
+            except Exception as exc2:
+                wf.checkpoint_fail(
+                    self.run_id,
+                    f"checkpoint write failed twice: {exc2} (first: {exc})",
+                )
+                raise WorkerExit(4, "checkpoint failed") from exc2
+        wf.checkpoint_commit(self.run_id, ordinal)
+        return name
+
+    @staticmethod
+    def _store_checkpoint(
+        store: CheckpointStore, trainer: Trainer, tstate: TrainState
+    ) -> tuple[int, str]:
+        nxt = (store.newest_valid().attempted_newest or 0) + 1
+        dest = store.write(
+            nxt,
+            trainer.checkpoint_payload(tstate),
+            global_step=tstate.global_step,
+            epoch=tstate.epoch,
+            components=set(REQUIRED_COMPONENTS),
+        )
+        return nxt, dest.name
+
+    def _do_pause(
+        self,
+        wf: WorkflowAPI,
+        store: CheckpointStore,
+        trainer: Trainer,
+        tstate: TrainState,
+        hb: HeartbeatWriter,
+    ) -> int:
+        """Graceful pause: RUNNING → PAUSING → final checkpoint (retry once)
+        → PAUSED. Checkpoint failure → FAILED[RESUME] (13 §7)."""
+        wf.pause(self.run_id)  # explicit: the control intent IS the user command
+        try:
+            _ordinal, name = self._store_checkpoint(store, trainer, tstate)
+        except Exception as first:
+            try:
+                _ordinal, name = self._store_checkpoint(store, trainer, tstate)
+            except Exception as second:
+                wf.pause_checkpoint_failed(
+                    self.run_id, f"pause checkpoint failed twice: {second} (first: {first})"
+                )
+                self._release(RunLeaseManager(self.root, clock=self.clock), hb)
+                self._owns = False
+                clear_control(self.root, self.run_id)
+                return 4
+        wf.pause_committed(self.run_id, name)
+        self._release(RunLeaseManager(self.root, clock=self.clock), hb)
+        self._owns = False
+        clear_control(self.root, self.run_id)
+        return 0
+
+    def _do_stop(self, wf: WorkflowAPI, hb: HeartbeatWriter) -> int:
+        """Graceful stop: RUNNING → STOPPING → STOPPED (no resume)."""
+        wf.stop(self.run_id)
+        wf.stop_committed(self.run_id, "none")
+        self._release(RunLeaseManager(self.root, clock=self.clock), hb)
+        self._owns = False
+        clear_control(self.root, self.run_id)
+        return 0
+
+    # -- helpers -----------------------------------------------------------
+
+    def _heartbeat_fresh(self, hb: HeartbeatWriter) -> bool:
+        p = hb.path
+        if not p.is_file():
+            return False
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            return False
+        age = self.clock() - float(data.get("ts", 0.0))
+        return age <= self.heartbeat_interval * _DUPLICATE_GRACE
+
+    def _release(self, lease: RunLeaseManager, hb: HeartbeatWriter) -> None:
+        try:
+            lease.release(self.run_id, self.session_token)
+        except MlforgeError:
+            pass  # already broken/released — never mask the real result
+        hb.clear()
+
+    def _fail(
+        self,
+        wf: WorkflowAPI,
+        store: CheckpointStore,
+        hb: HeartbeatWriter,
+        lease: RunLeaseManager,
+        exc: Exception,
+    ) -> int:
+        """Map an unexpected failure onto a defined state (13 §7 universal
+        rule: no command leaves a run indeterminate)."""
+        if isinstance(exc, NotFound):
+            return 2
+        if isinstance(exc, PreconditionFailed):
+            code = 3  # lease/state contract refusal (13 §4.2 exit 3)
+        elif isinstance(exc, ValidationBlock):
+            code = 1
+        else:
+            code = 4
+        if self._owns:
+            state = wf.get_run_state(self.run_id)
+            if state == RunState.RUNNING.value:
+                has_ckpt = store.newest_valid().selected is not None
+                wf.runtime_error(
+                    self.run_id,
+                    f"{type(exc).__name__}: {exc}",
+                    has_valid_checkpoint=has_ckpt,
+                )
+            elif state == RunState.CHECKPOINTING.value:
+                wf.checkpoint_fail(self.run_id, f"{type(exc).__name__}: {exc}")
+            # other states (FAILED/PAUSED/COMPLETED/...) are already final
+            # or owned by another transition — never overwrite them.
+        return code
+
+
+# ---------------------------------------------------------------------------
+# process entry (spawned by the supervisor daemon)
+# ---------------------------------------------------------------------------
+
+def main(argv: list[str] | None = None) -> int:
+    import argparse
+
+    p = argparse.ArgumentParser(
+        prog="mlforge.runtime.worker",
+        description="MLForge training worker (spawned by the supervisor daemon)",
+    )
+    p.add_argument("--root", required=True)
+    p.add_argument("--run", required=True, dest="run_id")
+    p.add_argument("--token", required=True, dest="session_token")
+    p.add_argument("--checkpoint-interval", type=int, default=None)
+    p.add_argument("--heartbeat-interval", type=float, default=None)
+    p.add_argument("--poll-interval", type=float, default=None)
+    args = p.parse_args(argv)
+
+    cfg: dict[str, Any] = {}
+    runtime_json = Path(args.root) / "runs" / args.run_id / "state" / "runtime.json"
+    if runtime_json.is_file():
+        try:
+            cfg = json.loads(runtime_json.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            cfg = {}
+
+    worker = Worker(
+        args.root,
+        args.run_id,
+        args.session_token,
+        checkpoint_interval=args.checkpoint_interval
+        or int(cfg.get("checkpoint_interval", 5)),
+        heartbeat_interval=args.heartbeat_interval
+        or float(cfg.get("heartbeat_interval", DEFAULT_HEARTBEAT_INTERVAL)),
+        poll_interval=args.poll_interval
+        if args.poll_interval is not None
+        else float(cfg.get("poll_interval", 0.5)),
+    )
+    try:
+        return worker.run()
+    except MlforgeError as exc:
+        print(exc.render(), file=sys.stderr)
+        return exc.exit_code
+
+
+if __name__ == "__main__":
+    sys.exit(main())

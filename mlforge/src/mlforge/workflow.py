@@ -31,11 +31,17 @@ import json
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 from mlforge.commands import CommandJournal
 from mlforge.commands.idempotency import DedupDecision, execute as _execute_once
-from mlforge.errors import NotFound, PreconditionFailed, RunAlreadyExecuting, ValidationBlock
+from mlforge.errors import (
+    MlforgeError,
+    NotFound,
+    PreconditionFailed,
+    RunAlreadyExecuting,
+    ValidationBlock,
+)
 from mlforge.hashing import content_hash
 from mlforge.ids import new_model_id, new_run_id
 from mlforge.journal import EventJournal
@@ -81,10 +87,21 @@ class RunHandle:
 
 
 class WorkflowAPI:
-    """Project-agnostic orchestrator facade rooted at a workspace directory."""
+    """Project-agnostic orchestrator facade rooted at a workspace directory.
 
-    def __init__(self, root: str | Path):
+    `gate_providers` wires the validation gate's step providers (12 §18).
+    Unset ⇒ fail-closed default gate: any step without a built-in provider
+    reports "unverifiable" ⇒ BLOCK — never a guess. Operators/tests wire
+    the provider set their environment can honestly verify."""
+
+    def __init__(
+        self,
+        root: str | Path,
+        *,
+        gate_providers: Mapping[str, Any] | None = None,
+    ):
         self.root = Path(root)
+        self.gate_providers = dict(gate_providers) if gate_providers else None
 
     # ------------------------------------------------------------------
     # plumbing
@@ -646,20 +663,25 @@ class WorkflowAPI:
         command: str,
         fn: Callable[[], Any],
         *,
-        run_id: str | None = None,
+        run_id: Any = None,
         meta: dict[str, Any] | None = None,
     ) -> Any:
         """Run `fn` exactly once per successful command_id.
 
         Duplicate success → returns the ORIGINAL result and journals
         COMMAND_DEDUPED into the run's events (13 §4.4). Failure → the
-        same command_id may be retried. In flight → exit 3."""
+        same command_id may be retried. In flight → exit 3.
+
+        `run_id` may be a callable — for `train` the run id only exists
+        INSIDE the deduplicated result (the event goes to the ORIGINAL
+        run, never to a second run)."""
 
         def _on_dedup(d: DedupDecision) -> None:
-            if run_id and (self.root / "runs" / run_id).is_dir():
+            rid = run_id(d.result) if callable(run_id) else run_id
+            if rid and (self.root / "runs" / rid).is_dir():
                 # Visible in `mlforge events` as COMMAND_DEDUPED (13 §4.4).
                 # Carries no `to` → never changes run state.
-                self._journal("run", run_id).append(
+                self._journal("run", rid).append(
                     "COMMAND_DEDUPED",
                     action="dedupe",
                     command_id=d.command_id,
@@ -718,7 +740,7 @@ class WorkflowAPI:
         The report is always returned (caller decides the exit code);
         the run's state follows the rules above — never anything else.
         """
-        gate = gate or ValidationGate()
+        gate = gate or ValidationGate(self.gate_providers)
         proj = self.get_run_status(run_id)
         state = proj["state"]
         spec = self._run_spec(run_id)
@@ -726,6 +748,12 @@ class WorkflowAPI:
             RunState.CREATED.value, RunState.VALIDATING.value
         ) else "RESUME"
         ctx = GateContext(run_id=run_id, root=self.root, run_spec=spec, flow=flow)
+        # Step 16 (revalidate) needs the worst-case disk requirement — the
+        # same formula preflight mandates (12 §7.3); the planner replaces
+        # this estimate when it arrives (13 §11 step 9).
+        ctx.facts["required_disk_bytes"] = PreflightContext(
+            run_id=run_id, root=self.root, run_spec=spec
+        ).required_disk_bytes
         report = gate.run(ctx)
         rep = report.to_dict()
 
@@ -736,6 +764,7 @@ class WorkflowAPI:
         if state == RunState.VALIDATING.value:
             # Train path (incl. crash-recovery of a gate interrupted mid-run).
             if report.blocked:
+                self._release_gate_lease(ctx)  # "no changes" includes the lease
                 self.validation_blocked(run_id, rep)  # journal attempt (still VALIDATING)
                 self.validation_fail(
                     run_id,
@@ -754,6 +783,7 @@ class WorkflowAPI:
         )
         if resumable:
             if report.blocked:
+                self._release_gate_lease(ctx)  # step 15 may have run before the FAIL
                 self.validation_blocked(run_id, rep)  # NO state change (13 §7)
             else:
                 # Gate passed → the resume transition itself is now legal.
@@ -771,6 +801,17 @@ class WorkflowAPI:
             self.validation_blocked(run_id, rep)
         return report
 
+    def _release_gate_lease(self, ctx: GateContext) -> None:
+        """A gate BLOCK must not strand the lease step 15 acquired —
+        "No changes were made" includes single-writer ownership."""
+        token = ctx.facts.get("session_token")
+        if not token:
+            return
+        try:
+            RunLeaseManager(self.root).release(ctx.run_id, str(token))
+        except MlforgeError:
+            pass  # never owned / already gone
+
     def preflight_run(
         self, run_id: str, preflight: Preflight | None = None, **ctx_kwargs: Any
     ) -> ValidationReport:
@@ -779,13 +820,16 @@ class WorkflowAPI:
         The READY → RUNNING transition stays with the runtime (build step
         6): firing `preflight_pass` here would put a run in RUNNING with
         no process behind it. Only after PREFLIGHT PASSED does train/
-        resume launch (12 §7.3)."""
+        resume launch (12 §7.3).
+
+        Identity re-verification uses the SAME provider wiring as the gate
+        (one vocabulary, two invocations); unwired ⇒ fail-closed FAIL."""
         self._require("run", run_id)
         spec = self._run_spec(run_id)
         ctx = PreflightContext(
             run_id=run_id, root=self.root, run_spec=spec, **ctx_kwargs
         )
-        preflight = preflight or Preflight()
+        preflight = preflight or Preflight(identity_providers=self.gate_providers or {})
         return preflight.run(ctx)
 
     # ------------------------------------------------------------------
