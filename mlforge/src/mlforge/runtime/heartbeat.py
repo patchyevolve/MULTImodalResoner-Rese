@@ -43,10 +43,13 @@ class HeartbeatWriter:
         self.clock = clock
         self.path = self.root / "runs" / run_id / "state" / "heartbeat.json"
 
-    def beat(self) -> dict[str, Any]:
+    def beat(self, **extra: Any) -> dict[str, Any]:
         """One heartbeat: renew lease (if owned) THEN write the file.
         A lost lease raises — the worker must stop writing checkpoints
-        (single-writer invariant, 12 §23.2)."""
+        (single-writer invariant, 12 §23.2).
+
+        `extra` carries the fields the worker knows and status displays
+        (13 §9.4 example: `global_step`, `state`)."""
         if self.lease is not None:
             self.lease.renew(self.run_id, self.session_token)  # owner check
         payload = {
@@ -55,6 +58,7 @@ class HeartbeatWriter:
             "pid": os.getpid(),
             "host": socket.gethostname(),
             "session_token": self.session_token,
+            **extra,
         }
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_suffix(".json.tmp")

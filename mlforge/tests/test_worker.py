@@ -243,6 +243,69 @@ def test_worker_control_poll_accepts_resume_of_corrupt_intent(tmp_path):
     assert not (state / "control.json").is_file()
 
 
+# -- live state (13 §9.4: heartbeat + live.json are observations) -------------
+
+def test_heartbeat_carries_progress_fields(tmp_path):
+    from mlforge.runtime.heartbeat import HeartbeatWriter
+
+    hb = HeartbeatWriter(tmp_path, "run_A", "tok")  # no lease → pure write
+    payload = hb.beat(global_step=7, state="RUNNING")
+    assert payload["global_step"] == 7 and payload["state"] == "RUNNING"
+    data = json.loads(hb.path.read_text())
+    assert data["global_step"] == 7 and data["state"] == "RUNNING"
+    hb.clear()
+    assert not hb.path.is_file()
+
+
+def test_worker_writes_live_json_and_clears_on_exit(tmp_path):
+    """state/live.json = current transient metrics; dies with the process."""
+    wf, run_id, token = make_ready(tmp_path)
+    w = _worker(tmp_path, run_id, token, ScaffoldTrainer(max_steps=10_000),
+                poll_interval=0.01, heartbeat_interval=0.05)
+    t, box = _run_in_thread(w)
+    assert _wait_state(wf, run_id, {"RUNNING"}) == "RUNNING"
+    live = tmp_path / "runs" / run_id / "state" / "live.json"
+    deadline = time.time() + 5.0
+    data = None
+    while time.time() < deadline and data is None:
+        if live.is_file():
+            data = json.loads(live.read_text())
+        time.sleep(0.01)
+    assert data is not None, "worker must publish live.json while running"
+    assert data["stage"] == "TRAINING"
+    assert "global_step" in data and "loss" in data
+
+    write_control(tmp_path, run_id, "stop")
+    t.join(timeout=5.0)
+    assert not t.is_alive() and box["code"] == 0
+    assert not live.is_file()  # graceful exit removes live state
+
+
+def test_worker_checkpoint_intent_forces_one_checkpoint(tmp_path):
+    """13 §9.6 watch keybinding: the viewer writes an intent; the worker
+    commits a checkpoint ONCE and clears the intent (not a mode)."""
+    wf, run_id, token = make_ready(tmp_path)
+    w = _worker(tmp_path, run_id, token, ScaffoldTrainer(max_steps=10_000),
+                poll_interval=0.01, heartbeat_interval=0.05,
+                checkpoint_interval=10_000)  # never fires periodically
+    t, box = _run_in_thread(w)
+    assert _wait_state(wf, run_id, {"RUNNING"}) == "RUNNING"
+    write_control(tmp_path, run_id, "checkpoint")
+    deadline = time.time() + 5.0
+    events: list = []
+    while time.time() < deadline:
+        events = [e["event"] for e in wf.get_run_events(run_id)]
+        if "checkpoint_committed" in events:
+            break
+        time.sleep(0.01)
+    assert "checkpoint_committed" in events  # only the INTENT could cause it
+    assert not (tmp_path / "runs" / run_id / "state" / "control.json").is_file()
+    write_control(tmp_path, run_id, "stop")
+    t.join(timeout=5.0)
+    assert not t.is_alive() and box["code"] == 0
+    assert wf.get_run_state(run_id) == RunState.STOPPED.value
+
+
 # -- spawn queue (12 §12.4: CLI queues, supervisor spawns) -------------------
 
 def test_drain_spawns_and_journals(tmp_path):

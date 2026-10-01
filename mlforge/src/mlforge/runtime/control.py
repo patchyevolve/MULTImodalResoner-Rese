@@ -1,4 +1,5 @@
-"""Worker control channel — pause/stop requests (13 §4.1, §12 §12.4).
+"""Worker control channel — pause/stop/checkpoint requests (13 §4.1,
+§9.6, 12 §12.4).
 
 The CLI (or TUI/GUI) never reaches into a running worker — it writes an
 intent file; the worker reads it at its next control poll and performs
@@ -7,7 +8,11 @@ transition on the single write path and makes pause/stop survive a dead
 CLI (`mlforge pause` returning does not mean the worker stopped — it
 means the intent was recorded).
 
-    runs/<id>/state/control.json   {"action": "pause"|"stop", ...}
+    runs/<id>/state/control.json   {"action": "pause"|"stop"|"checkpoint", ...}
+
+`checkpoint` is the watch keybinding (13 §9.6): the worker commits one
+checkpoint immediately and then CLEARS the intent (it is a one-shot, not
+a mode).
 
 An unreadable control file is quarantined (renamed `*.corrupt`), never
 silently ignored and never able to crash the worker — the run must not
@@ -22,7 +27,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-CONTROL_ACTIONS = ("pause", "stop")
+CONTROL_ACTIONS = ("pause", "stop", "checkpoint")
 
 
 def control_path(root: str | Path, run_id: str) -> Path:

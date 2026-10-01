@@ -23,7 +23,8 @@ import time
 from pathlib import Path
 
 import mlforge
-from mlforge.errors import MlforgeError, NoValidContinuation, PreconditionFailed
+import mlforge.status as status_layer
+from mlforge.errors import MlforgeError, NoValidContinuation, NotFound, PreconditionFailed
 from mlforge.leases import LeaseState, RunLeaseManager
 from mlforge.run_spec import RunSpec
 from mlforge.runtime.control import wait_for_state, write_control
@@ -35,7 +36,7 @@ from mlforge.workflow import WorkflowAPI
 # 13 §11 build-order gates: implemented vs pending.
 _IMPLEMENTED = {
     "status", "inspect", "events", "store", "validate", "preflight", "lease",
-    "train", "resume", "pause", "stop",
+    "train", "resume", "pause", "stop", "watch", "hardware",
 }
 _PENDING = {
     "init": 1,
@@ -48,8 +49,6 @@ _PENDING = {
     "infer": 11,
     "export": 11,
     "package": 11,
-    "watch": 7,
-    "hardware": 7,
 }
 
 #: States after which a worker is gone and `--attach` may stop waiting.
@@ -70,7 +69,14 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     sub = p.add_subparsers(dest="command")
 
-    st = sub.add_parser("status", help="overview of all runs (read-only, L1)")
+    st = sub.add_parser(
+        "status",
+        help="overview of all runs, or one run's block (read-only, L1/L2)",
+    )
+    st.add_argument("run_id", nargs="?", default=None,
+                    help="show one run's L1 block (default: all-runs overview)")
+    st.add_argument("-v", "--verbose", action="store_true",
+                    help="L2 training detail (config, loops, checkpoints)")
     st.add_argument("--json", action="store_true", help="machine-readable output")
 
     insp = sub.add_parser("inspect", help="detailed report for one object")
@@ -79,6 +85,19 @@ def _build_parser() -> argparse.ArgumentParser:
 
     ev = sub.add_parser("events", help="structured event stream for a run")
     ev.add_argument("run_id")
+    ev.add_argument("--follow", action="store_true",
+                    help="tail new events until Ctrl+C (read-only)")
+
+    wch = sub.add_parser("watch", help="live dashboard for a run (viewer only)")
+    wch.add_argument("run_id", nargs="?", default=None,
+                     help="run to watch (default: the most active run)")
+    wch.add_argument("--interval", type=float, default=1.0,
+                     help="refresh interval in seconds (default: 1)")
+    wch.add_argument("--json", action="store_true",
+                     help="one-shot machine-readable frame (no loop)")
+
+    hw = sub.add_parser("hardware", help="L3 host telemetry (diagnostic only)")
+    hw.add_argument("--json", action="store_true", help="machine-readable output")
 
     val = sub.add_parser(
         "validate", help="run the 19-step validation gate for a run (fail-closed)"
@@ -245,6 +264,111 @@ def _launch(wf: WorkflowAPI, run_id: str) -> dict:
     enqueue_spawn(wf.root, run_id, token)
     sup = ensure_supervisor(wf.root)
     return {"supervisor_pid": sup["pid"]}
+
+
+# ---------------------------------------------------------------------------
+# status / watch / hardware — read-only observation layer (13 §9)
+# ---------------------------------------------------------------------------
+
+
+def _do_status(wf: WorkflowAPI, args) -> int:
+    if args.run_id:
+        detail = status_layer.collect_run(wf.root, args.run_id, verbose=args.verbose)
+        if args.json:
+            print(json.dumps(detail, indent=2, sort_keys=True, default=str))
+        else:
+            for line in status_layer.render_l1(detail):
+                print(line)
+            if args.verbose:
+                for line in status_layer.render_l2(detail):
+                    print(line)
+        return 0
+    runs = status_layer.collect_overview(wf.root)
+    if args.json:
+        print(json.dumps(runs, indent=2, sort_keys=True))
+    else:
+        for line in status_layer.render_overview(runs):
+            print(line)
+    return 0
+
+
+def _pick_watch_run(wf: WorkflowAPI) -> str:
+    """`watch` without RUN: the most active run (13 §4.1 `watch [RUN]`)."""
+    runs = wf.list_runs()
+    if not runs:
+        raise NotFound("no runs to watch", hint="`mlforge train --config F` first")
+    running = [r for r in runs if r.get("state") == "RUNNING"]
+    pool = running or runs
+    best = max(pool, key=lambda r: r.get("updated_ts") or 0.0)
+    return best["id"]
+
+
+def _watch_keys(wf: WorkflowAPI, run_id: str, key: str) -> str | None:
+    """Map a viewer key to a control intent (13 §9.6). Returns 'quit' for q.
+    The VIEWER never transitions anything itself — it only writes intents
+    the worker obeys (same channel as `pause`/`stop`), or 'checkpoint'."""
+    if key == "q":
+        return "quit"
+    if key in ("p", "s", "c"):
+        write_control(wf.root, run_id, {"p": "pause", "s": "stop", "c": "checkpoint"}[key],
+                      requested_by="cli:watch")
+        return key
+    return None
+
+
+def _do_watch(wf: WorkflowAPI, args) -> int:
+    run_id = args.run_id or _pick_watch_run(wf)
+    detail = status_layer.collect_run(wf.root, run_id)  # NotFound ⇒ exit 2
+    if args.json:
+        print(json.dumps(detail, indent=2, sort_keys=True, default=str))
+        return 0
+
+    frame = "\n".join(status_layer.render_watch(detail))
+    if not sys.stdin.isatty():
+        # Piped/non-interactive: one frame, no loop (read-only either way).
+        print(frame)
+        return 0
+
+    import os as _os
+    import select
+    import termios
+    import tty
+
+    fd = sys.stdin.fileno()
+    saved = termios.tcgetattr(fd)
+    print(frame, flush=True)
+    try:
+        tty.setcbreak(fd)
+        while True:
+            ready, _, _ = select.select([fd], [], [], max(0.1, args.interval))
+            if ready:
+                key = _os.read(fd, 1).decode(errors="ignore")
+                action = _watch_keys(wf, run_id, key)
+                if action == "quit":
+                    print("\nq exits the viewer only — training continues")
+                    return 0
+                if action is not None:
+                    print(f"\n{action} requested for {run_id} (worker obeys; "
+                          "viewer does not transition anything)")
+            detail = status_layer.collect_run(wf.root, run_id)
+            print("\x1b[2J\x1b[H" + "\n".join(status_layer.render_watch(detail)),
+                  flush=True)
+    except KeyboardInterrupt:
+        print("\ndetached — training continues")
+        return 0
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+
+
+def _do_hardware(wf: WorkflowAPI, args) -> int:
+    """L3 (13 §9.5): diagnostic telemetry only — never training state."""
+    info = status_layer.collect_hardware(wf.root)
+    if args.json:
+        print(json.dumps(info, indent=2, sort_keys=True))
+    else:
+        for line in status_layer.render_hardware(info):
+            print(line)
+    return 0
 
 
 def _attach(wf: WorkflowAPI, run_id: str) -> int:
@@ -519,27 +643,33 @@ def main(argv: list[str] | None = None, *, wf_factory=None) -> int:
         if args.command == "stop":
             return _do_stop(wf, args)
         if args.command == "status":
-            runs = wf.list_runs()
-            if args.json:
-                print(json.dumps(runs, indent=2, sort_keys=True))
-            elif not runs:
-                print("No runs.")
-            else:
-                for r in runs:
-                    fail = r.get("failure")
-                    line = f"{r['id']}  {r['state']}"
-                    if fail:
-                        line += f"  recovery={fail.get('recovery')}  cause={fail.get('cause')}"
-                    print(line)
-            return 0
+            return _do_status(wf, args)
+
+        if args.command == "watch":
+            return _do_watch(wf, args)
+
+        if args.command == "hardware":
+            return _do_hardware(wf, args)
 
         if args.command == "inspect":
             print(json.dumps(wf.get_run_status(args.object_id), indent=2, sort_keys=True))
             return 0
 
         if args.command == "events":
-            for e in wf.get_run_events(args.run_id):
-                print(json.dumps(e, sort_keys=True))
+            events = wf.get_run_events(args.run_id)
+            for e in events:
+                print(json.dumps(e, sort_keys=True), flush=bool(args.follow))
+            if args.follow:
+                seen = len(events)
+                try:
+                    while True:
+                        time.sleep(0.5)
+                        more = wf.get_run_events(args.run_id)
+                        for e in more[seen:]:
+                            print(json.dumps(e, sort_keys=True), flush=True)
+                        seen = len(more)
+                except KeyboardInterrupt:
+                    print()  # clean detach — the stream itself never ends
             return 0
 
         if args.command == "validate":

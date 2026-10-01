@@ -105,6 +105,23 @@ class Worker:
             f.flush()
             os.fsync(f.fileno())
 
+    def _write_live(self, payload: dict[str, Any]) -> None:
+        """`state/live.json` — current transient metrics (13 §9.4).
+        Atomic (readers never see a partial file); removed on graceful
+        exit: live state dies with the process (12 §16)."""
+        state = self.run_dir / "state"
+        state.mkdir(parents=True, exist_ok=True)
+        payload = {"run_id": self.run_id, "ts": self.clock(), **payload}
+        tmp = state / "live.json.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, sort_keys=True)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, state / "live.json")
+
+    def _clear_live(self) -> None:
+        (self.run_dir / "state" / "live.json").unlink(missing_ok=True)
+
     # -- lifecycle ------------------------------------------------------------
 
     def run(self) -> int:
@@ -158,7 +175,7 @@ class Worker:
             tstate = TrainState(start_step, start_epoch, selection.resume_point)
 
             # 4. First heartbeat (lease renewed with it), then the loop.
-            last_beat = hb.beat()["ts"]
+            last_beat = hb.beat(global_step=tstate.global_step, state="RUNNING")["ts"]
             return self._loop(wf, store, hb, trainer, tstate, last_beat)
         except WorkerExit as exit_:
             return exit_.code
@@ -172,6 +189,7 @@ class Worker:
                 except MlforgeError:
                     pass
                 hb.clear()
+                self._clear_live()
 
     # -- main loop ------------------------------------------------------------
 
@@ -193,7 +211,8 @@ class Worker:
                 )
 
             if hb.due(last_beat, self.heartbeat_interval):
-                hb.beat()  # renews the lease too — losing it raises
+                # renews the lease too — losing it raises
+                hb.beat(global_step=tstate.global_step, state="RUNNING")
                 last_beat = self.clock()
 
             ctrl = read_control(self.root, self.run_id)
@@ -203,6 +222,11 @@ class Worker:
                     return self._do_pause(wf, store, trainer, tstate, hb)
                 if action == "stop":
                     return self._do_stop(wf, hb)
+                if action == "checkpoint":
+                    # explicit "checkpoint now" (13 §9.6 watch keybinding):
+                    # obey once, then forget the intent.
+                    clear_control(self.root, self.run_id)
+                    self._checkpoint(wf, store, trainer, tstate)
                 # corrupt/unknown intents are quarantined by read_control;
                 # they must not crash training — but they must not be obeyed.
 
@@ -214,9 +238,29 @@ class Worker:
                 "loss": result.loss,
                 **result.metrics,
             })
+            self._write_live({
+                "stage": "TRAINING",
+                "global_step": result.global_step,
+                "epoch": result.epoch,
+                "loss": result.loss,
+                "metrics": result.metrics,
+            })
 
             if result.global_step % self.checkpoint_interval == 0:
+                self._write_live({
+                    "stage": "CHECKPOINTING",
+                    "saving": f"checkpoint-{result.global_step}",
+                    "global_step": result.global_step,
+                    "epoch": result.epoch,
+                })
                 self._checkpoint(wf, store, trainer, tstate)
+                self._write_live({
+                    "stage": "TRAINING",
+                    "global_step": result.global_step,
+                    "epoch": result.epoch,
+                    "loss": result.loss,
+                    "metrics": result.metrics,
+                })
 
             tstate = TrainState(result.global_step, result.epoch, tstate.resume_from)
 
@@ -323,6 +367,7 @@ class Worker:
         except MlforgeError:
             pass  # already broken/released — never mask the real result
         hb.clear()
+        self._clear_live()
 
     def _fail(
         self,

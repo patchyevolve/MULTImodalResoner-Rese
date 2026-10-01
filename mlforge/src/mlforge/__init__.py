@@ -9,12 +9,12 @@ Ground truth (normative specifications, in reading order):
 Build order follows 13_product_specification.md §11:
 
     1. Workflow API + state machines          ← this package core (done)
-    2. Artifact registry + content store      (mlforge.store — pending)
-    3. Validation gate + preflight            (mlforge.validation — pending)
-    4. CLI contract                           (mlforge.cli — minimal)
-    5. Supervisor + leases + idempotency      (mlforge.leases / mlforge.commands — pending)
-    6. Training runtime + checkpoints         (mlforge.runtime — pending)
-    7. Status layer                           (mlforge.status — pending)
+    2. Artifact registry + content store      (mlforge.store — done)
+    3. Validation gate + preflight            (mlforge.validation — done)
+    4. CLI contract                           (mlforge.cli — done, pending cmds exit 4)
+    5. Supervisor + leases + idempotency      (mlforge.leases / mlforge.commands — done)
+    6. Training runtime + checkpoints         (mlforge.runtime — done)
+    7. Status layer                           (mlforge.status — done)
     8. Ingestion/transform DAG                (pending)
     9. Execution planner                      (mlforge.planner — pending)
    10. Resume/retrain/finetune flows + lineage (partial: via workflow)

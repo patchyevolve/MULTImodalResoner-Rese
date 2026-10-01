@@ -29,14 +29,14 @@ mlforge/
 │   ├── machine.py            # 4 transition tables (13 §5)        ✅
 │   ├── run_spec.py           # immutable semantic identity        ✅
 │   ├── workflow.py           # Workflow API facade (13 §1)        ✅
- │   ├── cli/                  # status/inspect/events/store/validate/preflight/lease/train/resume/pause/stop ✅
+│   ├── cli/                  # status/inspect/events/store/validate/preflight/lease/train/resume/pause/stop/watch/hardware ✅
 │   ├── store/                # CAS + registry + GC                ✅
 │   ├── validation/           # 19-step gate + preflight           ✅
 │   ├── leases/               # run lease + gate providers 15–16   ✅
 │   ├── commands/             # idempotency journal                ✅
- │   ├── supervisor.py         # crash detection + spawn queue daemon  ✅
- │   ├── runtime/              # checkpoints, worker, control, trainer ✅
-│   ├── status/               # L1/L2/L3, watch                    ⛔ step 7
+│   ├── supervisor.py         # crash detection + spawn queue daemon  ✅
+│   ├── runtime/              # checkpoints, worker, control, trainer ✅
+│   ├── status/               # L1/L2/L3, watch, events --follow   ✅
 │   └── planner/              # capability feasibility solver      ⛔ step 9
 └── tests/                    # specs as executable tests
 ```
@@ -58,7 +58,12 @@ mlforge/
    (`state/pending/` → detached worker, 12 §12.4 delegation), and
    `train`/`resume`/`pause`/`stop` CLI (gate BLOCK train →
    FAILED[FORK_ONLY], resume → state unchanged; `--command-id` dedupe)
-7. ⛔ Status layer (read-only L1/L2/L3)
+7. ✅ Status layer — read-only L1/L2 (`status [RUN] [-v]` incl. stale-
+   heartbeat WARNING + FAILED disposition + stage-aware block), L3
+   `hardware` (diagnostic telemetry), `watch [RUN]` (viewer only — keys
+   write control intents, `q` quits the viewer), `events --follow`;
+   worker publishes `state/heartbeat.json` (global_step/state) +
+   `state/live.json` (transient metrics) per 13 §9.4
 8. ⛔ Ingestion/transform DAG
 9. ⛔ Execution planner
 10. ⛔ Resume/retrain/finetune flows + lineage DAG
@@ -85,6 +90,10 @@ mlforge/
 * **Blobs are atomic and verified** — staging → fsync → rename; identity
   claimed at `put_file` must match (mismatch → BLOCK); corruption detected
   by `verify()`, never trusted.
+* **Status is read-only** — it never writes state or transitions a run
+  (13 §4.1); a stale RUNNING heartbeat is a WARNING, reconciled only by
+  `resume` / supervisor crash detection. Never infer lifecycle from
+  telemetry (13 §9.4).
 * **Registry registration is transactional** — entry written to temp,
   renamed to commit; crash orphans swept by `recover()`.
 * **Unverifiable == failed verification** — a missing provider, a throwing
