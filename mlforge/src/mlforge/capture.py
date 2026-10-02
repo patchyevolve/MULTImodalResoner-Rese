@@ -43,12 +43,20 @@ from mlforge.ingest.transforms import env_fingerprint
 from mlforge.validation.gate import GateContext, Provider
 from mlforge.validation.report import FAIL, PASS, Check
 
-#: Mutable/non-code directories never part of source identity.
+#: Mutable/non-code directories never part of source identity. These are
+#: SYSTEM-GENERATED registries and runtime state — each is verified by its
+#: own gate step (datasets → 4, model registry → 6, journal is the
+#: authority 12 §16.1). Counting them would make every model publish,
+#: `dataset add`, or supervisor tick "source drift" and block resume.
 SOURCE_EXCLUDES = frozenset({
     "runs", "store", "artifacts", "environment", "code",
     ".git", "__pycache__", ".pytest_cache", ".mlforge",
     "dist", "build",
+    "state", "projects", "models", "datasets", ".mlforge_probe",
 })
+
+#: Generated top-level files (same reasoning as the dirs above).
+SOURCE_EXCLUDE_FILES = frozenset({"commands.jsonl", "datasets.yaml"})
 
 SNAPSHOT_NAME = "source.snapshot.tar.gz"
 SOURCE_META_NAME = "source.json"
@@ -85,7 +93,7 @@ def iter_source_files(root: str | Path) -> list[Path]:
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = sorted(d for d in dirnames if d not in SOURCE_EXCLUDES)
         for name in sorted(filenames):
-            if name.endswith((".pyc", ".pyo")):
+            if name.endswith((".pyc", ".pyo")) or name in SOURCE_EXCLUDE_FILES:
                 continue
             p = Path(dirpath) / name
             if p.is_symlink():

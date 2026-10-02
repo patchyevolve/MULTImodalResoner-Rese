@@ -641,7 +641,8 @@ def provide_transform(root: str | Path) -> Provider:
     (12 §8.4: "artifact hash must match → else BLOCK")."""
 
     def _p(ctx: GateContext) -> Check:
-        from mlforge.ingest.identity import parse_ref
+        from mlforge.ingest.identity import DEFAULT_VERSION, parse_ref
+        from mlforge.ingest.prepare import derived_dataset_id
         from mlforge.ingest.transforms import registry_names
         from mlforge.store import ContentStore
 
@@ -669,11 +670,13 @@ def provide_transform(root: str | Path) -> Provider:
                 return Check(0, "", "", FAIL,
                              f"{name}: no recorded identity — re-register")
             if not store.contains(identity):
+                model = spec.model or "<MODEL>"
                 return Check(
                     0, "", "", FAIL,
                     f"{name}: raw dataset — no transform artifact recorded "
                     "(transform identity is EXACT-required, 12 §6.4/§8.4); "
-                    "derive it first: mlforge prepare <MODEL>",
+                    f"derive it first: mlforge prepare {model} — then train "
+                    f"on {derived_dataset_id(model)}:{DEFAULT_VERSION}",
                 )
             try:
                 doc = json.loads(store.get_bytes(identity, verify=True))

@@ -431,6 +431,43 @@ def test_preflight_default_disk_calculation():
     assert ctx.required_disk_bytes == 13 * (1 << 30)
 
 
+def test_preflight_failure_hints_name_the_runtime_knobs(tmp_path):
+    """Disk/RAM FAILs must tell a small-laptop user exactly what to set."""
+    from mlforge.validation.preflight import probe_disk, probe_ram
+
+    ctx = PreflightContext(
+        run_id="run_x", root=tmp_path, run_spec=make_spec(),
+        checkpoint_bytes=1 << 40,  # unreachable worst case ⇒ FAIL anywhere
+    )
+    verdict, detail, _ = probe_disk(ctx)
+    assert verdict == FAIL and "runtime.checkpoint_bytes" in detail
+    assert "runtime.safety_margin_bytes" in detail
+
+    ctx_ram = PreflightContext(
+        run_id="run_x", root=tmp_path, run_spec=make_spec(),
+        min_ram_bytes=1 << 45,  # 32 TiB ⇒ fails on any real host
+    )
+    verdict, detail, _ = probe_ram(ctx_ram)
+    assert verdict == FAIL and "runtime.min_ram_bytes" in detail
+
+
+def test_preflight_runtime_min_ram_reaches_the_context(wf):
+    """state/runtime.json (train config) lowers the RAM floor the same way
+    it lowers disk — one story for gate step 16 and preflight (12 §7.3)."""
+    run_id = _run(wf)
+    state = wf.root / "runs" / run_id / "state"
+    state.mkdir(parents=True, exist_ok=True)
+    (state / "runtime.json").write_text(json.dumps({
+        "min_ram_bytes": 1 << 45,  # force a FAIL no default 8 GiB floor would
+    }), encoding="utf-8")
+    probes = _host_ok()
+    del probes["ram"]  # let the real probe read ctx.min_ram_bytes
+    report = wf.preflight_run(run_id, Preflight(probes=probes))
+    assert report.blocked and report.first_failure.id == "ram"
+    assert "runtime.min_ram_bytes" in report.first_failure.detail
+    assert "32768.0 GiB" in report.first_failure.detail
+
+
 def test_preflight_gpu_required_fails_without_smi(wf, monkeypatch):
     """gpu_required and no nvidia-smi ⇒ FAIL (unverifiable, fail-closed)."""
     import mlforge.validation.preflight as pfmod

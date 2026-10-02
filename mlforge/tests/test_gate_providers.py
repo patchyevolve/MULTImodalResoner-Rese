@@ -121,7 +121,9 @@ def test_transform_raw_dataset_fails_with_prepare_hint(ws):
         GateContext("run_x", ws, _spec_refs("raw_ds:v1")))
     assert check.verdict == "FAIL"
     assert "raw dataset" in check.detail
-    assert "mlforge prepare" in check.detail
+    # actionable: the REAL prepare command + the derived ref to train on
+    assert "mlforge prepare rf_detr_s" in check.detail
+    assert "rf_detr_s_prepared:v1" in check.detail
 
 
 def test_transform_tampered_artifact_fails(ws):
@@ -258,8 +260,10 @@ def test_disk_components_default_shape(tmp_path):
 def test_gpu_required_follows_execution_plan(tmp_path):
     run_dir = tmp_path / "runs" / "run_p"
     run_dir.mkdir(parents=True)
-    # no plan yet ⇒ fail-closed: GPU required (historical default)
-    assert _gpu_required_for(tmp_path, "run_p", {}) is True
+    # no plan yet ⇒ live host detection: a CPU laptop never demands a
+    # GPU it cannot have; broken detection ⇒ ValidationBlock ⇒ True
+    host_needs_gpu = detect_capabilities().gpu_count > 0
+    assert _gpu_required_for(tmp_path, "run_p", {}) is host_needs_gpu
     caps = detect_capabilities()
     plan = build_plan(make_spec(), caps)
     plan.write(run_dir / PLAN_FILENAME)

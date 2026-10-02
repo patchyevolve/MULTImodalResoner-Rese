@@ -11,7 +11,10 @@ Specs as executable checks:
   * hardware (9) / driver (8): live detection facts (12 §13.1); CPU box
     has no driver to check — PASS with that honest detail, never a
     fabricated PASS
-  * mutable state (runs/, artifacts/, store/) never counts as source
+  * mutable/system state (runs/, artifacts/, store/, state/, models/,
+    projects/, datasets/, commands.jsonl, datasets.yaml) never counts
+    as source — each has its own verification path, and counting them
+    would block resume on every publish/add/tick
 """
 
 from __future__ import annotations
@@ -101,6 +104,33 @@ def test_mutable_dirs_excluded_from_tree(wf):
     (wf.root / "runs" / run_id / "events.jsonl").write_text('{"x":1}\n')
     h2, n2 = source_tree_hash(wf.root)
     assert (h1, n1) == (h2, n2)
+
+
+def test_generated_registries_never_count_as_source(wf):
+    """Regression: supervisor state, model publishes, dataset adds, the
+    command journal, and datasets.yaml are system-generated — counting
+    them made step 3 report "source tree changed" after every publish
+    and blocked subsequent resumes/preflights on a healthy project."""
+    from mlforge.capture import provide_source_code, source_tree_hash
+
+    run_id = _run(wf)  # capture first — nothing generated afterwards may drift
+    h1, n1 = source_tree_hash(wf.root)
+    (wf.root / "state").mkdir(exist_ok=True)
+    (wf.root / "state" / "supervisor.json").write_text("{}")
+    (wf.root / "state" / "supervisor.log").write_text("tick\n")
+    (wf.root / "models" / "model_x").mkdir(parents=True, exist_ok=True)
+    (wf.root / "models" / "model_x" / "status.json").write_text("{}")
+    (wf.root / "projects" / "p").mkdir(parents=True, exist_ok=True)
+    (wf.root / "projects" / "p" / "events.jsonl").write_text("{}\n")
+    (wf.root / "datasets" / "ds2").mkdir(parents=True, exist_ok=True)
+    (wf.root / "datasets" / "ds2" / "identity.json").write_text("{}")
+    (wf.root / "datasets.yaml").write_text("{}\n")
+    (wf.root / "commands.jsonl").write_text('{"id":"cmd_1"}\n')
+    h2, n2 = source_tree_hash(wf.root)
+    assert (h1, n1) == (h2, n2)
+    # step 3 agrees: still verified, no "drift" FAIL
+    check = provide_source_code(wf.root)(_ctx(wf, run_id))
+    assert check.verdict == "PASS" and "source tree verified" in check.detail
 
 
 # -- gate step 3: source_code ---------------------------------------------

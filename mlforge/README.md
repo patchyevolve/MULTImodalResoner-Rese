@@ -43,7 +43,7 @@ mlforge init myproj && cd myproj          # project scaffold (13 §4.1)
 mlforge dataset add coco_2017 /data/coco  # register + explicit path
 mlforge dataset verify coco_2017          # re-hash → VERIFIED
 mlforge configure datasets                # machine-local paths ($MLFORGE_HOME)
-$EDITOR ingestion.yaml                    # 12 §10.2: model → transform/sources
+$EDITOR ingestion.yaml                    # scaffolded: model → transform (12 §10.2)
 mlforge prepare rf_detr_s                 # derived rf_detr_s_prepared (§6.6)
 $EDITOR configs/train.example.json        # train_datasets: [<model>_prepared:v1]
 mlforge train --config configs/train.example.json   # gate 16/16 → preflight → run
@@ -51,9 +51,39 @@ mlforge watch                             # live dashboard while it trains
 ```
 
 The gate is fail-closed at every step: raw datasets BLOCK with the
-`prepare` hint, missing captures BLOCK, disk/GPU expectations derive
-from the run's runtime config + execution plan (12 §7.3/§14), and a
-passing gate acquires the run lease before launch (12 §18 step 15).
+exact `mlforge prepare <MODEL>` command, missing captures BLOCK, disk/
+GPU expectations derive from the run's runtime config + execution plan
+(12 §7.3/§14), and a passing gate acquires the run lease before launch
+(12 §18 step 15).
+
+### CPU-only laptops
+
+Nothing in the quickstart needs a GPU — the system measures whatever
+host it runs on:
+
+* **GPU expectations follow the plan, never a blind guess.** No
+  `nvidia-smi` ⇒ CPU/PORTABLE plan (fp32; `bf16` falls back with a
+  warning — 12 §14). `train`/`resume`/`preflight` only demand a driver
+  when the execution plan — or, before validation, live host detection —
+  actually found GPUs; explicit escape hatches:
+  `runtime: {"gpu": false|true}` in the train config, or
+  `mlforge preflight RUN --gpu/--no-gpu` for a one-off report.
+* **Disk (12 §7.3) defaults are worst-case**: 2×4 GiB checkpoints +
+  2 GiB logs + 2 GiB safety margin + dataset bytes. On a small disk,
+  put your real numbers in the train config — gate step 16 and
+  preflight both read the same `state/runtime.json`:
+
+  ```json
+  "runtime": {
+    "checkpoint_bytes": 268435456,
+    "log_bytes": 134217728,
+    "safety_margin_bytes": 134217728,
+    "min_ram_bytes": 4294967296
+  }
+  ```
+
+* **RAM floor** is 8 GiB by default; `runtime.min_ram_bytes` lowers it.
+  Every disk/RAM failure message names the exact knob to change.
 
 ## Ground truth (normative)
 

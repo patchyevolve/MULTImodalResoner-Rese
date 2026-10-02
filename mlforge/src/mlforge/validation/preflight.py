@@ -96,7 +96,12 @@ def probe_disk(ctx: PreflightContext) -> tuple[str, str, dict[str, Any]]:
     detail = (f"worst-case need {required / (1 << 30):.1f} GiB, "
               f"free {free / (1 << 30):.1f} GiB")
     if free < required:
-        return FAIL, detail + " — insufficient", data
+        return FAIL, (
+            detail
+            + " — insufficient (free disk, or set runtime.checkpoint_bytes / "
+            "runtime.log_bytes / runtime.safety_margin_bytes in your train "
+            "config to your real expected sizes — 12 §7.3)"
+        ), data
     return PASS, detail, data
 
 
@@ -137,7 +142,11 @@ def probe_ram(ctx: PreflightContext) -> tuple[str, str, dict[str, Any]]:
         return FAIL, "RAM total unverifiable on this platform (fail-closed)", {}
     detail = f"{total / (1 << 30):.1f} GiB total, need >= {ctx.min_ram_bytes / (1 << 30):.1f} GiB"
     if total < ctx.min_ram_bytes:
-        return FAIL, detail, {"total": total}
+        return FAIL, (
+            detail
+            + " (set runtime.min_ram_bytes in your train config if this host "
+            "is intentionally smaller)"
+        ), {"total": total}
     return PASS, detail, {"total": total}
 
 

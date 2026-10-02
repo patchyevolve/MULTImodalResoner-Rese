@@ -176,6 +176,29 @@ def test_preflight_report_only_and_fails_closed(tmp_path, capsys):
     assert [e["event"] for e in wf.get_run_events(h.run_id)] == ["run_created"]
 
 
+def test_preflight_cli_defaults_are_host_plan_and_runtime(tmp_path, capsys):
+    """CPU-laptop usability: no flags ⇒ GPU follows host/plan (never a
+    blind FAIL), disk/RAM honor state/runtime.json knobs."""
+    from mlforge.workflow import WorkflowAPI
+
+    wf = WorkflowAPI(tmp_path)
+    h = wf.create_run(_spec())
+    state = tmp_path / "runs" / h.run_id / "state"
+    state.mkdir(parents=True, exist_ok=True)
+    (state / "runtime.json").write_text(json.dumps({
+        "checkpoint_bytes": 1 << 20, "log_bytes": 1 << 20,
+        "safety_margin_bytes": 1 << 20, "min_ram_bytes": 1,
+    }), encoding="utf-8")
+    code = main(["--root", str(tmp_path), "preflight", h.run_id, "--json"])
+    report = json.loads(capsys.readouterr().out)
+    checks = {c["id"]: c for c in report["checks"]}
+    assert checks["disk"]["verdict"] == "PASS"    # tiny runtime budget
+    assert checks["ram"]["verdict"] == "PASS"     # runtime.min_ram_bytes=1
+    assert checks["gpu"]["verdict"] != "FAIL"     # host/plan-derived, no flags
+    # still fail-closed where it must be: unregistered dataset ⇒ blocked
+    assert code == 1 and report["blocked"] is True
+
+
 # -- lease CLI (12 §23, 13 §4.1) ------------------------------------------
 
 

@@ -107,6 +107,7 @@ from mlforge.planner import (
     Capabilities,
     ExecutionPlan,
     detect_capabilities,
+    disk_estimate_components,
     estimate_required_disk_bytes,
     load_runtime,
 )
@@ -1075,14 +1076,17 @@ class WorkflowAPI:
         (one vocabulary, two invocations); unwired ⇒ fail-closed FAIL."""
         self._require("run", run_id)
         spec = self._run_spec(run_id)
+        runtime = load_runtime(self._dir("run", run_id))
         # Worst-case disk inputs: the SAME runtime-aware components the
         # gate's step 16 uses (12 §7.3) — one formula, two invocations.
-        from mlforge.planner import disk_estimate_components
-
         for key, value in disk_estimate_components(
-            self.root, spec, runtime=load_runtime(self._dir("run", run_id))
+            self.root, spec, runtime=runtime
         ).items():
             ctx_kwargs.setdefault(key, value)
+        # `runtime.min_ram_bytes` lets an intentionally small host lower
+        # the RAM floor the same way it lowers the disk numbers.
+        if "min_ram_bytes" in runtime:
+            ctx_kwargs.setdefault("min_ram_bytes", int(runtime["min_ram_bytes"]))
         ctx = PreflightContext(
             run_id=run_id, root=self.root, run_spec=spec, **ctx_kwargs
         )

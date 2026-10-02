@@ -73,9 +73,14 @@ def provide_revalidation(
                          "planner must record it (fail-closed)")
         free = shutil.disk_usage(ctx.root).free
         if free < required:
-            return Check(16, "revalidate", "Revalidate volatile subset", FAIL,
-                         f"disk headroom shrank: need {required} B, free {free} B",
-                         {"required": required, "free": free})
+            return Check(
+                16, "revalidate", "Revalidate volatile subset", FAIL,
+                f"disk headroom shrank: need {required} B, free {free} B "
+                "(free disk, or lower runtime.checkpoint_bytes / "
+                "runtime.log_bytes / runtime.safety_margin_bytes in the "
+                "train config — 12 §7.3)",
+                {"required": required, "free": free},
+            )
 
         # 3) dataset identity (machine-local path is mutable by design)
         if dataset_provider is None:

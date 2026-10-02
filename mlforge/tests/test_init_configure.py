@@ -2,10 +2,10 @@
 
 Specs as executable checks:
   * 13 §4.1 `mlforge init <name>` — Create project: scaffolds the §10
-    product view (project.yaml, datasets.yaml, configs/ with a
-    schema-valid example, models/, runs/, artifacts/) and journals the
-    project genesis (13 §5.1 CREATED); never touches a foreign
-    directory; re-run = natural-key no-op exit 0; `--command-id`
+    product view (project.yaml, datasets.yaml, ingestion.yaml template,
+    configs/ with a schema-valid example, models/, runs/, artifacts/)
+    and journals the project genesis (13 §5.1 CREATED); never touches a
+    foreign directory; re-run = natural-key no-op exit 0; `--command-id`
     replays the ORIGINAL result (13 §4.4)
   * 12 §10.1 `mlforge configure datasets` — one-time-per-machine paths:
     every candidate path is HASHED against its registration BEFORE any
@@ -81,9 +81,18 @@ def test_init_creates_product_view_layout(tmp_path, capsys, home):
     assert isinstance(data["created_ts"], float)
     assert data["mlforge"]
     assert load_file(proj / "datasets.yaml") == {}
+    # ingestion plan scaffolded + parseable (12 §10.2) — matches the
+    # starter train config so prepare works without hand-written YAML
+    assert (proj / "ingestion.yaml").is_file()
+    from mlforge.ingest.dag import load_ingestion
+
+    plans = load_ingestion(proj)
+    assert "rf_detr_s" in plans
+    assert plans["rf_detr_s"].transform == "coco_detection"
     out = capsys.readouterr().out
     assert "Initialized project 'myproj'" in out
     assert "mlforge train --config configs/train.example.json" in out
+    assert "ingestion.yaml" in out
 
 
 def test_init_example_config_passes_live_schema(tmp_path, home):
@@ -113,6 +122,7 @@ def test_init_json_shape(tmp_path, capsys, home):
     assert result["name"] == "p"
     assert result["status"] == "created"
     assert result["example_config"] == "configs/train.example.json"
+    assert result["ingestion"] == "ingestion.yaml"
     assert Path(result["path"]).is_dir()
 
 

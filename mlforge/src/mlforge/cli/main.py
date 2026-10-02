@@ -45,7 +45,12 @@ from mlforge.ingest.config import (
 )
 from mlforge.leases import LeaseState, RunLeaseManager
 from mlforge.ops import DEFAULT_METRIC_NAMES, contract_source_dir
-from mlforge.planner import PLAN_FILENAME, ExecutionPlan, build_plan
+from mlforge.planner import (
+    PLAN_FILENAME,
+    ExecutionPlan,
+    build_plan,
+    detect_capabilities,
+)
 from mlforge.run_spec import RunSpec
 from mlforge.runtime.control import wait_for_state, write_control
 from mlforge.store import ArtifactRegistry, ContentStore
@@ -148,7 +153,14 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     pf.add_argument("run_id")
     pf.add_argument("--json", action="store_true")
-    pf.add_argument(
+    gpu_group = pf.add_mutually_exclusive_group()
+    gpu_group.add_argument(
+        "--gpu",
+        action="store_true",
+        help="force the GPU/driver checks (default: follow the run's plan "
+        "or live host detection)",
+    )
+    gpu_group.add_argument(
         "--no-gpu",
         action="store_true",
         help="this operation does not require a GPU (GPU/driver checks become WARN)",
@@ -590,6 +602,24 @@ def _load_project_yaml(path: Path) -> dict[str, Any]:
     return data
 
 
+#: Scaffolding template for `ingestion.yaml` (12 §10.2) — matches the
+#: starter train config (model `rf_detr_s` on `coco_2017:train`) so the
+#: init → dataset → prepare flow works without hand-writing YAML first.
+_INGESTION_TEMPLATE = """\
+# MLForge ingestion plan (12 §10.2) — one entry per model.
+#   transform:     name from the closed registry (unknown ⇒ prepare BLOCKs)
+#   train_sources: <dataset>:<split> — register with `mlforge dataset add`
+#                  and verify BEFORE `mlforge prepare`
+#   depends_on:    upstream models that must be AVAILABLE first (registry)
+models:
+  rf_detr_s:
+    transform: coco_detection
+    train_sources: [coco_2017:train]
+    # val_sources: [coco_2017:val]
+    # depends_on: []
+"""
+
+
 def _init_scaffold(target: Path, name: str, *, status: str) -> dict[str, Any]:
     """Create the 13 §10 project view. Every write is existence-guarded,
     so a re-run (natural key or --command-id replay) is a no-op."""
@@ -613,6 +643,9 @@ def _init_scaffold(target: Path, name: str, *, status: str) -> dict[str, Any]:
             json.dumps(_EXAMPLE_TRAIN_CONFIG, indent=2) + "\n",
             encoding="utf-8",
         )
+    ingestion = target / "ingestion.yaml"
+    if not ingestion.exists():
+        ingestion.write_text(_INGESTION_TEMPLATE, encoding="utf-8")
     if not (target / "projects" / name).is_dir():
         WorkflowAPI(target).create_project(name)  # journaled genesis (§5.1)
     return {
@@ -621,6 +654,7 @@ def _init_scaffold(target: Path, name: str, *, status: str) -> dict[str, Any]:
         "status": status,
         "created_ts": _load_project_yaml(proj_path).get("created_ts"),
         "example_config": "configs/train.example.json",
+        "ingestion": "ingestion.yaml",
         "dirs": list(_PROJECT_DIRS),
     }
 
@@ -630,12 +664,13 @@ def _print_init_next_steps(name: str, target: Path) -> None:
     print("  project.yaml                    project identity (13 §5.1)")
     print("  datasets.yaml                   dataset identity registry")
     print("  configs/train.example.json      starter training config — edit it")
+    print("  ingestion.yaml                  model → transform plan (12 §10.2)")
     print("  models/  runs/  artifacts/      §10 layout")
     print("\nNext steps:")
     print(f"  cd {target}")
     print("  mlforge dataset add <ID> <PATH>     # register + verify identity")
     print("  mlforge configure datasets          # machine-local paths (12 §10.1)")
-    print("  $EDITOR ingestion.yaml              # model → transform (12 §10.2)")
+    print("  $EDITOR ingestion.yaml              # adjust sources/transform")
     print("  mlforge prepare <MODEL>             # derived <MODEL>_prepared (§6.6)")
     print("  mlforge train --config configs/train.example.json")
 
@@ -1226,8 +1261,11 @@ def _gpu_required_for(root: Path, run_id: str, runtime: dict | None = None) -> b
     """`runtime["gpu"]` (train config) is the explicit override; otherwise
     the validated execution plan decides — a plan measured on a GPU host
     requires `nvidia-smi` at preflight, a CPU/PORTABLE plan does not
-    (12 §14: the plan already negotiated the device). No plan yet ⇒
-    fail-closed: GPU required (the historical default)."""
+    (12 §14: the plan already negotiated the device).
+
+    No plan yet (manual `preflight` before validation): fall back to live
+    host detection — a CPU host never demands a GPU it cannot have; broken
+    detection is a ValidationBlock ⇒ fail-closed True."""
     if runtime is not None and "gpu" in runtime:
         return bool(runtime["gpu"])
     if runtime is None:  # resume path: read the stored runtime config
@@ -1243,7 +1281,11 @@ def _gpu_required_for(root: Path, run_id: str, runtime: dict | None = None) -> b
         plan = ExecutionPlan.read(root / "runs" / run_id / PLAN_FILENAME)
         return int(plan.capabilities.get("gpu_count") or 0) > 0
     except Exception:
-        return True
+        pass
+    try:
+        return detect_capabilities().gpu_count > 0
+    except Exception:
+        return True  # detection itself failed ⇒ fail-closed (12 §13.1)
 
 
 def _do_resume(wf: WorkflowAPI, args) -> int:
@@ -2094,7 +2136,14 @@ def main(argv: list[str] | None = None, *, wf_factory=None) -> int:
             return 1 if report.blocked else 0
 
         if args.command == "preflight":
-            report = wf.preflight_run(args.run_id, gpu_required=not args.no_gpu)
+            # Plan/host-derived GPU expectation by default (same story as
+            # train/resume); --gpu/--no-gpu are explicit user overrides.
+            gpu = (
+                True
+                if args.gpu
+                else False if args.no_gpu else _gpu_required_for(wf.root, args.run_id)
+            )
+            report = wf.preflight_run(args.run_id, gpu_required=gpu)
             if args.json:
                 print(json.dumps(report.to_dict(), indent=2, sort_keys=True))
             else:
