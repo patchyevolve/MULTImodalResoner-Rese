@@ -54,6 +54,7 @@ _IMPLEMENTED = {
     "train", "resume", "pause", "stop", "watch", "hardware", "dataset",
     "prepare", "fork", "retrain", "finetune", "model",
     "evaluate", "compare", "infer", "export", "package",
+    "gui",
 }
 _PENDING = {
     "init": 1,
@@ -272,6 +273,15 @@ def _build_parser() -> argparse.ArgumentParser:
     sv = sub.add_parser("serve",
                         help="(long-running model server — no build step yet)")
     sv.add_argument("extra", nargs=argparse.REMAINDER)
+
+    # GUI (13 §9.2 control plane; build step 12): localhost web viewer
+    # over the SAME Workflow API as the CLI and the TUI (§1 rule 2).
+    gui = sub.add_parser("gui", help="localhost web dashboard (read-only "
+                         "viewer over the same Workflow API)")
+    gui.add_argument("--port", type=int, default=8765,
+                     help="localhost port (default 8765)")
+    gui.add_argument("--open", action="store_true", dest="open_browser",
+                     help="open the browser after binding")
 
     st_gc_parent = sub.add_parser("store", help="artifact store operations")
     st_gc = st_gc_parent.add_subparsers(dest="store_command").add_parser(
@@ -495,17 +505,6 @@ def _do_status(wf: WorkflowAPI, args) -> int:
     return 0
 
 
-def _pick_watch_run(wf: WorkflowAPI) -> str:
-    """`watch` without RUN: the most active run (13 §4.1 `watch [RUN]`)."""
-    runs = wf.list_runs()
-    if not runs:
-        raise NotFound("no runs to watch", hint="`mlforge train --config F` first")
-    running = [r for r in runs if r.get("state") == "RUNNING"]
-    pool = running or runs
-    best = max(pool, key=lambda r: r.get("updated_ts") or 0.0)
-    return best["id"]
-
-
 def _watch_keys(wf: WorkflowAPI, run_id: str, key: str) -> str | None:
     """Map a viewer key to a control intent (13 §9.6). Returns 'quit' for q.
     The VIEWER never transitions anything itself — it only writes intents
@@ -520,7 +519,27 @@ def _watch_keys(wf: WorkflowAPI, run_id: str, key: str) -> str | None:
 
 
 def _do_watch(wf: WorkflowAPI, args) -> int:
-    run_id = args.run_id or _pick_watch_run(wf)
+    if args.run_id:
+        return _watch_run(wf, args, args.run_id)
+    # `mlforge watch` without RUN = the Live dashboard (13 §4.1), a
+    # multi-screen viewer over the same Workflow API (build step 12).
+    if args.json:
+        from mlforge.ui.viewmodel import dashboard_model
+
+        model = dashboard_model(wf)
+        if not model["runs"]:
+            raise NotFound(
+                "no runs to watch", hint="`mlforge train --config F` first"
+            )
+        print(json.dumps(model, indent=2, sort_keys=True, default=str))
+        return 0
+    from mlforge.ui.app import run_dashboard
+
+    return run_dashboard(wf, interval=args.interval)
+
+
+def _watch_run(wf: WorkflowAPI, args, run_id: str) -> int:
+    """`watch RUN` — the §9.6 single-run frame (unchanged since step 7)."""
     detail = status_layer.collect_run(wf.root, run_id)  # NotFound ⇒ exit 2
     if args.json:
         print(json.dumps(detail, indent=2, sort_keys=True, default=str))
@@ -1581,6 +1600,27 @@ def _do_package(wf: WorkflowAPI, args) -> int:
     return 0
 
 
+def _do_gui(wf: WorkflowAPI, args) -> int:
+    """`mlforge gui` — the localhost web viewer (13 §9.2 control plane).
+    Same Workflow API as CLI/TUI (§1 rule 2); pages are observations and
+    buttons write control intents only. Killing this process changes
+    nothing about any run (§9.1 STATUS DOWN → TRAINING CONTINUES)."""
+    from mlforge.ui.web import serve
+
+    if not (0 <= args.port <= 65535):
+        raise ValidationBlock(
+            f"invalid --port: {args.port}",
+            hint="valid TCP ports are 1-65535 (0 = ephemeral, for tests)",
+        )
+    try:
+        return serve(wf, port=args.port, open_browser=args.open_browser)
+    except OSError as exc:
+        raise PreconditionFailed(
+            f"cannot bind 127.0.0.1:{args.port}: {exc.strerror or exc}",
+            hint="pick another --port (the GUI binds localhost only)",
+        ) from exc
+
+
 def main(argv: list[str] | None = None, *, wf_factory=None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
@@ -1642,6 +1682,8 @@ def main(argv: list[str] | None = None, *, wf_factory=None) -> int:
             return _do_export(wf, args)
         if args.command == "package":
             return _do_package(wf, args)
+        if args.command == "gui":
+            return _do_gui(wf, args)
         if args.command == "status":
             return _do_status(wf, args)
 

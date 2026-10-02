@@ -121,7 +121,16 @@ mlforge/
     `model import` (declared identity, hashed weights, duplicate `name:vN`
     BLOCKs, origin `import`), `validate <RUN|MODEL>`, `serve` honest
     exit 4 (no build step yet)
-12. ⛔ TUI/GUI over the same Workflow API
+12. ✅ TUI/GUI over the same Workflow API — `watch` without RUN is the
+    multi-screen Live dashboard (overview → run §9.6 frame → events
+    §9.7 feed → help; j/k/Enter/e/b/p/s/c/q keys), `watch RUN` keeps the
+    single-run frame, `--json` returns the dashboard model; shared
+    read-only view model (`mlforge.ui.viewmodel`) feeds both UIs; pure
+    `handle_key` state machine + pure `route()` make the whole layer
+    testable without a TTY or a socket; `gui` = localhost (127.0.0.1)
+    stdlib web dashboard with the §9.6 frame, events, and pause/stop/
+    checkpoint INTENT buttons (`requested_by=cli:gui`), 404/400 fail
+    closed; every viewer is disposable — closing it never touches a run
 
 ## Invariants already enforced in code
 
@@ -237,6 +246,18 @@ mlforge/
   runtime retargeted (13 §6.9, 12 §15.3).
 * **Secrets never enter artifacts** — export and package scan the model,
   run, and contract sources; any finding BLOCKs (12 §16, 13 §7).
+* **Every UI is a disposable viewer over ONE Workflow API** — CLI, TUI,
+  and GUI share `mlforge.ui.viewmodel` reads and write control INTENTS
+  through the same channel (`requested_by` is the only difference);
+  no screen, page, or key ever transitions a run (13 §1 rules 2–3).
+* **STATUS DOWN → TRAINING CONTINUES** — closing the dashboard, killing
+  `gui`, or dropping the terminal changes nothing about any run; a run
+  that vanishes under the viewer's cursor drops back to the overview
+  with a notice, reconstructed from persistence (13 §9.1, §9.9).
+* **The GUI binds localhost only and fails closed** — unknown run ⇒ 404,
+  unknown/mis-scoped action ⇒ 400/405, bad `--port` ⇒ exit 1, port in
+  use ⇒ exit 3; pages HTML-escape everything (13 §9.2 local control
+  plane, no remote surface in v1).
 * **Run completion publishes its model** — `COMPLETED` ⇒ registry
   entry CREATED → VALIDATED → AVAILABLE with provenance (`name:vN`,
   run, spec hash, artifact = newest COMMIT marker or null) and a
