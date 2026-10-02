@@ -7,17 +7,31 @@ Run/model/evaluation/command ids are prefixed, time-sortable, and unique
 
 Format: <prefix>_<ULID> — 48-bit millisecond timestamp + 80 bits of
 randomness, Crockford base32 (26 chars, lexicographically sortable).
+
+Monotonic within a process: ids generated in the same millisecond
+increment the random field instead of redrawing it (ULID "monotonic
+mode"). Without this, two runs created in the same millisecond would
+sort by luck — and "the latest run of model X" (retrain's source, 13
+§6.3) would be a coin flip. Cross-process ordering within one
+millisecond remains timestamp-only (ms resolution); callers needing
+exact recency should compare journal `ts` events.
 """
 
 from __future__ import annotations
 
 import os
 import secrets
+import threading
 import time
 
 _ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"  # Crockford base32 (no I, L, O, U)
 _TIME_LEN = 10
 _RAND_LEN = 16
+_RAND_MAX = (1 << (_RAND_LEN * 5)) - 1  # 80 bits, one per base32 char
+
+_lock = threading.Lock()
+_last_ms = -1
+_last_rand = 0
 
 
 def _b32(value: int, length: int) -> str:
@@ -29,9 +43,19 @@ def _b32(value: int, length: int) -> str:
 
 
 def new_ulid() -> str:
-    ms = int(time.time() * 1000)
-    rand = secrets.randbits(80)
-    return _b32(ms, _TIME_LEN) + _b32(rand, _RAND_LEN)
+    global _last_ms, _last_rand
+    with _lock:
+        ms = int(time.time() * 1000)
+        if ms > _last_ms:
+            _last_ms, _last_rand = ms, secrets.randbits(_RAND_LEN * 5)
+        else:
+            # same millisecond (or clock stepped back): increment —
+            # strictly increasing, still random-based across restarts
+            _last_rand += 1
+            if _last_rand > _RAND_MAX:
+                _last_ms += 1
+                _last_rand = 0
+        return _b32(_last_ms, _TIME_LEN) + _b32(_last_rand, _RAND_LEN)
 
 
 def new_run_id() -> str:

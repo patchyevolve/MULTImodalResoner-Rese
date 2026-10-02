@@ -51,13 +51,11 @@ from mlforge.workflow import WorkflowAPI
 _IMPLEMENTED = {
     "status", "inspect", "events", "store", "validate", "preflight", "lease",
     "train", "resume", "pause", "stop", "watch", "hardware", "dataset",
-    "prepare",
+    "prepare", "fork", "retrain", "finetune", "model",
 }
 _PENDING = {
     "init": 1,
     "configure": 1,
-    "retrain": 10,
-    "finetune": 10,
     "evaluate": 11,
     "compare": 11,
     "infer": 11,
@@ -174,6 +172,58 @@ def _build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--timeout", type=float, default=15.0)
     sp.add_argument("--json", action="store_true")
 
+    # fork / retrain / finetune (13 §6.3/§6.4, build step 10): all three
+    # create a NEW run — semantic identity is frozen (12 §4 hard rule).
+    def _add_flow_flags(sp_: argparse.ArgumentParser) -> None:
+        sp_.add_argument("--set", dest="overrides", action="append",
+                         default=[], metavar="KEY=VALUE",
+                         help="semantic override (repeatable; JSON values, "
+                              "e.g. --set lr=2e-4 --set 'epochs=10')")
+        sp_.add_argument("--dataset", default=None,
+                         help="replace the training dataset (fork/retrain/"
+                              "finetune → new experiment identity)")
+        sp_.add_argument("--config", default=None,
+                         help='partial config: {"semantic": {...}, '
+                              '"runtime": {...}} (base; --set wins)')
+        sp_.add_argument("--command-id", default=None,
+                         help="dedupe key: a retry returns the original run id (§4.4)")
+        sp_.add_argument("--yes", action="store_true",
+                         help="skip the SHOW DELTA confirmation")
+        sp_.add_argument("--attach", action="store_true",
+                         help="tail events until the run reaches a terminal state")
+        sp_.add_argument("--json", action="store_true")
+
+    fk = sub.add_parser("fork", help="semantic change → NEW run, parent "
+                        "recorded (12 §4: never reconfigure in place)")
+    fk.add_argument("run_id", help="parent run to fork from")
+    _add_flow_flags(fk)
+
+    rt = sub.add_parser("retrain", help="repeat the latest run of MODEL "
+                        "with fresh init (13 §6.3)")
+    rt.add_argument("model", help="model name (e.g. rf_detr_s)")
+    _add_flow_flags(rt)
+
+    ft = sub.add_parser("finetune", help="init from model://name:vN "
+                        "weights → NEW run + NEW model (13 §6.4)")
+    ft.add_argument("model", help="base model ref: name | name:vN | "
+                    "model://name:vN")
+    ft.add_argument("--strategy", default=None,
+                    choices=["full", "freeze_backbone", "freeze_encoder",
+                             "lora", "adapter", "custom"],
+                    help="fine-tuning strategy (default: config's "
+                         "finetune_strategy, else full)")
+    _add_flow_flags(ft)
+
+    md = sub.add_parser("model", help="model registry (13 §4.1)")
+    md_sub = md.add_subparsers(dest="model_command", required=True)
+    md_list = md_sub.add_parser("list", help="all registered models")
+    md_list.add_argument("--json", action="store_true")
+    md_ins = md_sub.add_parser("inspect", help="model detail + lineage")
+    md_ins.add_argument("ref", help="name | name:vN | model://name:vN")
+    md_ins.add_argument("--json", action="store_true")
+    md_imp = md_sub.add_parser("import", help="(pending build step 11)")
+    md_imp.add_argument("path")
+
     st_gc_parent = sub.add_parser("store", help="artifact store operations")
     st_gc = st_gc_parent.add_subparsers(dest="store_command").add_parser(
         "gc",
@@ -259,6 +309,53 @@ def _load_config(path: str) -> tuple[RunSpec, dict]:
     return spec, runtime
 
 
+def _load_partial_config(path: str | None) -> tuple[dict, dict]:
+    """Partial config for fork/retrain/finetune (13 §6.4 `--config`):
+    `{"semantic": {...}, "runtime": {...}}`, both optional — semantic
+    entries are BASE overrides, `--set` applies on top (explicit wins)."""
+    if not path:
+        return {}, {}
+    p = Path(path)
+    if not p.is_file():
+        raise PreconditionFailed(f"config not found: {path}",
+                                 hint='expected JSON: {"semantic": {...}, '
+                                      '"runtime": {...}}')
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise PreconditionFailed(f"config {path} is not valid JSON: {exc}") from exc
+    if not isinstance(data, dict):
+        raise PreconditionFailed(f"config {path} must be a JSON object")
+    unknown = set(data) - {"schema_version", "semantic", "runtime"}
+    if unknown:
+        raise PreconditionFailed(
+            f"config {path} has unknown keys: {', '.join(sorted(unknown))}",
+            hint='expected {"semantic": {...}, "runtime": {...}}',
+        )
+    semantic = data.get("semantic") or {}
+    runtime = data.get("runtime") or {}
+    if not isinstance(semantic, dict) or not isinstance(runtime, dict):
+        raise PreconditionFailed(
+            f"config {path}: semantic/runtime must be JSON objects")
+    return dict(semantic), dict(runtime)
+
+
+def _print_plan_section(spec: RunSpec, runtime: dict) -> None:
+    """13 §6.1 SHOW PLAN — the feasibility solver's answer. Infeasible
+    (ValidationBlock) propagates to exit 1 BEFORE anything is created."""
+    plan = build_plan(spec, runtime=runtime)
+    print("\nExecution plan")
+    print("  " + plan.summary_line())
+    bits = [f"precision {plan.precision_effective}"]
+    if plan.precision_fallback_used:
+        bits.append(f"fallback from {plan.precision_preferred} — PORTABLE")
+    elif plan.portable_required:
+        bits.append("CPU-only — PORTABLE")
+    else:
+        bits.append("PORTABLE-capable")
+    print("  " + " · ".join(bits))
+
+
 def _print_plan(spec: RunSpec, runtime: dict) -> None:
     sem = dict(spec.semantic)
     print("MLForge Training Setup\n")
@@ -271,21 +368,15 @@ def _print_plan(spec: RunSpec, runtime: dict) -> None:
     if runtime:
         print("\nExecution (runtime overrides)")
         print("  " + " · ".join(f"{k} {v}" for k, v in runtime.items()))
-    # 13 §6.1 SHOW PLAN — the feasibility solver's answer, shown before
-    # the user confirms. Infeasible (ValidationBlock) propagates to
-    # exit 1 BEFORE anything is created — never show an unsolved plan.
-    plan = build_plan(spec, runtime=runtime)
-    print("\nExecution plan")
-    print("  " + plan.summary_line())
-    bits = [f"precision {plan.precision_effective}"]
-    if plan.precision_fallback_used:
-        bits.append(f"fallback from {plan.precision_preferred} — PORTABLE")
-    elif plan.portable_required:
-        bits.append("CPU-only — PORTABLE")
-    else:
-        bits.append("PORTABLE-capable")
-    print("  " + " · ".join(bits))
+    _print_plan_section(spec, runtime)
     print()
+
+
+def _print_changed_lines(delta: dict) -> None:
+    """SHOW DELTA (13 §6.3): every changed field, `from → to`."""
+    for key in sorted(delta):
+        change = delta[key]
+        print(f"  {key}: {change['from']} → {change['to']}")
 
 
 def _confirm(prompt: str) -> bool:
@@ -459,44 +550,38 @@ def _attach(wf: WorkflowAPI, run_id: str) -> int:
         return 0
 
 
-def _do_train(wf: WorkflowAPI, args) -> int:
-    spec, runtime = _load_config(args.config)
-    if not args.yes:
-        _print_plan(spec, runtime)
-        if not _confirm("Start training? [Y/n] "):
-            print("Cancelled — nothing was created.")
-            return 0
+def _start_pipeline(
+    wf: WorkflowAPI, args, runtime: dict, *, create: Any
+) -> dict:
+    """CREATE RUN → runtime config → VALIDATE → PREFLIGHT → LAUNCH.
 
-    def _start() -> dict:
-        h = wf.create_run(spec)
-        run_id = h.run_id
-        _write_runtime_config(run_id, wf.root, runtime)
-        # 13 §6.1: validated before anything expensive; gate BLOCK →
-        # FAILED[FORK_ONLY] (failure matrix "VALIDATING → READY").
-        report = wf.validate_run(run_id)
-        if report.blocked:
-            if not args.json:
-                print(report.render())
-            return {"status": "blocked", "run_id": run_id,
-                    "failed_step": report.failed_step, "exit": 1}
-        pre = wf.preflight_run(run_id, gpu_required=bool(runtime.get("gpu", True)))
-        if pre.blocked:
-            if not args.json:
-                print(pre.render())
-            f = pre.first_failure
-            wf.preflight_fail(
-                run_id, f"preflight: {f.label}: {f.detail}", pre.to_dict()
-            )
-            return {"status": "preflight_blocked", "run_id": run_id, "exit": 1}
-        return {"status": "started", "run_id": run_id,
-                **_launch(wf, run_id), "exit": 0}
+    Shared by train/fork/retrain/finetune (13 §6.1): gate BLOCK → run
+    FAILED[FORK_ONLY] exit 1, preflight BLOCK → exit 1, else queue the
+    supervisor spawn — the CLI never becomes the training process."""
+    run_id = create()
+    _write_runtime_config(run_id, wf.root, runtime)
+    # 13 §6.1: validated before anything expensive; gate BLOCK →
+    # FAILED[FORK_ONLY] (failure matrix "VALIDATING → READY").
+    report = wf.validate_run(run_id)
+    if report.blocked:
+        if not args.json:
+            print(report.render())
+        return {"status": "blocked", "run_id": run_id,
+                "failed_step": report.failed_step, "exit": 1}
+    pre = wf.preflight_run(run_id, gpu_required=bool(runtime.get("gpu", True)))
+    if pre.blocked:
+        if not args.json:
+            print(pre.render())
+        f = pre.first_failure
+        wf.preflight_fail(
+            run_id, f"preflight: {f.label}: {f.detail}", pre.to_dict()
+        )
+        return {"status": "preflight_blocked", "run_id": run_id, "exit": 1}
+    return {"status": "started", "run_id": run_id,
+            **_launch(wf, run_id), "exit": 0}
 
-    result = (
-        wf.execute_idempotent(args.command_id, "train", _start,
-                              run_id=lambda r: (r or {}).get("run_id")
-                              if isinstance(r, dict) else None)
-        if args.command_id else _start()
-    )
+
+def _finish_start(wf: WorkflowAPI, args, result: dict) -> int:
     run_id = result.get("run_id")
     if args.json:
         print(json.dumps(result, indent=2, sort_keys=True))
@@ -507,6 +592,220 @@ def _do_train(wf: WorkflowAPI, args) -> int:
     if result["status"] == "started" and args.attach:
         return _attach(wf, run_id)
     return int(result["exit"])
+
+
+def _execute_new_run(
+    wf: WorkflowAPI, args, *, command: str, plan: Any, runtime: dict
+) -> int:
+    """SHOW DELTA → confirm → CREATE (once, via --command-id) → pipeline."""
+
+    def _start() -> dict:
+        return _start_pipeline(
+            wf, args, runtime,
+            create=lambda: wf.create_from_plan(plan).run_id,
+        )
+
+    result = (
+        # A retry re-previews with a FRESH plan.run_id — the dedupe event
+        # must land on the ORIGINAL run, so derive it from the stored
+        # result (same rule as `train`, 13 §4.4).
+        wf.execute_idempotent(args.command_id, command, _start,
+                              run_id=lambda r: (r or {}).get("run_id")
+                              if isinstance(r, dict) else None)
+        if args.command_id else _start()
+    )
+    return _finish_start(wf, args, result)
+
+
+def _do_train(wf: WorkflowAPI, args) -> int:
+    spec, runtime = _load_config(args.config)
+    if not args.yes:
+        _print_plan(spec, runtime)
+        if not _confirm("Start training? [Y/n] "):
+            print("Cancelled — nothing was created.")
+            return 0
+
+    def _start() -> dict:
+        return _start_pipeline(
+            wf, args, runtime, create=lambda: wf.create_run(spec).run_id
+        )
+
+    result = (
+        wf.execute_idempotent(args.command_id, "train", _start,
+                              run_id=lambda r: (r or {}).get("run_id")
+                              if isinstance(r, dict) else None)
+        if args.command_id else _start()
+    )
+    return _finish_start(wf, args, result)
+
+
+# ---------------------------------------------------------------------------
+# fork / retrain / finetune (13 §6.3/§6.4, build step 10)
+# ---------------------------------------------------------------------------
+
+
+def _merged_overrides(config_semantic: dict, pairs: list[str]) -> dict | list:
+    """`--config` semantic is the BASE, `--set` applies on top (explicit
+    wins). Returns a Mapping when config is present, else the raw pairs
+    (workflow parses `KEY=VALUE` fail-closed)."""
+    if not config_semantic:
+        return pairs or None
+    from mlforge.lineage import parse_overrides
+
+    return {**config_semantic, **parse_overrides(pairs)}
+
+
+def _do_fork(wf: WorkflowAPI, args) -> int:
+    """Semantic change → NEW run with parent set (12 §4 hard rule:
+    `mlforge fork`, never `--reconfigure`). Parent never mutates."""
+    config_sem, runtime = _load_partial_config(args.config)
+    plan = wf.preview_fork(
+        args.run_id, overrides=_merged_overrides(config_sem, args.overrides),
+        dataset=args.dataset,
+    )
+    if not args.yes:
+        print(f"Forking {args.run_id}\n")
+        print("This will create a NEW training run "
+              "(semantic change = new experiment).\n")
+        print(f"Previous run:  {plan.source_run_id}")
+        print(f"New run:       {plan.run_id}")
+        print("\nChanged:")
+        _print_changed_lines(plan.delta)
+        _print_plan_section(plan.spec, runtime)
+        print()
+        if not _confirm("Create new run? [Y/n] "):
+            print("Cancelled — nothing was created.")
+            return 0
+    return _execute_new_run(wf, args, command="fork", plan=plan,
+                            runtime=runtime)
+
+
+def _do_retrain(wf: WorkflowAPI, args) -> int:
+    """13 §6.3: load previous run_spec → SHOW DELTA → confirm → new run
+    (fresh init, parent set)."""
+    config_sem, runtime = _load_partial_config(args.config)
+    plan = wf.preview_retrain(
+        args.model, overrides=_merged_overrides(config_sem, args.overrides),
+        dataset=args.dataset,
+    )
+    if not args.yes:
+        print(f"Retraining {args.model}\n")
+        print("This will create a NEW training run.\n")
+        print(f"Previous run:  {plan.source_run_id}")
+        print(f"New run:       {plan.run_id}")
+        print(f"Starting state: {plan.starting_state}")
+        datasets = plan.delta.get("train_datasets")
+        if datasets:
+            print(f"Dataset changed: {', '.join(datasets['from'])} → "
+                  f"{', '.join(datasets['to'])}")
+            print("\nThis is a new experiment.")
+        else:
+            print(f"Dataset:        {', '.join(plan.spec.train_datasets)}")
+            print("Everything else: same as previous configuration")
+        other = {k: v for k, v in plan.delta.items() if k != "train_datasets"}
+        if other:
+            print("\nChanged:")
+            _print_changed_lines(other)
+        _print_plan_section(plan.spec, runtime)
+        print()
+        if not _confirm("Create new run? [Y/n] "):
+            print("Cancelled — nothing was created.")
+            return 0
+    return _execute_new_run(wf, args, command="retrain", plan=plan,
+                            runtime=runtime)
+
+
+def _do_finetune(wf: WorkflowAPI, args) -> int:
+    """13 §6.4: resolve base model + hash → strategy → SHOW → confirm →
+    NEW run (parent=model); base model is NEVER modified."""
+    config_sem, runtime = _load_partial_config(args.config)
+    plan = wf.preview_finetune(
+        args.model,
+        strategy=args.strategy,
+        overrides=_merged_overrides(config_sem, args.overrides),
+        dataset=args.dataset,
+    )
+    if not args.yes:
+        print(f"Fine-tuning {plan.base_model}\n")
+        print("This will create a NEW run + NEW model.\n")
+        for warning in plan.warnings:
+            print(f"  ! {warning}")
+        print(f"\nBase model:    {plan.base_model}")
+        checkpoint = plan.lineage.get("parent_checkpoint")
+        if checkpoint:
+            print(f"Base weights:  {checkpoint}")
+        print(f"Base run:      {plan.source_run_id}")
+        print(f"New run:       {plan.run_id}")
+        print(f"Strategy:      {plan.spec.semantic['finetune_strategy']}")
+        print(f"Dataset:       {', '.join(plan.spec.train_datasets)}")
+        other = {k: v for k, v in plan.delta.items()
+                 if k != "finetune_strategy"}
+        if other:
+            print("\nChanged:")
+            _print_changed_lines(other)
+        _print_plan_section(plan.spec, runtime)
+        print()
+        if not _confirm("Create new run? [Y/n] "):
+            print("Cancelled — nothing was created.")
+            return 0
+    return _execute_new_run(wf, args, command="finetune", plan=plan,
+                            runtime=runtime)
+
+
+def _do_model(wf: WorkflowAPI, args) -> int:
+    """`model list` / `model inspect` (+ lineage) — read-only registry
+    surfaces (13 §4.1). `model import` arrives with build step 11."""
+    if args.model_command == "import":
+        print("[NOT_IMPLEMENTED] `mlforge model import` arrives in build "
+              "step 11 (13 §11). Nothing was executed.", file=sys.stderr)
+        return 4
+    if args.model_command == "list":
+        models = wf.list_models()
+        if args.json:
+            print(json.dumps(models, indent=2, sort_keys=True))
+        elif not models:
+            print("no models — a model is published when a run COMPLETES "
+                  "(13 §5.5)")
+        else:
+            print(f"{'REF':<24} {'STATE':<24} {'RUN':<30} ARTIFACT")
+            for m in models:
+                ref = (f"{m['name']}:{m['version']}"
+                       if m.get("name") else m.get("model_id"))
+                print(f"{ref:<24} {str(m.get('state')):<24} "
+                      f"{str(m.get('run_id') or '—'):<30} "
+                      f"{m.get('artifact_hash') or '—'}")
+        return 0
+    if args.model_command == "inspect":
+        entry = wf.resolve_model(args.ref)
+        lineage = None
+        chain = None
+        if entry.get("run_id"):
+            try:
+                lineage = wf.get_lineage(entry["run_id"])
+                chain = [c["run_id"] for c in wf.lineage_chain(entry["run_id"])]
+            except NotFound:
+                lineage = None  # provenance run not in this workspace
+        out = {**entry, "lineage": lineage, "chain": chain}
+        if args.json:
+            print(json.dumps(out, indent=2, sort_keys=True, default=str))
+        else:
+            ref = (f"{entry['name']}:{entry['version']}"
+                   if entry.get("name") else entry["model_id"])
+            print(f"MODEL                   {ref}")
+            print(f"State                   {entry.get('state')}")
+            print(f"Run                     {entry.get('run_id') or '—'}")
+            print(f"Run spec                {entry.get('run_spec_hash') or '—'}")
+            print(f"Artifact                {entry.get('artifact_hash') or '—'}")
+            if lineage:
+                print("\nLineage")
+                print(f"  origin                {lineage.get('origin')}")
+                print(f"  parent run            {lineage.get('parent_run') or '—'}")
+                print(f"  parent model          {lineage.get('parent_model') or '—'}")
+                print(f"  parent checkpoint     {lineage.get('parent_checkpoint') or '—'}")
+                if chain:
+                    print(f"  run chain             {' → '.join(chain)}")
+        return 0
+    return 4
 
 
 def _resume_gpu_required(root: Path, run_id: str) -> bool:
@@ -927,6 +1226,14 @@ def main(argv: list[str] | None = None, *, wf_factory=None) -> int:
         wf = (wf_factory or WorkflowAPI)(args.root)
         if args.command == "train":
             return _do_train(wf, args)
+        if args.command == "fork":
+            return _do_fork(wf, args)
+        if args.command == "retrain":
+            return _do_retrain(wf, args)
+        if args.command == "finetune":
+            return _do_finetune(wf, args)
+        if args.command == "model":
+            return _do_model(wf, args)
         if args.command == "resume":
             return _do_resume(wf, args)
         if args.command == "pause":
@@ -947,7 +1254,27 @@ def main(argv: list[str] | None = None, *, wf_factory=None) -> int:
             return _do_hardware(wf, args)
 
         if args.command == "inspect":
-            print(json.dumps(wf.get_run_status(args.object_id), indent=2, sort_keys=True))
+            try:
+                out = dict(wf.get_run_status(args.object_id))
+            except NotFound as run_err:
+                # `inspect` also resolves model refs (13 §4.3): a ref that
+                # is not a run falls through to the registry; a genuine
+                # unknown id keeps exit 2 with the run's message.
+                try:
+                    entry = wf.resolve_model(args.object_id)
+                except NotFound:
+                    raise run_err from None
+                lineage = None
+                if entry.get("run_id"):
+                    try:
+                        lineage = wf.get_lineage(entry["run_id"])
+                    except NotFound:
+                        lineage = None
+                print(json.dumps({**entry, "lineage": lineage}, indent=2,
+                                 sort_keys=True, default=str))
+                return 0
+            out["lineage"] = wf.get_lineage(args.object_id)
+            print(json.dumps(out, indent=2, sort_keys=True))
             return 0
 
         if args.command == "events":

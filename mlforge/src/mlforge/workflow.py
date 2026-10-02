@@ -36,6 +36,7 @@ from typing import Any, Callable, Mapping
 from mlforge.commands import CommandJournal
 from mlforge.commands.idempotency import DedupDecision, execute as _execute_once
 from mlforge.errors import (
+    InvalidTransition,
     MlforgeError,
     NotFound,
     PreconditionFailed,
@@ -46,6 +47,19 @@ from mlforge.hashing import content_hash
 from mlforge.ids import new_model_id, new_run_id
 from mlforge.journal import EventJournal
 from mlforge.leases import LeaseState, RunLeaseManager
+from mlforge.lineage import (
+    FINETUNE_STRATEGIES,
+    NewRunPlan,
+    build_lineage,
+    derive_spec,
+    format_model_ref,
+    new_plan,
+    parse_model_ref,
+    parse_overrides,
+    read_lineage,
+    spec_delta,
+    write_lineage,
+)
 from mlforge.machine import (
     DATASET_MACHINE,
     MODEL_MACHINE,
@@ -90,6 +104,16 @@ _KINDS = {
     "dataset": ("datasets", DatasetState.REGISTERED.value, DATASET_MACHINE),
     "model": ("models", ModelState.CREATED.value, MODEL_MACHINE),
 }
+
+
+def _version_number(version: Any) -> int:
+    """`v3` → 3; anything else → 0 (sorts unversioned/odd first)."""
+    if isinstance(version, str) and version.startswith("v"):
+        try:
+            return int(version[1:])
+        except ValueError:
+            return 0
+    return 0
 
 
 @dataclass(frozen=True)
@@ -267,11 +291,20 @@ class WorkflowAPI:
     # RUN lifecycle (13 §5.3 / §6)
     # ------------------------------------------------------------------
 
-    def create_run(self, spec: RunSpec, run_id: str | None = None) -> RunHandle:
-        """RUN flow: create immutable run_spec, journal `run_created` (CREATED).
+    def create_run(
+        self,
+        spec: RunSpec,
+        run_id: str | None = None,
+        *,
+        lineage: Mapping[str, Any] | None = None,
+    ) -> RunHandle:
+        """RUN flow: create immutable run_spec + lineage.json, journal
+        `run_created` (CREATED).
 
         13 §6.1: CREATE RUN (immutable run_spec) — semantic identity frozen;
         the 19-step gate runs on resume/preflight, not at creation.
+        12 §5/§15.2: every run folder carries its lineage edges (train =
+        parent nulls; fork/retrain/finetune = parent set), written once.
         """
         run_id = run_id or new_run_id()
         d = self._dir("run", run_id)
@@ -279,12 +312,16 @@ class WorkflowAPI:
             raise ValidationBlock(f"run {run_id} already exists")
         d.mkdir(parents=True)
         spec.write_once(d / "run_spec.json")
+        lin = dict(lineage) if lineage else None
+        write_lineage(d, lin or {})
         self._journal("run", run_id).append(
             "run_created",
             frm=None,
             to=RunState.CREATED.value,
             action="create",
             run_spec_hash=spec.identity,
+            origin=(lin or {}).get("origin", "train"),
+            parent_run=(lin or {}).get("parent_run"),
         )
         self._write_projection("run", run_id, RunState.CREATED.value, run_spec_hash=spec.identity)
         return RunHandle(run_id, RunState.CREATED.value, spec.identity)
@@ -379,7 +416,15 @@ class WorkflowAPI:
         return self._fire("run", run_id, "checkpoint_failed", "checkpoint_failed", failure=failure)
 
     def complete(self, run_id: str) -> str:
-        return self._fire("run", run_id, "complete", "completed")
+        """RUNNING → COMPLETED, then the run produces its model (13 line
+        50 "A run produces a model", §5.5 TRAIN → RUN A → MODEL A): the
+        registry entry is published CREATED → VALIDATED → AVAILABLE with
+        provenance (name:vN, run, artifact). Recording an artifact is not
+        a lifecycle continuation — nothing about the RUN auto-transitions
+        beyond the explicit completion itself."""
+        state = self._fire("run", run_id, "complete", "completed")
+        self.publish_model_from_run(run_id)
+        return state
 
     def runtime_error(
         self,
@@ -1119,16 +1164,43 @@ class WorkflowAPI:
     # MODEL (13 §5.4)
     # ------------------------------------------------------------------
 
-    def create_model(self, *, artifact_hash: str | None = None) -> str:
+    def create_model(
+        self,
+        *,
+        artifact_hash: str | None = None,
+        name: str | None = None,
+        version: str | None = None,
+        run_id: str | None = None,
+        run_spec_hash: str | None = None,
+    ) -> str:
+        """Registry entry: the model.json sidecar carries the addressable
+        `name:vN` identity (13 §4.3) + provenance (13 §5.5: every model
+        traces to the run that produced it)."""
         model_id = new_model_id()
         d = self._dir("model", model_id)
         d.mkdir(parents=True)
+        sidecar = {
+            "schema_version": 1,
+            "model_id": model_id,
+            "name": name,
+            "version": version,
+            "artifact_hash": artifact_hash,
+            "run_id": run_id,
+            "run_spec_hash": run_spec_hash,
+            "created_ts": time.time(),
+        }
+        (d / "model.json").write_text(
+            json.dumps(sidecar, indent=2, sort_keys=True), encoding="utf-8"
+        )
         self._journal("model", model_id).append(
             "model_created",
             frm=None,
             to=ModelState.CREATED.value,
             action="create",
             artifact_hash=artifact_hash,
+            name=name,
+            version=version,
+            run_id=run_id,
         )
         self._write_projection("model", model_id, ModelState.CREATED.value)
         return model_id
@@ -1143,6 +1215,306 @@ class WorkflowAPI:
         """kind ∈ evaluation | export | deployment | finetune_base (13 §5.4)."""
         action = f"record_{kind}"
         return self._fire("model", model_id, action, f"model_{kind}_recorded")
+
+    # ------------------------------------------------------------------
+    # lineage DAG + new-run flows (build step 10; 12 §5, §15; 13 §5.5,
+    # §6.3/§6.4)
+    # ------------------------------------------------------------------
+
+    def get_lineage(self, run_id: str) -> dict[str, Any]:
+        self._require("run", run_id)
+        return read_lineage(self._dir("run", run_id))
+
+    def lineage_chain(self, run_id: str) -> list[dict[str, Any]]:
+        """Ancestors root-first, SELF included (the full path a model
+        traces back through — 12 invariant D). Cycle guard: corrupt edges
+        BLOCK rather than loop forever."""
+        chain: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        current: str | None = run_id
+        while current is not None:
+            if current in seen:
+                raise ValidationBlock(
+                    f"lineage cycle detected at {current} "
+                    f"({' → '.join(sorted(seen))})",
+                    hint="lineage edges are immutable — repair requires "
+                         "forking from a healthy run (12 §15.2)",
+                )
+            seen.add(current)
+            lin = self.get_lineage(current)
+            chain.append({"run_id": current, **lin})
+            parent = lin.get("parent_run")
+            if parent is not None and not (self._dir("run", parent)).is_dir():
+                raise ValidationBlock(
+                    f"lineage parent {parent} of {current} is missing "
+                    "from this workspace",
+                    hint="the workspace is incomplete — restore the parent "
+                         "run or fork from a healthy run",
+                )
+            current = parent
+        chain.reverse()  # root first
+        return chain
+
+    def retrain_source(self, model: str) -> tuple[str, RunSpec]:
+        """Most recent run of `model` — retrain's config source (13 §6.3
+        "load previous run_spec"). Newest by run id (ULID time-sortable)."""
+        runs_dir = self.root / "runs"
+        if runs_dir.is_dir():
+            names = sorted(
+                (p.name for p in runs_dir.iterdir() if p.is_dir()), reverse=True
+            )
+            for name in names:
+                if not (runs_dir / name / "run_spec.json").is_file():
+                    continue
+                spec = self._run_spec(name)
+                if spec.model == model:
+                    return name, spec
+        raise NotFound(
+            f"no previous run found for model {model!r}",
+            hint="retrain continues a previous configuration (13 §6.3) — "
+                 "train one first: `mlforge train --config ...`",
+        )
+
+    @staticmethod
+    def _overrides(overrides: Any) -> dict[str, Any]:
+        if overrides is None:
+            return {}
+        if isinstance(overrides, Mapping):
+            return dict(overrides)
+        return parse_overrides(overrides)  # iterable of "KEY=VALUE"
+
+    def preview_fork(
+        self,
+        run_id: str,
+        *,
+        overrides: Any = None,
+        dataset: str | None = None,
+        model: str | None = None,
+    ) -> NewRunPlan:
+        """Semantic change → a NEW run with parent set (12 §4 hard rule:
+        `mlforge fork`, never `--reconfigure`). The parent is read-only."""
+        self._require("run", run_id)  # absent → NotFound (exit 2), not a
+        # "folder incomplete" block — distinguish never-existed from broken.
+        parent = self._run_spec(run_id)
+        new = derive_spec(
+            parent,
+            semantic=self._overrides(overrides),
+            train_datasets=(dataset,) if dataset else None,
+            model=model,
+        )
+        if new.identity == parent.identity:
+            raise ValidationBlock(
+                f"fork of {run_id} would not change the experiment identity",
+                hint="nothing to fork: `resume` continues this run, "
+                     "`retrain` repeats it with fresh init (13 §5.5)",
+            )
+        lineage = build_lineage(
+            "fork", parent_run=run_id, parent_run_spec_hash=parent.identity
+        )
+        return new_plan(
+            "fork", new, lineage,
+            delta=spec_delta(parent, new), source_run_id=run_id,
+        )
+
+    def preview_retrain(
+        self,
+        model: str,
+        *,
+        overrides: Any = None,
+        dataset: str | None = None,
+    ) -> NewRunPlan:
+        """13 §6.3: same config unless changed, fresh init, parent set."""
+        src_id, src = self.retrain_source(model)
+        new = derive_spec(
+            src,
+            semantic=self._overrides(overrides),
+            train_datasets=(dataset,) if dataset else None,
+        )
+        lineage = build_lineage(
+            "retrain", parent_run=src_id, parent_run_spec_hash=src.identity
+        )
+        return new_plan(
+            "retrain", new, lineage,
+            delta=spec_delta(src, new),
+            source_run_id=src_id,
+            starting_state="pretrained base weights (fresh init)",
+        )
+
+    def resolve_model(self, ref: str) -> dict[str, Any]:
+        """`model://rf_detr_s:v2` | `rf_detr_s:v2` | `rf_detr_s` (latest)
+        → registry entry (13 §4.3 reference syntax)."""
+        name, version = parse_model_ref(ref)
+        candidates = [m for m in self.list_models() if m.get("name") == name]
+        if version is None:
+            if not candidates:
+                raise NotFound(
+                    f"model {name!r} not found",
+                    hint="models are published when a run COMPLETES "
+                         "(13 §5.5); `mlforge model list` shows what exists",
+                )
+            return max(
+                candidates, key=lambda m: _version_number(m.get("version"))
+            )
+        for m in candidates:
+            if m.get("version") == version:
+                return m
+        available = ", ".join(
+            format_model_ref(str(m["name"]), str(m["version"]))
+            for m in candidates
+        )
+        raise NotFound(
+            f"model {format_model_ref(name, version)} not found",
+            hint=f"available versions: {available}" if available
+                 else f"model {name!r} not found — `mlforge model list`",
+        )
+
+    def preview_finetune(
+        self,
+        ref: str,
+        *,
+        strategy: str | None = None,
+        overrides: Any = None,
+        dataset: str | None = None,
+    ) -> NewRunPlan:
+        """13 §6.4: init from weights of `model://name:vN` → NEW run +
+        NEW model; the base model is never modified."""
+        base_entry = self.resolve_model(ref)
+        ov = self._overrides(overrides)
+        effective = strategy if strategy is not None else ov.get(
+            "finetune_strategy", "full"
+        )
+        if effective not in FINETUNE_STRATEGIES:
+            raise ValidationBlock(
+                f"fine-tuning strategy {effective!r} is not supported",
+                hint=f"allowed: {', '.join(FINETUNE_STRATEGIES)} (13 §6.4)",
+            )
+        ov["finetune_strategy"] = effective
+        base_run = base_entry.get("run_id")
+        if not base_run:
+            raise NotFound(
+                f"model {format_model_ref(str(base_entry['name']), str(base_entry['version']))} "
+                "has no provenance run",
+                hint="fine-tune sources are produced models (13 §6.4); "
+                     "imported externals arrive with `model import` (step 11)",
+            )
+        base = self._run_spec(base_run)
+        new = derive_spec(
+            base,
+            semantic=ov,
+            train_datasets=(dataset,) if dataset else None,
+            model=str(base_entry["name"]),
+        )
+        lineage = build_lineage(
+            "finetune",
+            parent_run=base_run,
+            parent_run_spec_hash=base.identity,
+            parent_model=format_model_ref(
+                str(base_entry["name"]), str(base_entry["version"])
+            ),
+            parent_checkpoint=base_entry.get("artifact_hash"),
+        )
+        return new_plan(
+            "finetune", new, lineage,
+            delta=spec_delta(base, new),
+            source_run_id=base_run,
+            base_model=format_model_ref(
+                str(base_entry["name"]), str(base_entry["version"])
+            ),
+            base_model_id=str(base_entry["model_id"]),
+            warnings=(
+                "base model NOT modified — this creates a NEW run + NEW model",
+            ),
+        )
+
+    def create_from_plan(self, plan: NewRunPlan) -> RunHandle:
+        """Materialize a previewed plan exactly once (SHOW DELTA →
+        confirm → CREATE — 13 §6.3/§6.4)."""
+        handle = self.create_run(
+            plan.spec, plan.run_id, lineage=plan.lineage
+        )
+        if plan.kind == "finetune" and plan.base_model_id:
+            try:
+                self.record_model_event(plan.base_model_id, "finetune_base")
+            except InvalidTransition:
+                # already USED_AS_FINE_TUNE_BASE — the lineage edge in the
+                # child is the record; the state just is not re-enterable.
+                pass
+        return handle
+
+    # -- model registry (13 §5.4/§5.5, §4.3 references) -----------------
+
+    def list_models(self) -> list[dict[str, Any]]:
+        mdir = self.root / "models"
+        if not mdir.is_dir():
+            return []
+        out: list[dict[str, Any]] = []
+        for d in sorted(mdir.iterdir()):
+            p = d / "model.json"
+            if not p.is_file():
+                continue
+            try:
+                data = json.loads(p.read_text(encoding="utf-8"))
+            except json.JSONDecodeError as exc:
+                raise ValidationBlock(f"model sidecar unreadable: {p}: {exc}")
+            if not isinstance(data, dict):
+                raise ValidationBlock(f"model sidecar must be an object: {p}")
+            data = dict(data)
+            data["state"] = self._load_projection(
+                "model", d.name
+            ).get("state")
+            out.append(data)
+        out.sort(
+            key=lambda m: (
+                str(m.get("name") or ""), _version_number(m.get("version")),
+                str(m.get("model_id") or ""),
+            )
+        )
+        return out
+
+    def publish_model_from_run(self, run_id: str) -> str:
+        """The run produces its model on completion (13 §5.5): version
+        bumps per name (`rf_detr_s:v1`, `:v2`, ...), artifact = newest
+        COMMITTED checkpoint's manifest hash (or null — weights alone are
+        not the model, 12 §15.3)."""
+        self._require("run", run_id)
+        spec = self._run_spec(run_id)
+        name = spec.model
+        version = f"v{self._next_version(name)}"
+        model_id = self.create_model(
+            artifact_hash=self._newest_checkpoint_hash(run_id),
+            name=name,
+            version=version,
+            run_id=run_id,
+            run_spec_hash=spec.identity,
+        )
+        self.validate_model(model_id)
+        self.publish_model(model_id)
+        return model_id
+
+    def _next_version(self, name: str) -> int:
+        versions = [
+            _version_number(m.get("version"))
+            for m in self.list_models()
+            if m.get("name") == name
+        ]
+        return (max(versions) if versions else 0) + 1
+
+    def _newest_checkpoint_hash(self, run_id: str) -> str | None:
+        ckpt_dir = self._dir("run", run_id) / "checkpoints"
+        if not ckpt_dir.is_dir():
+            return None
+        dirs = sorted(
+            (p for p in ckpt_dir.iterdir()
+             if p.is_dir() and p.name.startswith("ckpt-")),
+            reverse=True,
+        )
+        for d in dirs:  # COMMIT marker = the manifest hash (12 §11.1)
+            marker = d / "COMMIT"
+            if marker.is_file():
+                digest = marker.read_text(encoding="utf-8").strip()
+                if digest:
+                    return digest
+        return None
 
     # ------------------------------------------------------------------
     # introspection

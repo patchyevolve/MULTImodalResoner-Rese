@@ -28,8 +28,9 @@ mlforge/
 │   ├── states.py             # lifecycle states + FAILED disposition ✅
 │   ├── machine.py            # 4 transition tables (13 §5)        ✅
 │   ├── run_spec.py           # immutable semantic identity        ✅
+│   ├── lineage.py            # lineage DAG + fork/retrain/finetune plans ✅
 │   ├── workflow.py           # Workflow API facade (13 §1)        ✅
-│   ├── cli/                  # status/inspect/events/store/validate/preflight/lease/train/resume/pause/stop/watch/hardware/dataset/prepare ✅
+│   ├── cli/                  # status/inspect/events/store/validate/preflight/lease/train/resume/pause/stop/watch/hardware/dataset/prepare/fork/retrain/finetune/model ✅
 │   ├── yamlmini.py           # strict YAML subset (fail-closed)   ✅
 │   ├── ingest/               # identity, paths, DAG, transforms, prepare ✅
 │   ├── store/                # CAS + registry + GC                ✅
@@ -89,7 +90,21 @@ mlforge/
    execution segments (`segments/segment_<NNNN>.json` — hardware
    context recorded by the worker only AFTER preflight passes,
    12 §12.2), and `SHOW PLAN` in `train` before confirmation (13 §6.1)
-10. ⛔ Resume/retrain/finetune flows + lineage DAG
+10. ✅ Resume/retrain/finetune flows + lineage DAG — `lineage.json`
+    written once per run (train = null parents; fork/retrain/finetune =
+    parent set; immutable edges, cycle/missing-parent guards), `fork`
+    (semantic change → NEW run, parent's spec never mutates; no-change
+    fork BLOCKs), `retrain` (sources the LATEST run of that model,
+    fresh init, SHOW DELTA → confirm), `finetune` (resolve
+    `model://name:vN` → base weights recorded in lineage, strategy
+    menu, NEW run + NEW model, base → `USED_AS_FINE_TUNE_BASE` and
+    never mutated), completion publishes the model (`name:vN`,
+    provenance, artifact = newest COMMIT marker) with per-name version
+    bumps, `model list|inspect` (+ lineage chain) and `model import`
+    pending exit 4, allowlisted `--set`/`--config` overrides (typo ⇒
+    BLOCK), `--command-id` dedupe, `inspect <run>` carries lineage,
+    monotonic ULIDs (same-ms ids sort by creation — retrain source is
+    deterministic)
 11. ⛔ Evaluate/compare/infer/export/package
 12. ⛔ TUI/GUI over the same Workflow API
 
@@ -175,6 +190,26 @@ mlforge/
   another machine / fork with a different global_batch / cancel"
   (13 §7), never a silent shrink of the batch; execution segments are
   created only after preflight passes, one per start (12 §12.2).
+* **lineage.json is written once and never rewritten** — edges are
+  immutable after run creation; a differing rewrite BLOCKs, a child run
+  gets its own file (12 §15.2). The chain walks root-first with cycle
+  and missing-parent guards.
+* **Semantic change = NEW run with a parent** — `fork`/`retrain`/
+  `finetune` all create runs; the parent's `run_spec.json` is never
+  touched (frozen identity), and a fork that changes nothing BLOCKs
+  (resume continues, retrain repeats — 12 §4, 13 §6.3).
+* **Run completion publishes its model** — `COMPLETED` ⇒ registry
+  entry CREATED → VALIDATED → AVAILABLE with provenance (`name:vN`,
+  run, spec hash, artifact = newest COMMIT marker or null) and a
+  per-name version bump; weights alone are not the model (13 §5.5,
+  12 §15.3).
+* **Fine-tuning never mutates the base** — NEW run + NEW model; the
+  base only records `USED_AS_FINE_TUNE_BASE` (state, not data), and its
+  edges live in the CHILD's lineage (13 §6.4).
+* **Override keys are allowlisted** — `--set`/`--config` semantic keys
+  accept only identity fields (plus `lr`/`batch`/`precision` aliases);
+  a typo BLOCKs before anything exists, never a silent different
+  experiment (12 §13.3).
 
 ## Develop
 
