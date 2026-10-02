@@ -138,6 +138,58 @@ def test_worker_duplicate_spawn_stands_down(tmp_path):
     assert RunLeaseManager(tmp_path).status(run_id).state == LeaseState.HELD
 
 
+# -- no silent scaffold (correction: never fake training) -------------------
+
+def test_resolve_trainer_fails_closed_without_opt_in(monkeypatch):
+    from mlforge.runtime.trainer import resolve_trainer
+
+    monkeypatch.delenv("MLFORGE_HARNESS", raising=False)
+    with pytest.raises(PreconditionFailed) as exc:
+        resolve_trainer({})
+    out = exc.value.render()
+    assert "no real trainer integrated" in out
+    assert "harness-scaffold" in out            # hint names the only opt-in
+    # explicit PER-RUN opt-in works without the env (auditable runtime.json)
+    assert isinstance(resolve_trainer({"trainer": "harness-scaffold"}),
+                      ScaffoldTrainer)
+    # session-wide opt-in (system tests)
+    monkeypatch.setenv("MLFORGE_HARNESS", "1")
+    assert isinstance(resolve_trainer({}), ScaffoldTrainer)
+    # an explicit unknown id never falls back to anything
+    with pytest.raises(PreconditionFailed) as exc2:
+        resolve_trainer({"trainer": "torch"})
+    assert "unknown trainer" in str(exc2.value)
+
+
+def test_worker_without_trainer_refuses_leaving_run_ready(tmp_path, monkeypatch):
+    """No real trainer + no opt-in ⇒ exit 3 BEFORE READY → RUNNING: the
+    run stays READY (untouched, lease released), no metrics, no fake loss."""
+    monkeypatch.delenv("MLFORGE_HARNESS", raising=False)
+    wf, run_id, token = make_ready(tmp_path)
+    code = _worker(tmp_path, run_id, token, None).run()
+    assert code == 3
+    assert wf.get_run_state(run_id) == RunState.READY.value  # never dirtied
+    assert RunLeaseManager(tmp_path).status(run_id).state == LeaseState.FREE
+    assert not (tmp_path / "runs" / run_id / "metrics" / "metrics.jsonl").exists()
+    events = [e["event"] for e in wf.get_run_events(run_id)]
+    assert "preflight_passed" not in events     # transition never fired
+    assert "completed" not in events
+
+
+def test_worker_harness_opt_in_still_runs(tmp_path, monkeypatch):
+    """The explicit per-run opt-in keeps the system harness usable."""
+    monkeypatch.delenv("MLFORGE_HARNESS", raising=False)
+    wf, run_id, token = make_ready(
+        tmp_path, runtime={"trainer": "harness-scaffold"}
+    )
+    code = _worker(tmp_path, run_id, token, None, checkpoint_interval=2).run()
+    assert code == 0
+    assert wf.get_run_state(run_id) == RunState.COMPLETED.value
+    lines = (tmp_path / "runs" / run_id / "metrics" /
+             "metrics.jsonl").read_text().splitlines()
+    assert len(lines) > 0  # harness ran — loudly labeled, never silent
+
+
 # -- pause / stop via control intents (13 §1: explicit only) ---------------
 
 def _run_in_thread(worker: Worker):

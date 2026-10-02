@@ -113,6 +113,22 @@ def test_train_fails_closed_without_providers(tmp_path, capsys, no_supervisor):
     assert not list((tmp_path / "state" / "pending").glob("*.json"))  # no spawn
 
 
+def test_train_refuses_without_real_trainer(tmp_path, capsys, no_supervisor,
+                                            monkeypatch):
+    """Production default (no harness opt-in): nothing is created at all —
+    exit 3 BEFORE any run/queue exists. No fake start, no fake loss."""
+    monkeypatch.delenv("MLFORGE_HARNESS", raising=False)
+    cfg = _write_config(tmp_path)
+    code = main(["--root", str(tmp_path), "train", "--config", cfg, "--yes"])
+    assert code == 3
+    err = capsys.readouterr().err
+    assert "no real trainer integrated" in err
+    assert "harness-scaffold" in err            # hint names the only opt-in
+    assert not (tmp_path / "runs").exists() or not list(
+        (tmp_path / "runs").iterdir())
+    assert not (tmp_path / "state" / "pending").exists()
+
+
 def test_train_queues_supervisor_spawn(tmp_path, capsys, no_supervisor):
     cfg = _write_config(tmp_path, runtime={"max_steps": 7, "checkpoint_interval": 3})
     code = main(["--root", str(tmp_path), "train", "--config", cfg, "--yes", "--json"],

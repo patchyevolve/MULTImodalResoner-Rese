@@ -39,7 +39,7 @@ from mlforge.planner import PLAN_FILENAME, ExecutionPlan, detect_capabilities
 from mlforge.runtime.checkpoints import REQUIRED_COMPONENTS, CheckpointStore
 from mlforge.runtime.control import clear_control, read_control
 from mlforge.runtime.heartbeat import DEFAULT_HEARTBEAT_INTERVAL, HeartbeatWriter
-from mlforge.runtime.trainer import ScaffoldTrainer, TrainState, Trainer
+from mlforge.runtime.trainer import TrainState, Trainer, resolve_trainer
 from mlforge.states import RunState
 from mlforge.workflow import WorkflowAPI
 
@@ -163,6 +163,22 @@ class Worker:
                 # created only once the run actually starts).
                 caps = detect_capabilities()
                 plan = self._load_plan()
+                # 3. Restore point: newest-valid predicate decides (§11.2)
+                #    — NEVER "start from step 0" when a valid checkpoint exists.
+                selection = store.newest_valid()
+                start_step = 0
+                start_epoch = 0
+                if selection.selected is not None and selection.selected.manifest:
+                    start_step = int(selection.selected.manifest.get("global_step", 0) or 0)
+                    start_epoch = int(selection.selected.manifest.get("epoch", 0) or 0)
+                # 3a. Trainer BEFORE READY → RUNNING: resolved fail-closed
+                #     (no silent scaffold default) — a refusal leaves the
+                #     run READY and untouched, never a faked or dirtied run.
+                trainer = self.trainer or resolve_trainer(
+                    self._runtime_config(),
+                    start_step=start_step,
+                    start_epoch=start_epoch,
+                )
                 wf.preflight_pass(self.run_id)  # READY → RUNNING (runtime's step)
                 wf.create_execution_segment(
                     self.run_id, capabilities=caps, plan=plan
@@ -184,20 +200,6 @@ class Worker:
                     "(expected READY — train/resume must validate first)"
                 )
 
-            # 3. Restore point: newest-valid predicate decides (§11.2) —
-            #    NEVER "start from step 0" when a valid checkpoint exists.
-            selection = store.newest_valid()
-            start_step = 0
-            start_epoch = 0
-            if selection.selected is not None and selection.selected.manifest:
-                start_step = int(selection.selected.manifest.get("global_step", 0) or 0)
-                start_epoch = int(selection.selected.manifest.get("epoch", 0) or 0)
-            trainer = self.trainer or ScaffoldTrainer(
-                max_steps=int(self._runtime_config().get("max_steps", 20)),
-                steps_per_epoch=int(self._runtime_config().get("steps_per_epoch", 10)),
-                start_step=start_step,
-                start_epoch=start_epoch,
-            )
             tstate = TrainState(start_step, start_epoch, selection.resume_point)
 
             # 4. First heartbeat (lease renewed with it), then the loop.

@@ -6,6 +6,15 @@ from mlforge.run_spec import RunSpec
 from mlforge.workflow import WorkflowAPI
 
 
+@pytest.fixture(autouse=True)
+def _harness_opt_in(monkeypatch):
+    """System tests may run the labeled scaffold harness (fake loss).
+    Production defaults to FAIL-CLOSED: no real trainer integrated ⇒
+    train/launch/worker refuse (see mlforge.runtime.trainer). Tests that
+    assert that refusal must `monkeypatch.delenv(MLFORGE_HARNESS)`."""
+    monkeypatch.setenv("MLFORGE_HARNESS", "1")
+
+
 @pytest.fixture
 def wf(tmp_path) -> WorkflowAPI:
     return WorkflowAPI(tmp_path / "workspace")

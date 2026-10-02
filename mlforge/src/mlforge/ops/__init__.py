@@ -3,8 +3,11 @@ model import (build step 11; 13 §11, §6.7–§6.10, 12 §15.3–§15.4).
 
 All five are pluggable-harness surfaces: the identity, contract,
 comparability, and fail-closed machinery is real; the measurement /
-execution / format-binary engines are deterministic scaffolds that
-replace wholesale at integration (the `ScaffoldTrainer` pattern).
+execution / format-binary engines are deterministic scaffolds labeled
+`harness: scaffold` in every output. Like `ScaffoldTrainer`, they are
+harness code — never deliverables (the trainer's fail-closed default in
+`mlforge.runtime.trainer` is the rule, not the exception) — and they
+replace wholesale at integration.
 """
 
 from mlforge.ops.bundle import (

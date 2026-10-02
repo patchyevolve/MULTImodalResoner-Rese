@@ -28,7 +28,17 @@ from mlforge.runtime.control import (
 )
 from mlforge.runtime.heartbeat import DEFAULT_HEARTBEAT_INTERVAL, HeartbeatWriter
 from mlforge.runtime.reconcile import ReconcileReport, scan_checkpoints
-from mlforge.runtime.trainer import ScaffoldTrainer, StepResult, TrainState, Trainer
+from mlforge.runtime.trainer import (
+    HARNESS_ENV,
+    HARNESS_TRAINER,
+    ScaffoldTrainer,
+    StepResult,
+    TrainState,
+    Trainer,
+    harness_allowed,
+    require_trainable,
+    resolve_trainer,
+)
 
 __all__ = [
     "CheckpointStore",
@@ -47,4 +57,9 @@ __all__ = [
     "ScaffoldTrainer",
     "TrainState",
     "StepResult",
+    "HARNESS_TRAINER",
+    "HARNESS_ENV",
+    "harness_allowed",
+    "require_trainable",
+    "resolve_trainer",
 ]

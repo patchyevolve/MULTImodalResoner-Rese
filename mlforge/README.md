@@ -119,7 +119,7 @@ mlforge/
 │   ├── leases/               # run lease + gate providers 15–16   ✅
 │   ├── commands/             # idempotency journal                ✅
 │   ├── supervisor.py         # crash detection + spawn queue daemon  ✅
-│   ├── runtime/              # checkpoints, worker, control, trainer ✅
+│   ├── runtime/              # checkpoints, worker, control ✅ — trainer = labeled test HARNESS only (no learning loop yet)
 │   ├── status/               # L1/L2/L3, watch, events --follow   ✅
 │   └── planner/              # capability feasibility solver      ✅
 └── tests/                    # specs as executable tests
@@ -145,14 +145,22 @@ mlforge/
    export/package, watch/gui); `serve` alone stays honest exit 4 (no
    build step will ever deliver it — never fake success)
 5. ✅ Supervisor daemon + run leases + idempotency journal
-6. ✅ Training runtime — transactional checkpoints (12 §11 write
-   protocol / newest-valid predicate / verify / components), heartbeat
-   writer, deterministic reconciliation (`reconcile_from_disk`, wired
-   into `resume`), worker process (start contract, control-channel
-   pause/stop, checkpoint loop), supervisor spawn queue + daemon
-   (`state/pending/` → detached worker, 12 §12.4 delegation), and
-   `train`/`resume`/`pause`/`stop` CLI (gate BLOCK train →
-   FAILED[FORK_ONLY], resume → state unchanged; `--command-id` dedupe)
+6. ⚠ Training runtime — **CORRECTED (was wrongly checked ✅ while the
+   learning loop was a scaffold).** REAL and delivered: transactional
+   checkpoints (12 §11 write protocol / newest-valid predicate / verify /
+   components), heartbeat writer, deterministic reconciliation
+   (`reconcile_from_disk`, wired into `resume`), worker process (start
+   contract, control-channel pause/stop, checkpoint loop), supervisor
+   spawn queue + daemon (`state/pending/` → detached worker, 12 §12.4),
+   `train`/`resume`/`pause`/`stop` CLI semantics (gate BLOCK →
+   FAILED[FORK_ONLY], `--command-id` dedupe).
+   **NOT delivered: the training itself.** `ScaffoldTrainer` is a fake
+   loss curve for system tests, and production now FAILS CLOSED rather
+   than faking it: `train`/launch refuse with exit 3 and the worker
+   refuses (run stays READY) unless a real trainer is integrated — the
+   only accepted opt-ins are `runtime.trainer=harness-scaffold` (per
+   run) or `MLFORGE_HARNESS=1` (tests). Integrating the real trainer is
+   the next build item.
 7. ✅ Status layer — read-only L1/L2 (`status [RUN] [-v]` incl. stale-
    heartbeat WARNING + FAILED disposition + stage-aware block), L3
    `hardware` (diagnostic telemetry), `watch [RUN]` (viewer only — keys
@@ -195,23 +203,28 @@ mlforge/
     `--set`/`--config` overrides (typo ⇒ BLOCK), `--command-id` dedupe, `inspect <run>` carries lineage,
     monotonic ULIDs (same-ms ids sort by creation — retrain source is
     deterministic)
-11. ✅ Evaluate/compare/infer/export/package + `model import` —
-    five-component evaluation identity (model+dataset+code+environment+
-    protocol, 12 §15.4) with SHOW PROTOCOL preview that equals the
-    recorded artifact, write-once evaluation/export/bundle artifacts,
-    first-consumption model state marker (AVAILABLE → exactly one of
-    EVALUATED/EXPORTED/...; later consumptions journal no-`to` events),
-    operator/format validation (unknown format or unsupported operator ⇒
-    BLOCK with the closed registry, never a partial export), contract
-    reuse + runtime retargeting, package (contract required, secrets
-    scan, provenance, no state change), one-shot `infer` (contract
-    check SAFE|BLOCK, missing input ⇒ exit 2, deterministic output
-    identity), descriptive `compare` (NOT_COMPARABLE = different
-    protocol, shown never averaged, never a winner), `evaluate/export/
-    package --command-id` dedupe (original result, never recomputed),
-    `model import` (declared identity, hashed weights, duplicate `name:vN`
-    BLOCKs, origin `import`), `validate <RUN|MODEL>`, `serve` honest
-    exit 4 (no build step yet)
+11. ⚠ Evaluate/compare/infer/export/package + `model import` —
+    **CORRECTED (was wrongly checked ✅ while the engines underneath
+    were scaffolds).** REAL and delivered: five-component evaluation
+    identity (model+dataset+code+environment+protocol, 12 §15.4) with
+    SHOW PROTOCOL preview that equals the recorded artifact, write-once
+    evaluation/export/bundle artifacts, first-consumption model state
+    marker, operator/format validation (unknown format or unsupported
+    operator ⇒ BLOCK with the closed registry, never a partial export),
+    contract reuse + runtime retargeting, package (contract required,
+    secrets scan, provenance, no state change), input contract check
+    SAFE|BLOCK for `infer` (missing input ⇒ exit 2), descriptive
+    `compare` (NOT_COMPARABLE = different protocol, shown never
+    averaged, never a winner), `--command-id` dedupe (original result,
+    never recomputed), `model import` (declared identity, hashed
+    weights, duplicate `name:vN` BLOCKs, origin `import`),
+    `validate <RUN|MODEL>`, `serve` honest exit 4.
+    **NOT delivered: the engines.** Metric computation
+    (`scaffold_metrics`), inference execution (`execute_scaffold`), and
+    exported model bytes are labeled scaffolds (`harness: scaffold` in
+    every output — they never claim otherwise); the real model runtime
+    replaces them at integration. Outputs are honestly labeled; they
+    are not ✅.
 12. ✅ TUI/GUI over the same Workflow API — `watch` without RUN is the
     multi-screen Live dashboard (overview → run §9.6 frame → events
     §9.7 feed → help; j/k/Enter/e/b/p/s/c/q keys), `watch RUN` keeps the
@@ -224,6 +237,15 @@ mlforge/
     closed; every viewer is disposable — closing it never touches a run
 
 ## Invariants already enforced in code
+
+* **No scaffold ships as a deliverable** — harness code (fake loss,
+  fake metrics, fake exported bytes) is labeled `harness: scaffold` in
+  its own output and production refuses it by default (`train`/launch
+  exit 3 before anything is created; the worker refuses before
+  READY → RUNNING, leaving the run untouched). Explicit opt-ins only:
+  `runtime.trainer=harness-scaffold` / `MLFORGE_HARNESS=1`.
+  Correction: build steps 6 and 11 were once wrongly checked ✅ while
+  their engines were scaffolds — fixed here, never again.
 
 * **FAILED has one meaning** — a recorded `failure.recovery` disposition
   (`RESUME` | `FORK_ONLY`); resume on `FORK_ONLY` exits 3

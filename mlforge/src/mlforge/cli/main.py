@@ -50,9 +50,11 @@ from mlforge.planner import (
     ExecutionPlan,
     build_plan,
     detect_capabilities,
+    load_runtime,
 )
 from mlforge.run_spec import RunSpec
 from mlforge.runtime.control import wait_for_state, write_control
+from mlforge.runtime.trainer import require_trainable
 from mlforge.store import ArtifactRegistry, ContentStore
 from mlforge.supervisor import enqueue_spawn, ensure_supervisor
 from mlforge.validation import Preflight, ValidationGate
@@ -499,7 +501,12 @@ def _write_runtime_config(run_id: str, root: Path, runtime: dict) -> None:
 
 def _launch(wf: WorkflowAPI, run_id: str) -> dict:
     """Lease → queue spawn → ensure the daemon is up. The CLI stops here;
-    the worker (fired from READY) is a daemon child, never ours (12 §12.4)."""
+    the worker (fired from READY) is a daemon child, never ours (12 §12.4).
+
+    Fail-closed: refuse to queue a spawn that cannot honestly train (no
+    real trainer integrated + no explicit harness opt-in ⇒ exit 3) —
+    never a doomed "started" run."""
+    require_trainable(load_runtime(wf.root / "runs" / run_id))
     lease = RunLeaseManager(wf.root)
     info = lease.status(run_id)
     if info.state == LeaseState.HELD:
@@ -1035,6 +1042,10 @@ def _execute_new_run(
 
 def _do_train(wf: WorkflowAPI, args) -> int:
     spec, runtime = _load_config(args.config)
+    # Fail-closed BEFORE anything exists: no real trainer integrated and
+    # no explicit harness opt-in ⇒ exit 3, zero runs created (13 §7 —
+    # never start what you cannot honestly run).
+    require_trainable(runtime)
     if not args.yes:
         _print_plan(spec, runtime)
         if not _confirm("Start training? [Y/n] "):
