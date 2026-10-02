@@ -139,6 +139,52 @@ class Worker:
                 f"persisted execution plan unreadable: {p}: {exc}"
             ) from exc
 
+    def _load_spec(self) -> Any:
+        """run_spec.json — immutable, written once (12 §17). Needed to
+        select the REAL trainer (run_spec.model chooses the learning
+        loop); absent/corrupt ⇒ fail-closed before READY → RUNNING."""
+        from mlforge.run_spec import RunSpec
+
+        p = self.run_dir / "run_spec.json"
+        if not p.is_file():
+            raise ValidationBlock(
+                f"run {self.run_id}: run_spec.json missing — cannot "
+                "select a trainer"
+            )
+        try:
+            return RunSpec.from_dict(json.loads(p.read_text(encoding="utf-8")))
+        except ValidationBlock:
+            raise
+        except Exception as exc:
+            raise ValidationBlock(
+                f"run {self.run_id}: run_spec.json unreadable: {exc}"
+            ) from exc
+
+    def _restore_payloads(self, store: CheckpointStore, ordinal: int) -> dict[str, bytes]:
+        """Load every REQUIRED_COMPONENTS payload of a verified checkpoint
+        (12 §11.4) — one verify pass, then read. Corrupt/incomplete ⇒
+        ValidationBlock: a trainer must never resume from a partial lie."""
+        ok, reason = store.verify(ordinal)
+        if not ok:
+            raise ValidationBlock(
+                f"checkpoint {ordinal} failed verification: {reason}"
+            )
+        directory = store.dir_for(ordinal)
+        out: dict[str, bytes] = {}
+        missing: list[str] = []
+        for component in REQUIRED_COMPONENTS:
+            path = directory / component
+            if not path.is_file():
+                missing.append(component)
+                continue
+            out[component] = path.read_bytes()
+        if missing:
+            raise ValidationBlock(
+                f"checkpoint {ordinal}: components missing "
+                f"({', '.join(missing)}) — not resumable (12 §11.4)"
+            )
+        return out
+
     # -- lifecycle ------------------------------------------------------------
 
     def run(self) -> int:
@@ -174,11 +220,30 @@ class Worker:
                 # 3a. Trainer BEFORE READY → RUNNING: resolved fail-closed
                 #     (no silent scaffold default) — a refusal leaves the
                 #     run READY and untouched, never a faked or dirtied run.
-                trainer = self.trainer or resolve_trainer(
-                    self._runtime_config(),
-                    start_step=start_step,
-                    start_epoch=start_epoch,
-                )
+                #     The REAL trainer is selected by run_spec.model and
+                #     restored from the newest-valid checkpoint payload
+                #     (model/optimizer/RNG — 12 §11.4), so a resume
+                #     CONTINUES training instead of restarting it.
+                if self.trainer is not None:
+                    trainer = self.trainer
+                else:
+                    spec = self._load_spec()
+                    payloads: dict[str, bytes] | None = None
+                    if selection.selected is not None:
+                        payloads = self._restore_payloads(
+                            store, selection.selected.ordinal
+                        )
+                    trainer = resolve_trainer(
+                        self._runtime_config(),
+                        start_step=start_step,
+                        start_epoch=start_epoch,
+                        model=spec.model,
+                        semantic=dict(spec.semantic),
+                        train_datasets=list(spec.train_datasets),
+                        root=self.root,
+                        payloads=payloads,
+                        plan=plan,
+                    )
                 wf.preflight_pass(self.run_id)  # READY → RUNNING (runtime's step)
                 wf.create_execution_segment(
                     self.run_id, capabilities=caps, plan=plan
@@ -266,31 +331,36 @@ class Worker:
                 "loss": result.loss,
                 **result.metrics,
             })
+            # Advance the state BEFORE any checkpoint: the manifest and the
+            # payload must describe "trained THROUGH result.global_step"
+            # (a lagged state meant resume restarted one step behind).
+            tstate = TrainState(result.global_step, result.epoch, tstate.resume_from)
             self._write_live({
                 "stage": "TRAINING",
-                "global_step": result.global_step,
-                "epoch": result.epoch,
+                "global_step": tstate.global_step,
+                "epoch": tstate.epoch,
                 "loss": result.loss,
                 "metrics": result.metrics,
             })
 
-            if result.global_step % self.checkpoint_interval == 0:
+            # Periodic checkpoint — and ALWAYS on completion: publishing a
+            # model reads the newest COMMIT marker, so the final weights
+            # must be on disk before wf.complete().
+            if result.global_step % self.checkpoint_interval == 0 or result.done:
                 self._write_live({
                     "stage": "CHECKPOINTING",
-                    "saving": f"checkpoint-{result.global_step}",
-                    "global_step": result.global_step,
-                    "epoch": result.epoch,
+                    "saving": f"checkpoint-{tstate.global_step}",
+                    "global_step": tstate.global_step,
+                    "epoch": tstate.epoch,
                 })
                 self._checkpoint(wf, store, trainer, tstate)
                 self._write_live({
                     "stage": "TRAINING",
-                    "global_step": result.global_step,
-                    "epoch": result.epoch,
+                    "global_step": tstate.global_step,
+                    "epoch": tstate.epoch,
                     "loss": result.loss,
                     "metrics": result.metrics,
                 })
-
-            tstate = TrainState(result.global_step, result.epoch, tstate.resume_from)
 
             if result.done:
                 wf.complete(self.run_id)

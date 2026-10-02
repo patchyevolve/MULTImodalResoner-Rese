@@ -504,9 +504,17 @@ def _launch(wf: WorkflowAPI, run_id: str) -> dict:
     the worker (fired from READY) is a daemon child, never ours (12 §12.4).
 
     Fail-closed: refuse to queue a spawn that cannot honestly train (no
-    real trainer integrated + no explicit harness opt-in ⇒ exit 3) —
-    never a doomed "started" run."""
-    require_trainable(load_runtime(wf.root / "runs" / run_id))
+    real trainer for this run's model + no explicit harness opt-in ⇒
+    exit 3) — never a doomed "started" run."""
+    spec_path = wf.root / "runs" / run_id / "run_spec.json"
+    model: str | None = None
+    if spec_path.is_file():
+        try:
+            model = str(json.loads(spec_path.read_text(encoding="utf-8"))
+                        .get("model") or "") or None
+        except (json.JSONDecodeError, AttributeError):  # gate re-validates
+            model = None
+    require_trainable(load_runtime(wf.root / "runs" / run_id), model=model)
     lease = RunLeaseManager(wf.root)
     info = lease.status(run_id)
     if info.state == LeaseState.HELD:
@@ -614,7 +622,8 @@ def _load_project_yaml(path: Path) -> dict[str, Any]:
 #: init → dataset → prepare flow works without hand-writing YAML first.
 _INGESTION_TEMPLATE = """\
 # MLForge ingestion plan (12 §10.2) — one entry per model.
-#   transform:     name from the closed registry (unknown ⇒ prepare BLOCKs)
+#   transform:     name from the registry (unknown ⇒ prepare BLOCKs;
+#                  add types with mlforge.ingest.register_transform)
 #   train_sources: <dataset>:<split> — register with `mlforge dataset add`
 #                  and verify BEFORE `mlforge prepare`
 #   depends_on:    upstream models that must be AVAILABLE first (registry)
@@ -624,6 +633,10 @@ models:
     train_sources: [coco_2017:train]
     # val_sources: [coco_2017:val]
     # depends_on: []
+  # Text models (e.g. your books/papers corpus):
+  # reasoner_s:
+  #   transform: text_corpus          # pdf/docx/md/txt/zip → text chunks
+  #   train_sources: [books:train]
 """
 
 
@@ -1042,10 +1055,10 @@ def _execute_new_run(
 
 def _do_train(wf: WorkflowAPI, args) -> int:
     spec, runtime = _load_config(args.config)
-    # Fail-closed BEFORE anything exists: no real trainer integrated and
-    # no explicit harness opt-in ⇒ exit 3, zero runs created (13 §7 —
+    # Fail-closed BEFORE anything exists: no real trainer for THIS model
+    # and no explicit harness opt-in ⇒ exit 3, zero runs created (13 §7 —
     # never start what you cannot honestly run).
-    require_trainable(runtime)
+    require_trainable(runtime, model=spec.model)
     if not args.yes:
         _print_plan(spec, runtime)
         if not _confirm("Start training? [Y/n] "):

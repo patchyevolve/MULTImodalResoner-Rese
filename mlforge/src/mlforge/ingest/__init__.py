@@ -24,7 +24,9 @@ from mlforge.ingest.prepare import PreparedResult, derived_dataset_id, prepare
 from mlforge.ingest.transforms import (
     ResolvedSource,
     get_transform,
+    register_transform,
     registry_names,
+    text_corpus,
     transform_identity,
 )
 
@@ -47,9 +49,11 @@ __all__ = [
     "paths_file",
     "prepare",
     "recompute_identity",
+    "register_transform",
     "registry_names",
     "resolve_order",
     "scan_files",
     "set_path",
+    "text_corpus",
     "transform_identity",
 ]

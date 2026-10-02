@@ -4,18 +4,20 @@ Normative context: 12_training_system.md §12.4 (the worker OWNS the
 process; what it *trains* is injected), §11.4 (checkpoint contents are
 the trainer's state — model/optimizer/RNG/sampler/...).
 
-CORRECTION (was shipped silently and mischecked as complete):
-`ScaffoldTrainer` is a **test harness only** — a deterministic fake
-loss curve and JSON stand-in payloads. It is NOT a deliverable, it does
-NOT train anything, and production refuses to use it:
+Resolution order (`resolve_trainer` — the ONLY way production code
+obtains a trainer):
 
-  * `state/runtime.json`: {"trainer": "harness-scaffold"}  — per-run
-  * env `MLFORGE_HARNESS=1`                                — system tests
-
-Anything else fails closed with `PreconditionFailed`: no real trainer
-is integrated yet (the torch learning loop is not built) and MLForge
-will never fake training. When a real trainer lands it becomes the
-default here — no opt-in key required.
+  1. explicit `runtime.trainer` id  → "harness-scaffold" only (system
+     tests); any other id ⇒ unknown-trainer refusal
+  2. harness opt-in via `MLFORGE_HARNESS=1` (system tests)
+  3. REAL trainer for `run_spec.model` via the mlforge.trainers
+     registry — e.g. `reasoner_s` → the torch byte-level LM loop
+     (needs torch installed; missing ⇒ honest refusal naming the
+     install command)
+  4. anything else ⇒ `PreconditionFailed`: unknown model, no model
+     context, or missing framework. MLForge never falls back to a
+     scaffold to make a run "work" — the old silent
+     `ScaffoldTrainer` default is gone and stays gone.
 """
 
 from __future__ import annotations
@@ -23,7 +25,8 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass, field
-from typing import Any, Mapping, Protocol, runtime_checkable
+from pathlib import Path
+from typing import Any, Mapping, Protocol, Sequence, runtime_checkable
 
 from mlforge.errors import PreconditionFailed
 from mlforge.runtime.checkpoints import REQUIRED_COMPONENTS
@@ -32,6 +35,13 @@ from mlforge.runtime.checkpoints import REQUIRED_COMPONENTS
 HARNESS_TRAINER = "harness-scaffold"
 #: Session-wide opt-in for system tests (never set in production).
 HARNESS_ENV = "MLFORGE_HARNESS"
+
+#: Refusal hint — the harness is named, never silently reached.
+_HARNESS_HINT = (
+    f'system-test harness only: "runtime": {{\"trainer\": '
+    f'"{HARNESS_TRAINER}"}} or {HARNESS_ENV}=1 — the harness is a fake '
+    "loss curve, never a model"
+)
 
 
 @dataclass(frozen=True)
@@ -125,18 +135,24 @@ def resolve_trainer(
     *,
     start_step: int = 0,
     start_epoch: int = 0,
+    model: str | None = None,
+    semantic: Mapping[str, Any] | None = None,
+    train_datasets: Sequence[str] = (),
+    root: str | Path | None = None,
+    payloads: Mapping[str, bytes] | None = None,
+    plan: Any = None,
 ) -> Trainer:
     """The ONLY way production code obtains a trainer (fail-closed).
 
-    Order: explicit `trainer:` id → harness opt-in → refuse. No silent
-    scaffold, ever — a run that cannot honestly train must not start."""
+    Order: explicit `trainer:` id → harness opt-in → the REAL trainer
+    registered for `model` → refuse. No silent scaffold, ever."""
     choice = str((runtime or {}).get("trainer", "")).strip().lower()
     if choice and choice != HARNESS_TRAINER:
         raise PreconditionFailed(
             f"unknown trainer {choice!r}",
             hint=f'the only accepted value today is "{HARNESS_TRAINER}" '
                  "(system-test harness — fake loss, not a model); real "
-                 "trainers register here when integrated",
+                 "trainers resolve by run_spec.model (mlforge.trainers)",
         )
     if harness_allowed(runtime):
         cfg = runtime or {}
@@ -146,19 +162,67 @@ def resolve_trainer(
             start_step=start_step,
             start_epoch=start_epoch,
         )
-    raise PreconditionFailed(
-        "no real trainer integrated — MLForge's learning loop (real "
-        "gradients/loss) is not built yet; refusing to start a run that "
-        "cannot train",
-        hint=f'set "runtime": {{"trainer": "{HARNESS_TRAINER}"}} in the '
-             "train config (per-run) or MLFORGE_HARNESS=1 (system tests) "
-             "ONLY — the harness is a fake loss curve, never a model",
+    # Real path — model-selected, framework-checked, built here so a
+    # refusal lands BEFORE READY → RUNNING (the run stays untouched).
+    from mlforge import trainers as _trainers
+
+    if not model:
+        raise PreconditionFailed(
+            "no real trainer integrated — no model context "
+            "(run_spec.model missing) to select a trainer",
+            hint=_HARNESS_HINT,
+        )
+    err = _trainers.availability_error(model)
+    if err:
+        raise PreconditionFailed(
+            f"no real trainer integrated for model {model!r} — {err}",
+            hint=_HARNESS_HINT,
+        )
+    return _trainers.build_trainer(
+        model,
+        runtime=runtime or {},
+        semantic=semantic or {},
+        train_datasets=tuple(train_datasets),
+        root=Path(root) if root is not None else Path("."),
+        payloads=payloads,
+        start_step=start_step,
+        start_epoch=start_epoch,
+        plan=plan,
     )
 
 
-def require_trainable(runtime: Mapping[str, Any] | None = None) -> None:
-    """Raise unless some trainer (real, or opted-in harness) can run."""
-    resolve_trainer(runtime)
+def require_trainable(
+    runtime: Mapping[str, Any] | None = None,
+    *,
+    model: str | None = None,
+) -> None:
+    """Cheap preflight: raise unless a trainer CAN run for this model.
+
+    Checks availability only (no corpus load, no model build) — the
+    worker still constructs the real trainer before READY → RUNNING."""
+    choice = str((runtime or {}).get("trainer", "")).strip().lower()
+    if choice and choice != HARNESS_TRAINER:
+        raise PreconditionFailed(
+            f"unknown trainer {choice!r}",
+            hint=f'the only accepted value today is "{HARNESS_TRAINER}" '
+                 "(system-test harness — fake loss, not a model)",
+        )
+    if harness_allowed(runtime):
+        return
+    from mlforge import trainers as _trainers
+
+    if not model:
+        raise PreconditionFailed(
+            "no real trainer integrated — no model context "
+            "(run_spec.model missing) to select a trainer",
+            hint=_HARNESS_HINT,
+        )
+    err = _trainers.availability_error(model)
+    if err:
+        raise PreconditionFailed(
+            f"no real trainer integrated for model {model!r} — {err}",
+            hint=_HARNESS_HINT,
+        )
 
 
 __all__ = [

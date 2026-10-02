@@ -56,6 +56,24 @@ GPU expectations derive from the run's runtime config + execution plan
 (12 §7.3/§14), and a passing gate acquires the run lease before launch
 (12 §18 step 15).
 
+### Train a text model on your own books/papers (CPU is fine)
+
+```bash
+mlforge dataset add books /path/to/your/books --yes   # pdf/docx/md/txt/zip
+mlforge configure datasets --set books=/path/to/your/books
+$EDITOR ingestion.yaml        # add: reasoner_s / transform: text_corpus
+mlforge prepare reasoner_s    # extract → chunk → reasoner_s_prepared:v1
+mlforge train --config configs/train.example.json     # model: reasoner_s,
+                                    # loss: byte_cross_entropy, fp32
+mlforge watch                  # real loss (starts ≈ 5.55 = ln 256)
+```
+
+Real gradients on real text (verified end to end: loss 5.56 → 2.68
+over 6 epochs on CLRS + OS Concepts + CTCI; kill -9 mid-run →
+`lease break` → `resume` continues with optimizer + LR schedule
+intact). Detection models (RF-DETR) still require their GPU runtime —
+asking to train one here refuses with exactly that reason.
+
 ### CPU-only laptops
 
 Nothing in the quickstart needs a GPU — the system measures whatever
@@ -119,7 +137,8 @@ mlforge/
 │   ├── leases/               # run lease + gate providers 15–16   ✅
 │   ├── commands/             # idempotency journal                ✅
 │   ├── supervisor.py         # crash detection + spawn queue daemon  ✅
-│   ├── runtime/              # checkpoints, worker, control ✅ — trainer = labeled test HARNESS only (no learning loop yet)
+│   ├── runtime/              # checkpoints, worker, control, trainer resolution ✅
+│   ├── trainers/             # REAL learning loops — torch byte-LM (reasoner_s) ✅
 │   ├── status/               # L1/L2/L3, watch, events --follow   ✅
 │   └── planner/              # capability feasibility solver      ✅
 └── tests/                    # specs as executable tests
@@ -145,22 +164,29 @@ mlforge/
    export/package, watch/gui); `serve` alone stays honest exit 4 (no
    build step will ever deliver it — never fake success)
 5. ✅ Supervisor daemon + run leases + idempotency journal
-6. ⚠ Training runtime — **CORRECTED (was wrongly checked ✅ while the
-   learning loop was a scaffold).** REAL and delivered: transactional
-   checkpoints (12 §11 write protocol / newest-valid predicate / verify /
-   components), heartbeat writer, deterministic reconciliation
-   (`reconcile_from_disk`, wired into `resume`), worker process (start
-   contract, control-channel pause/stop, checkpoint loop), supervisor
-   spawn queue + daemon (`state/pending/` → detached worker, 12 §12.4),
-   `train`/`resume`/`pause`/`stop` CLI semantics (gate BLOCK →
-   FAILED[FORK_ONLY], `--command-id` dedupe).
-   **NOT delivered: the training itself.** `ScaffoldTrainer` is a fake
-   loss curve for system tests, and production now FAILS CLOSED rather
-   than faking it: `train`/launch refuse with exit 3 and the worker
-   refuses (run stays READY) unless a real trainer is integrated — the
-   only accepted opt-ins are `runtime.trainer=harness-scaffold` (per
-   run) or `MLFORGE_HARNESS=1` (tests). Integrating the real trainer is
-   the next build item.
+6. ⚠ Training runtime — **delivered for text models (REAL torch
+   learning loop); detection (RF-DETR) not integrated.** REAL: the
+   `reasoner_s` byte-level transformer trains with genuine
+   gradients/AdamW/cosine schedule on prepared text (`text_corpus`
+   transform) — loss falls from ≈5.55 (ln 256) into the 2s on books;
+   transactional checkpoints (12 §11 write protocol / newest-valid
+   predicate / verify / components) carry REAL model + optimizer +
+   scheduler + RNG + sampler state (12 §11.4, all 15
+   REQUIRED_COMPONENTS), so `resume` — including after SIGKILL →
+   INTERRUPTED → reconcile → `lease break` → `resume` — CONTINUES the
+   same run (LR schedule and weights intact), heartbeat writer,
+   deterministic reconciliation (`reconcile_from_disk`), worker process
+   (start contract, control-channel pause/stop, checkpoint loop,
+   completion checkpoint so the published model = final weights),
+   supervisor spawn queue + daemon (`state/pending/` → detached worker,
+   12 §12.4), `train`/`resume`/`pause`/`stop` CLI semantics (gate BLOCK
+   → FAILED[FORK_ONLY], `--command-id` dedupe).
+   Fail-closed everywhere else: model with no integrated trainer (e.g.
+   `rf_detr_s` — needs a GPU runtime), missing torch, non-fp32 plan
+   (no AMP), world_size > 1 (no distributed), or an unsupported
+   semantic loss/optimizer ⇒ refusal with the concrete reason — never a
+   substitute. `ScaffoldTrainer` remains system-test harness only
+   (explicit `runtime.trainer=harness-scaffold` / `MLFORGE_HARNESS=1`).
 7. ✅ Status layer — read-only L1/L2 (`status [RUN] [-v]` incl. stale-
    heartbeat WARNING + FAILED disposition + stage-aware block), L3
    `hardware` (diagnostic telemetry), `watch [RUN]` (viewer only — keys
@@ -171,8 +197,12 @@ mlforge/
    (every file hashed; counts are never identity, 12 §6.2), strict YAML
    config subset (`yamlmini`), machine-local paths at `$MLFORGE_HOME`
    vs portable `datasets.yaml` (12 §6.3), `ingestion.yaml` DAG
-   (sources/depends_on, cycle detection), closed transform registry
-   with code-hash identity + four-field cache key (12 §6.4),
+   (sources/depends_on, cycle detection), GLOBALLY-OPEN but gated
+   transform registry (`register_transform` — only registered code
+   runs, unknown ⇒ BLOCK) with code-hash identity + four-field cache
+   key (12 §6.4), built-in transforms `coco_detection` and
+   `text_corpus` (PDF/DOCX/MD/TXT/zip → extract → paragraph-chunked
+   text records; a source yielding nothing BLOCKs, never fabricates),
    `dataset add|list|verify` (tamper → REJECTED, `--force`
    reregister), `prepare` (resolve → cache → transform → derived
    `<model>_prepared` REGISTERED→VERIFIED→PREPARED, `--command-id`
