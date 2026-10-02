@@ -44,7 +44,14 @@ from mlforge.errors import (
     ValidationBlock,
 )
 from mlforge.hashing import content_hash
-from mlforge.ids import new_model_id, new_run_id
+from mlforge.ids import (
+    new_bundle_id,
+    new_eval_id,
+    new_export_id,
+    new_model_id,
+    new_output_id,
+    new_run_id,
+)
 from mlforge.journal import EventJournal
 from mlforge.leases import LeaseState, RunLeaseManager
 from mlforge.lineage import (
@@ -66,6 +73,34 @@ from mlforge.machine import (
     PROJECT_MACHINE,
     RUN_MACHINE,
     StateMachine,
+)
+from mlforge.ops import (
+    FORMATS as EXPORT_FORMATS,
+    build_bundle,
+    build_evaluation,
+    build_export,
+    build_protocol,
+    check_input,
+    comparability_groups as _comparability_groups,
+    component_integrity,
+    contract_source_dir,
+    execute_scaffold,
+    latest_evaluation,
+    latest_export as _latest_export,
+    list_evaluations,
+    list_exports as _list_exports,
+    load_model_spec,
+    model_entry_hash,
+    numerical_validation,
+    read_package,
+    required_operators as _required_operators,
+    scaffold_contract,
+    source_tree_hash,
+    validate_export,
+    write_bundle,
+    write_evaluation,
+    write_export,
+    write_output,
 )
 from mlforge.planner import (
     PLAN_FILENAME,
@@ -1172,10 +1207,12 @@ class WorkflowAPI:
         version: str | None = None,
         run_id: str | None = None,
         run_spec_hash: str | None = None,
+        origin: str | None = None,
     ) -> str:
         """Registry entry: the model.json sidecar carries the addressable
         `name:vN` identity (13 §4.3) + provenance (13 §5.5: every model
-        traces to the run that produced it)."""
+        traces to the run that produced it — or `import` for external
+        packages, 13 §4.1)."""
         model_id = new_model_id()
         d = self._dir("model", model_id)
         d.mkdir(parents=True)
@@ -1187,6 +1224,7 @@ class WorkflowAPI:
             "artifact_hash": artifact_hash,
             "run_id": run_id,
             "run_spec_hash": run_spec_hash,
+            "origin": origin or "run",
             "created_ts": time.time(),
         }
         (d / "model.json").write_text(
@@ -1201,6 +1239,7 @@ class WorkflowAPI:
             name=name,
             version=version,
             run_id=run_id,
+            origin=sidecar["origin"],
         )
         self._write_projection("model", model_id, ModelState.CREATED.value)
         return model_id
@@ -1515,6 +1554,454 @@ class WorkflowAPI:
                 if digest:
                     return digest
         return None
+
+    # ------------------------------------------------------------------
+    # downstream operations (build step 11; 13 §6.7–§6.10, 12 §15.3–§15.4)
+    # ------------------------------------------------------------------
+
+    def _model_for_ops(self, ref: str) -> dict[str, Any]:
+        """Model resolved + published (13 §5.4). CREATED/VALIDATED are
+        not consumable — they never finished publishing."""
+        entry = self.resolve_model(ref)
+        state = entry.get("state")
+        if state in (ModelState.CREATED.value, ModelState.VALIDATED.value):
+            raise PreconditionFailed(
+                f"model {ref} is {state} — not published for use",
+                hint="published models are AVAILABLE (13 §5.4); a partially "
+                     "registered model is repaired by re-import or "
+                     "`validate` (13 §4.1)",
+            )
+        return entry
+
+    def _record_consumption(
+        self, model_id: str, action: str, event: str, data: dict[str, Any]
+    ) -> str:
+        """First-consumption marker semantics (13 §5.4: AVAILABLE fans out
+        to exactly one of EVALUATED/EXPORTED/DEPLOYED/USED_AS_...).
+
+        The FIRST consumption fires the normative transition. Later
+        consumptions (second evaluation with a different protocol, export
+        after evaluate, ...) still record their artifact + a no-`to`
+        journal event — the marker never flips back and forth, and the
+        artifacts are the full record (12 §15.4: a different protocol is
+        a DIFFERENT artifact, not an update)."""
+        state = self._load_projection("model", model_id)["state"]
+        if state == ModelState.AVAILABLE.value:
+            return self._fire("model", model_id, action, event, data=data)
+        self._journal("model", model_id).append(event, action=action, **data)
+        return state
+
+    def _resolve_eval_dataset(self, ref: str) -> dict[str, Any]:
+        """Registered + re-hashed dataset for evaluation (13 §7: not
+        resolved → exit 2; content changed since registration → BLOCK)."""
+        from mlforge.ingest import config as ingest_config
+        from mlforge.ingest.identity import full_ref, parse_ref, recompute_identity
+
+        name, version = parse_ref(ref)
+        reg_path = self.root / "datasets" / name / "identity.json"
+        if not reg_path.is_file():
+            raise NotFound(
+                f"dataset {ref} not registered",
+                hint=f"register it first: mlforge dataset add {name} <PATH>",
+            )
+        try:
+            reg = json.loads(reg_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise ValidationBlock(
+                f"dataset {name}: registration unreadable ({exc})") from exc
+        reg_version = str(reg.get("version") or "")
+        if reg_version and reg_version != version:
+            raise ValidationBlock(
+                f"{ref}: registered version {reg_version!r} != {version!r} "
+                "(versions are identity, never reinterpreted)",
+            )
+        paths = ingest_config.load_paths(self.root)
+        path = paths.get(name)
+        if not path:
+            raise ValidationBlock(
+                f"{name}: no machine-local path configured",
+                hint=f"mlforge dataset add {name} <PATH> (paths are explicit, "
+                     "never discovered — 12 §6.3)",
+            )
+        identity, _manifest = recompute_identity(
+            path, name, version, schema=reg.get("schema")
+        )
+        registered = reg.get("identity")
+        if registered and identity != registered:
+            raise ValidationBlock(
+                f"{name}: dataset content changed since registration "
+                f"(registered {registered}, found {identity})",
+                hint="re-register explicitly with `mlforge dataset add "
+                     "--force` — never silently reinterpret identity (13 §5.2)",
+            )
+        return {
+            "name": name,
+            "version": version,
+            "ref": full_ref(name, version),
+            "identity": identity,
+            "path": path,
+        }
+
+    def _scan_model_sources(self, entry: dict[str, Any]) -> list[str]:
+        """Secrets scan over the model's source directories (13 §7:
+        secrets in artifacts → BLOCK packaging/export, no partial run)."""
+        from mlforge.validation.gate import scan_for_secrets
+
+        findings: list[str] = []
+        dirs: list[Path] = [self.root / "models" / str(entry.get("model_id"))]
+        run_id = entry.get("run_id")
+        if run_id:
+            dirs.append(self.root / "runs" / str(run_id))
+        contract_dir = contract_source_dir(self.root, entry)
+        if contract_dir is not None:
+            dirs.append(contract_dir)
+        seen: set[Path] = set()
+        for d in dirs:
+            d = d.resolve()
+            if d in seen or not d.is_dir():
+                continue
+            seen.add(d)
+            findings.extend(scan_for_secrets(d))
+        return findings
+
+    def _prepare_evaluation(
+        self,
+        model_ref: str,
+        dataset_ref: str,
+        protocol_overrides: Mapping[str, Any] | None,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Resolve + build the record WITHOUT writing (deterministic —
+        the previewed numbers are exactly what gets recorded)."""
+        from mlforge.ingest.transforms import env_fingerprint
+
+        entry = self._model_for_ops(model_ref)
+        dataset = self._resolve_eval_dataset(dataset_ref)
+        protocol = build_protocol(
+            dict(protocol_overrides) if protocol_overrides else None
+        )
+        record = build_evaluation(
+            eval_id="",
+            model_entry=entry,
+            dataset_hash=dataset["identity"],
+            dataset_ref=dataset["ref"],
+            code_hash=source_tree_hash(),
+            environment_hash=env_fingerprint(),
+            protocol=protocol,
+        )
+        return entry, record
+
+    def preview_evaluation(
+        self,
+        model_ref: str,
+        dataset_ref: str,
+        *,
+        protocol_overrides: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """SHOW PROTOCOL before confirmation (13 §6.7) — resolution and
+        validation run now; nothing is written, no state changes."""
+        _, record = self._prepare_evaluation(
+            model_ref, dataset_ref, protocol_overrides
+        )
+        return record
+
+    def evaluate_model(
+        self,
+        model_ref: str,
+        dataset_ref: str,
+        *,
+        protocol_overrides: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """EVALUATE (13 §6.7): resolve hashes → run harness → immutable
+        five-component evaluation artifact."""
+        entry, record = self._prepare_evaluation(
+            model_ref, dataset_ref, protocol_overrides
+        )
+        record["eval_id"] = new_eval_id()
+        record["created_ts"] = time.time()
+        write_evaluation(self.root, record)
+        self._record_consumption(
+            str(entry["model_id"]),
+            "record_evaluation",
+            "evaluation_recorded",
+            {
+                "eval_id": record["eval_id"],
+                "dataset_ref": record["dataset_ref"],
+                "evaluation_protocol_hash": record["evaluation_protocol_hash"],
+            },
+        )
+        return record
+
+    def list_model_evaluations(self, model_ref: str) -> list[dict[str, Any]]:
+        entry = self.resolve_model(model_ref)
+        return list_evaluations(self.root, model_id=str(entry["model_id"]))
+
+    def compare_models(self, refs: list[str]) -> dict[str, Any]:
+        """COMPARE (13 §6.10): descriptive columns; NOT_COMPARABLE when
+        evaluation protocol hashes differ — shown, never averaged."""
+        if len(refs) < 2:
+            raise ValidationBlock(
+                "compare needs at least two model references",
+                hint="mlforge compare model://a:v1 model://b:v1 (13 §6.10)",
+            )
+        columns: list[dict[str, Any]] = []
+        for ref in refs:
+            entry = self.resolve_model(ref)  # unknown → NotFound (exit 2)
+            record = latest_evaluation(self.root, str(entry["model_id"]))
+            dataset, base_model = "—", "—"
+            run_id = entry.get("run_id")
+            if run_id:
+                try:
+                    spec = self._run_spec(str(run_id))
+                    dataset = ", ".join(spec.train_datasets)
+                except MlforgeError:
+                    pass
+                try:
+                    lin = self.get_lineage(str(run_id))
+                    base_model = lin.get("parent_model") or "—"
+                except MlforgeError:
+                    pass
+            columns.append(
+                {
+                    "ref": (f"{entry.get('name')}:{entry.get('version')}"
+                            if entry.get("name") else entry["model_id"]),
+                    "model_id": entry.get("model_id"),
+                    "dataset": dataset,
+                    "base_model": base_model,
+                    "evaluation": record,
+                }
+            )
+        records = [c["evaluation"] for c in columns if c["evaluation"] is not None]
+        comparable, not_comparable = _comparability_groups(records)
+        comparable_hashes = set(comparable)
+        for col in columns:
+            ev = col["evaluation"]
+            if ev is None:
+                col["comparable"] = None
+            else:
+                col["comparable"] = bool(comparable) and (
+                    ev["evaluation_protocol_hash"] in comparable_hashes
+                )
+                col["protocol_hash"] = ev["evaluation_protocol_hash"]
+        return {
+            "columns": columns,
+            "comparable_protocols": sorted(comparable),
+            "not_comparable_protocols": sorted(not_comparable),
+        }
+
+    def export_model(self, model_ref: str, fmt: str) -> dict[str, Any]:
+        """EXPORT (13 §6.9): contract → operator validation → immutable
+        export artifact with its own identity."""
+        entry = self._model_for_ops(model_ref)
+        if fmt not in EXPORT_FORMATS:
+            # Guard BEFORE any contract work: an unknown format must give
+            # the registry, never a KeyError (13 §7 failure matrix).
+            raise ValidationBlock(
+                f"unsupported export format {fmt!r}",
+                hint=f"formats: {', '.join(sorted(EXPORT_FORMATS))}",
+            )
+        findings = self._scan_model_sources(entry)
+        if findings:
+            raise ValidationBlock(
+                "secrets detected in artifacts: " + "; ".join(findings[:5]),
+                hint="BLOCK export (13 §7) — remove the secret material and "
+                     "re-register; secrets never enter artifacts (12 §16)",
+            )
+        # contract: reuse the existing one (operators/schema are the
+        # model's), retarget the runtime; else build the scaffold contract
+        existing_dir = contract_source_dir(self.root, entry)
+        if existing_dir is not None:
+            model_spec = load_model_spec(self.root, entry)
+            contract = dict(model_spec["inference_contract"])
+            contract["runtime"] = {
+                "framework": fmt,
+                "opset": EXPORT_FORMATS[fmt]["opset"]
+                if fmt in EXPORT_FORMATS else contract.get("runtime", {}).get("opset"),
+            }
+            model_spec = {**model_spec, "inference_contract": contract}
+            _required_operators(model_spec)  # fail-closed: list must exist
+        else:
+            model_spec = scaffold_contract(entry, fmt)
+        validations = validate_export(model_spec, fmt)  # BLOCKs unknown fmt/ops
+        record = build_export(
+            export_id=new_export_id(),
+            model_entry=entry,
+            model_hash=model_entry_hash(entry),
+            model_spec=model_spec,
+            fmt=fmt,
+            validations=validations,
+            numerical=numerical_validation(
+                model_spec, model_entry_hash(entry), fmt
+            ),
+        )
+        record["created_ts"] = time.time()
+        write_export(self.root, record)
+        self._record_consumption(
+            str(entry["model_id"]),
+            "record_export",
+            "export_recorded",
+            {
+                "export_id": record["export_id"],
+                "format": fmt,
+                "contract_hash": record["contract_hash"],
+            },
+        )
+        return record
+
+    def package_model(self, model_ref: str) -> dict[str, Any]:
+        """PACKAGE (13 §4.1, 12 §15.3): contract required; secrets scan;
+        immutable bundle artifact."""
+        entry = self._model_for_ops(model_ref)
+        model_spec = load_model_spec(self.root, entry)  # no contract ⇒ BLOCK
+        findings = self._scan_model_sources(entry)
+        if findings:
+            raise ValidationBlock(
+                "secrets detected in artifacts: " + "; ".join(findings[:5]),
+                hint="BLOCK packaging (13 §7) — remove the secret material "
+                     "first; secrets never enter artifacts (12 §16)",
+            )
+        provenance: dict[str, Any] = {
+            "model": {k: entry.get(k) for k in
+                      ("model_id", "name", "version", "artifact_hash",
+                       "run_id", "run_spec_hash", "origin")},
+        }
+        if entry.get("run_id"):
+            try:
+                provenance["lineage"] = self.get_lineage(str(entry["run_id"]))
+                provenance["run_chain"] = [
+                    c["run_id"] for c in self.lineage_chain(str(entry["run_id"]))
+                ]
+            except MlforgeError:
+                provenance["lineage"] = None  # provenance run not in workspace
+        integrity = component_integrity(
+            model_spec, provenance, entry.get("artifact_hash")
+        )
+        record = build_bundle(
+            bundle_id=new_bundle_id(),
+            model_entry=entry,
+            model_hash=model_entry_hash(entry),
+            model_spec=model_spec,
+            provenance=provenance,
+            integrity=integrity,
+        )
+        record["created_ts"] = time.time()
+        write_bundle(
+            self.root,
+            record=record,
+            model_spec=model_spec,
+            provenance=provenance,
+            integrity=integrity,
+        )
+        # packaging consumes no lifecycle state (13 §5.4 has no BUNDLED
+        # state) — journal-only, artifacts carry the record.
+        self._journal("model", str(entry["model_id"])).append(
+            "bundle_created",
+            action="package",
+            bundle_id=record["bundle_id"],
+            contract_hash=record["contract_hash"],
+        )
+        return record
+
+    def infer_model(self, model_ref: str, input_path: str) -> dict[str, Any]:
+        """ONE-SHOT INFER (13 §6.8): contract check → input schema check
+        → scaffold execution → output artifact with its own identity."""
+        entry = self._model_for_ops(model_ref)
+        model_spec = load_model_spec(self.root, entry)  # no contract ⇒ BLOCK
+        checked = check_input(model_spec, input_path)  # violations ⇒ BLOCK
+        record = execute_scaffold(
+            output_id=new_output_id(),
+            model_entry=entry,
+            contract_doc=model_spec,
+            checked=checked,
+        )
+        record["created_ts"] = time.time()
+        write_output(self.root, record)
+        self._journal("model", str(entry["model_id"])).append(
+            "inference_executed",
+            action="infer",
+            output_id=record["output_id"],
+            input_identity=record["input"]["identity"],
+        )
+        return record
+
+    def import_external_model(self, path: str) -> dict[str, Any]:
+        """`model import <PATH>` (13 §4.1): validate the package, hash
+        the weights, register + publish with its real contract."""
+        spec, weights = read_package(path)
+        name, version = str(spec["name"]), str(spec["version"])
+        for existing in self.list_models():
+            if existing.get("name") == name and existing.get("version") == version:
+                raise ValidationBlock(
+                    f"model {name}:{version} is already registered",
+                    hint="imported versions are immutable — declare a new "
+                         "version in model_spec.json or use the existing one "
+                         "(`mlforge model list`)",
+                )
+        model_id = self.create_model(
+            artifact_hash=str(weights["artifact_hash"]),
+            name=name,
+            version=version,
+            run_id=None,
+            run_spec_hash=None,
+            origin="import",
+        )
+        d = self._dir("model", model_id)
+        spec_path = d / "model_spec.json"
+        tmp = spec_path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(spec, indent=2, sort_keys=True), encoding="utf-8")
+        tmp.replace(spec_path)
+        self._journal("model", model_id).append(
+            "model_imported",
+            action="import",
+            package=str(path),
+            weights_bytes=weights["bytes"],
+            artifact_hash=weights["artifact_hash"],
+        )
+        self.validate_model(model_id)
+        self.publish_model(model_id)
+        return self.resolve_model(f"{name}:{version}")
+
+    def model_integrity_report(self, model_ref: str) -> dict[str, Any]:
+        """`validate <MODEL>` (13 §4.1): registry + contract integrity
+        checks — read-only, fail-closed on unreadable artifacts."""
+        entry = self.resolve_model(model_ref)
+        checks: list[dict[str, str]] = []
+
+        def add(name: str, status: str, detail: str) -> None:
+            checks.append({"name": name, "status": status, "detail": detail})
+
+        add("registry sidecar", "PASS",
+            f"{entry.get('name')}:{entry.get('version')} state "
+            f"{entry.get('state')}")
+        add("provenance", "PASS",
+            f"origin {entry.get('origin') or 'run'}"
+            + (f" · run {entry.get('run_id')}" if entry.get("run_id")
+               else " · external package"))
+        if entry.get("artifact_hash"):
+            add("weights reference", "PASS", str(entry["artifact_hash"]))
+        else:
+            add("weights reference", "PASS",
+                "none recorded (scaffold publish without checkpoints)")
+        source = contract_source_dir(self.root, entry)
+        if source is None:
+            add("inference contract", "PASS",
+                "none yet — export or import creates one (12 §15.3)")
+        else:
+            try:
+                spec = load_model_spec(self.root, entry)
+                ops = _required_operators(spec)
+                add("inference contract", "PASS",
+                    f"{len(ops)} operators · runtime "
+                    f"{spec['inference_contract'].get('runtime')}")
+            except ValidationBlock as exc:
+                add("inference contract", "FAIL", str(exc))
+        blocked = any(c["status"] == "FAIL" for c in checks)
+        return {
+            "model_ref": f"{entry.get('name')}:{entry.get('version')}",
+            "model_id": entry.get("model_id"),
+            "state": entry.get("state"),
+            "checks": checks,
+            "blocked": blocked,
+        }
 
     # ------------------------------------------------------------------
     # introspection

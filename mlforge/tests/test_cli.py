@@ -58,7 +58,9 @@ def test_inspect_and_events(tmp_path, capsys):
 
 
 def test_pending_command_exits_4(tmp_path, capsys):
-    assert main(["--root", str(tmp_path), "evaluate", "model_m1"]) == 4
+    # build step 11 delivered evaluate/compare/infer/export/package —
+    # init/configure (step 1) are still the pending examples
+    assert main(["--root", str(tmp_path), "init"]) == 4
     assert "NOT_IMPLEMENTED" in capsys.readouterr().err
 
 

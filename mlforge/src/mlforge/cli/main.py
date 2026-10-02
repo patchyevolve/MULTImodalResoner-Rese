@@ -39,6 +39,7 @@ from mlforge.ingest import (
 )
 from mlforge.ingest.config import set_path as ingest_set_path, write_registry as ingest_write_registry
 from mlforge.leases import LeaseState, RunLeaseManager
+from mlforge.ops import DEFAULT_METRIC_NAMES, contract_source_dir
 from mlforge.planner import build_plan
 from mlforge.run_spec import RunSpec
 from mlforge.runtime.control import wait_for_state, write_control
@@ -52,15 +53,11 @@ _IMPLEMENTED = {
     "status", "inspect", "events", "store", "validate", "preflight", "lease",
     "train", "resume", "pause", "stop", "watch", "hardware", "dataset",
     "prepare", "fork", "retrain", "finetune", "model",
+    "evaluate", "compare", "infer", "export", "package",
 }
 _PENDING = {
     "init": 1,
     "configure": 1,
-    "evaluate": 11,
-    "compare": 11,
-    "infer": 11,
-    "export": 11,
-    "package": 11,
 }
 
 #: States after which a worker is gone and `--attach` may stop waiting.
@@ -114,7 +111,8 @@ def _build_parser() -> argparse.ArgumentParser:
     val = sub.add_parser(
         "validate", help="run the 19-step validation gate for a run (fail-closed)"
     )
-    val.add_argument("run_id")
+    val.add_argument("object_id", help="run id or model ref (13 §4.1: "
+                                       "validate <RUN|MODEL>)")
     val.add_argument("--json", action="store_true")
 
     pf = sub.add_parser(
@@ -221,8 +219,59 @@ def _build_parser() -> argparse.ArgumentParser:
     md_ins = md_sub.add_parser("inspect", help="model detail + lineage")
     md_ins.add_argument("ref", help="name | name:vN | model://name:vN")
     md_ins.add_argument("--json", action="store_true")
-    md_imp = md_sub.add_parser("import", help="(pending build step 11)")
-    md_imp.add_argument("path")
+    md_imp = md_sub.add_parser("import", help="import an external model "
+                                "package (13 §4.1)")
+    md_imp.add_argument("path", help="package directory: model_spec.json "
+                                     "+ model.safetensors (12 §15.3)")
+    md_imp.add_argument("--command-id", default=None,
+                        help="dedupe key: a retry returns the original result (§4.4)")
+    md_imp.add_argument("--json", action="store_true")
+
+    # EVALUATION / INFERENCE / ARTIFACT (13 §4.1, §6.7–§6.10; build step 11)
+    ev = sub.add_parser("evaluate", help="produce an evaluation artifact "
+                        "(13 §6.7)")
+    ev.add_argument("model", help="model ref: name | name:vN | model://name:vN")
+    ev.add_argument("--dataset", required=True,
+                    help="dataset ref: name | name:vN | dataset://name:vN")
+    ev.add_argument("--protocol", default=None, metavar="FILE",
+                    help="JSON protocol overrides (split/seed/thresholds/... "
+                         "— derived fields are not overridable)")
+    ev.add_argument("--command-id", default=None,
+                    help="dedupe key: never recompute a finished evaluation (§4.4)")
+    ev.add_argument("--yes", action="store_true",
+                    help="skip the SHOW PROTOCOL confirmation")
+    ev.add_argument("--json", action="store_true")
+
+    cp = sub.add_parser("compare", help="side-by-side evaluation comparison "
+                        "(13 §6.10 — descriptive, never a winner)")
+    cp.add_argument("models", nargs="+", metavar="MODEL")
+    cp.add_argument("--json", action="store_true")
+
+    inf = sub.add_parser("infer", help="one-shot inference (13 §6.8)")
+    inf.add_argument("model", help="model ref")
+    inf.add_argument("input", help="input file (validated against the "
+                                   "contract's input_schema)")
+    inf.add_argument("--json", action="store_true")
+
+    ex = sub.add_parser("export", help="export artifact + inference contract "
+                        "(13 §6.9)")
+    ex.add_argument("model", help="model ref")
+    ex.add_argument("--format", required=True, dest="fmt",
+                    help="onnx | openvino | tensorrt | coreml | tflite")
+    ex.add_argument("--command-id", default=None,
+                    help="dedupe key: never recompute a finished export (§4.4)")
+    ex.add_argument("--json", action="store_true")
+
+    pk = sub.add_parser("package", help="build the inference bundle "
+                         "(12 §15.3)")
+    pk.add_argument("model", help="model ref")
+    pk.add_argument("--command-id", default=None,
+                    help="dedupe key: never rebuild a finished bundle (§4.4)")
+    pk.add_argument("--json", action="store_true")
+
+    sv = sub.add_parser("serve",
+                        help="(long-running model server — no build step yet)")
+    sv.add_argument("extra", nargs=argparse.REMAINDER)
 
     st_gc_parent = sub.add_parser("store", help="artifact store operations")
     st_gc = st_gc_parent.add_subparsers(dest="store_command").add_parser(
@@ -753,12 +802,41 @@ def _do_finetune(wf: WorkflowAPI, args) -> int:
 
 
 def _do_model(wf: WorkflowAPI, args) -> int:
-    """`model list` / `model inspect` (+ lineage) — read-only registry
-    surfaces (13 §4.1). `model import` arrives with build step 11."""
+    """`model list` / `model inspect` (+ lineage, contract) / `model
+    import` — registry surfaces (13 §4.1)."""
     if args.model_command == "import":
-        print("[NOT_IMPLEMENTED] `mlforge model import` arrives in build "
-              "step 11 (13 §11). Nothing was executed.", file=sys.stderr)
-        return 4
+        def _start() -> dict:
+            entry = wf.import_external_model(args.path)
+            return {
+                "status": "imported",
+                "exit": 0,
+                "model_id": entry["model_id"],
+                "model_ref": (f"{entry['name']}:{entry['version']}"
+                              if entry.get("name") else entry["model_id"]),
+                "state": entry["state"],
+                "origin": entry.get("origin"),
+                "artifact_hash": entry.get("artifact_hash"),
+            }
+
+        # §4.4: duplicate name:version blocks inside import; a retry with
+        # the same command_id returns the original registration.
+        result = (
+            wf.execute_idempotent(
+                args.command_id, "model_import", _start,
+                kind="model",
+                run_id=lambda r: (r or {}).get("model_id"),
+            )
+            if args.command_id else _start()
+        )
+        if args.json:
+            print(json.dumps(result, indent=2, sort_keys=True))
+        else:
+            print(f"imported {result['model_ref']} ({result['model_id']}) — "
+                  f"{result['state']}")
+            print(f"  origin {result.get('origin')} · weights "
+                  f"{_short_hash(result.get('artifact_hash'))} · "
+                  f"contract created from the package (12 §15.3)")
+        return 0
     if args.model_command == "list":
         models = wf.list_models()
         if args.json:
@@ -785,7 +863,9 @@ def _do_model(wf: WorkflowAPI, args) -> int:
                 chain = [c["run_id"] for c in wf.lineage_chain(entry["run_id"])]
             except NotFound:
                 lineage = None  # provenance run not in this workspace
-        out = {**entry, "lineage": lineage, "chain": chain}
+        contract_dir = contract_source_dir(wf.root, entry)
+        out = {**entry, "lineage": lineage, "chain": chain,
+               "inference_contract_present": contract_dir is not None}
         if args.json:
             print(json.dumps(out, indent=2, sort_keys=True, default=str))
         else:
@@ -796,6 +876,8 @@ def _do_model(wf: WorkflowAPI, args) -> int:
             print(f"Run                     {entry.get('run_id') or '—'}")
             print(f"Run spec                {entry.get('run_spec_hash') or '—'}")
             print(f"Artifact                {entry.get('artifact_hash') or '—'}")
+            print(f"Inference contract      "
+                  f"{'present (12 §15.3)' if contract_dir else 'none yet — export or import creates one'}")
             if lineage:
                 print("\nLineage")
                 print(f"  origin                {lineage.get('origin')}")
@@ -1205,6 +1287,300 @@ def _do_prepare(wf: WorkflowAPI, args) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# evaluate / compare / infer / export / package (13 §6.7–§6.10, 12 §15;
+# build step 11)
+# ---------------------------------------------------------------------------
+
+
+def _short_hash(value: Any) -> str:
+    """Readable hash for tables — full values always stay in --json."""
+    if value is None:
+        return "—"
+    text = str(value)
+    return text if len(text) <= 20 else text[:19] + "…"
+
+
+def _load_protocol(path: str) -> dict:
+    p = Path(path)
+    if not p.is_file():
+        raise PreconditionFailed(
+            f"protocol file not found: {path}",
+            hint='expected JSON, e.g. {"seed": 7, "split": "val"}',
+        )
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValidationBlock(
+            f"protocol file {path} is not valid JSON: {exc}"
+        ) from exc
+    if not isinstance(data, dict):
+        raise ValidationBlock(
+            "protocol file must be a JSON object",
+            hint='e.g. {"seed": 7, "thresholds": {"iou": 0.5}}',
+        )
+    return data
+
+
+def _print_eval_preview(model_ref: str, rec: dict) -> None:
+    """13 §6.7 SHOW PROTOCOL — built by the same deterministic code that
+    writes the artifact: what is shown is exactly what gets recorded."""
+    proto = rec["evaluation_protocol"]
+    thr = proto["thresholds"]
+    nms = proto["nms"]
+    print(f"Evaluating {model_ref}\n")
+    print(f"  Dataset       {rec['dataset_ref']}  identity "
+          f"{_short_hash(rec['dataset_hash'])}")
+    print(f"  Model hash    {_short_hash(rec['model_hash'])}")
+    print(f"  Code hash     {_short_hash(rec['code_hash'])}")
+    print(f"  Environment   {_short_hash(rec['environment_hash'])}")
+    print("  Protocol")
+    print(f"    split        {proto['split']}")
+    print(f"    metrics      {', '.join(DEFAULT_METRIC_NAMES)} "
+          f"(definitions {_short_hash(proto['metric_definitions'])})")
+    print(f"    aggregation  {proto['aggregation']}")
+    print(f"    thresholds   iou={thr['iou']} conf={thr['conf']}")
+    print(f"    nms          iou_thresh={nms['iou_thresh']} "
+          f"max_det={nms['max_det']}")
+    print(f"    seed         {proto['seed']}")
+    print(f"    harness      {_short_hash(proto['harness_code_hash'])}")
+    print("\n  evaluation identity = model + dataset + code + environment "
+          "+ protocol (five components, 12 §15.4)")
+    print(f"  harness: {rec['harness']} — {rec['note']}")
+    print()
+
+
+def _do_evaluate(wf: WorkflowAPI, args) -> int:
+    """13 §6.7: SHOW PROTOCOL → confirm → immutable evaluation artifact.
+    Resolution/validation run during the preview (unknown dataset/model →
+    exit 2, unknown protocol keys → exit 1) before anything is written."""
+    protocol = _load_protocol(args.protocol) if args.protocol else None
+    if not args.yes and not args.json:
+        preview = wf.preview_evaluation(
+            args.model, args.dataset, protocol_overrides=protocol
+        )
+        _print_eval_preview(args.model, preview)
+        if not _confirm("Produce evaluation artifact? [Y/n] "):
+            print("Cancelled — no evaluation artifact was written.")
+            return 0
+
+    def _start() -> dict:
+        rec = wf.evaluate_model(
+            args.model, args.dataset, protocol_overrides=protocol
+        )
+        return {
+            "status": "evaluated",
+            "exit": 0,
+            "eval_id": rec["eval_id"],
+            "uri": f"evaluation://{rec['eval_id']}",
+            "model_ref": rec["model_ref"],
+            "model_id": rec["model_id"],
+            "dataset_ref": rec["dataset_ref"],
+            "metrics": rec["metrics"],
+            "evaluation_protocol_hash": rec["evaluation_protocol_hash"],
+            "identity": rec["identity"],
+            "harness": rec["harness"],
+        }
+
+    # §4.4: a finished evaluation is never recomputed — the retry returns
+    # the original eval_id.
+    result = (
+        wf.execute_idempotent(
+            args.command_id, "evaluate", _start,
+            kind="model",
+            run_id=lambda r: (r or {}).get("model_id"),
+        )
+        if args.command_id else _start()
+    )
+    if args.json:
+        print(json.dumps(result, indent=2, sort_keys=True))
+    else:
+        metrics = " ".join(
+            f"{name} {value}" for name, value in result["metrics"].items()
+        )
+        print(f"{result['uri']}   {metrics}")
+    return 0
+
+
+def _print_comparison(data: dict) -> None:
+    """13 §6.10 — descriptive side-by-side; never averaged across
+    protocols, never a winner for the user to hide behind."""
+    cols: list[dict] = data["columns"]
+    refs = [c["ref"] for c in cols]
+
+    def cell(col: dict, pick, missing: str = "—") -> str:
+        ev = col.get("evaluation")
+        return pick(ev) if ev is not None else missing
+
+    ordered: list[str] = list(DEFAULT_METRIC_NAMES)
+    for col in cols:
+        for name in (col.get("evaluation") or {}).get("metrics", {}):
+            if name not in ordered:
+                ordered.append(name)
+
+    rows: list[tuple[str, list[str]]] = [
+        ("Dataset", [c["dataset"] for c in cols]),
+        ("Base model", [c["base_model"] for c in cols]),
+    ]
+    for name in ordered:
+        rows.append((
+            name,
+            [cell(c, lambda ev, n=name: str(ev["metrics"].get(n, "—")))
+             for c in cols],
+        ))
+    rows.append((
+        "Evaluation",
+        [cell(c, lambda ev: ev.get("eval_id") or "—") for c in cols],
+    ))
+    rows.append((
+        "Protocol",
+        [cell(c, lambda ev: _short_hash(ev["evaluation_protocol_hash"]),
+              missing="no evaluation")
+         for c in cols],
+    ))
+
+    def comparable_cell(col: dict) -> str:
+        if col.get("evaluation") is None:
+            return "no evaluation"
+        return "yes" if col.get("comparable") else "NOT_COMPARABLE"
+
+    rows.append(("Comparable", [comparable_cell(c) for c in cols]))
+
+    label_w = max([len("Comparable")] + [len(lbl) for lbl, _ in rows])
+    widths = [
+        max([len(refs[i])] + [len(cells[i]) for _, cells in rows])
+        for i in range(len(cols))
+    ]
+
+    print("MODEL COMPARISON\n")
+    header = " " * label_w
+    for ref, w in zip(refs, widths):
+        header += f"  {ref:<{w}}"
+    print(header)
+    for label, cells in rows:
+        line = f"{label:<{label_w}}"
+        for text, w in zip(cells, widths):
+            line += f"  {text:<{w}}"
+        print(line)
+
+    has_not_comparable = False
+    for col in cols:
+        ev = col.get("evaluation")
+        if ev is None:
+            print(f"\n{col['ref']}: no evaluation yet — `mlforge evaluate "
+                  f"{col['ref']} --dataset <DATASET>`")
+        elif not col.get("comparable"):
+            has_not_comparable = True
+            print(f"\nNOT_COMPARABLE: {col['ref']} used evaluation protocol "
+                  f"{_short_hash(col.get('protocol_hash'))} — shown, never "
+                  f"averaged (13 §6.10)")
+    if has_not_comparable:
+        print("\nNOT_COMPARABLE = a different evaluation protocol — rows stay "
+              "side by side and are never averaged into one number.")
+    print("\n(descriptive only — comparison does not choose a winner for "
+          "the user)")
+
+
+def _do_compare(wf: WorkflowAPI, args) -> int:
+    """13 §6.10: read-only comparison — exit 2 for unknown refs, no
+    confirmation (nothing is written)."""
+    data = wf.compare_models(args.models)
+    if args.json:
+        print(json.dumps(data, indent=2, sort_keys=True))
+    else:
+        _print_comparison(data)
+    return 0
+
+
+def _do_infer(wf: WorkflowAPI, args) -> int:
+    """13 §6.8: contract check → SAFE | BLOCK (exit 1) → output envelope.
+    The contract itself is never weakened to accept an input — BLOCK."""
+    rec = wf.infer_model(args.model, args.input)
+    if args.json:
+        print(json.dumps(rec, indent=2, sort_keys=True))
+        return 0
+    runtime = rec.get("runtime") or {}
+    print(f"infer {rec['model_ref']} ← {args.input}")
+    print(f"  contract check: SAFE ({_short_hash(rec.get('contract_hash'))} "
+          f"· {runtime.get('framework', '—')})")
+    print(f"  output:   outputs/{rec['output_id']}.json")
+    print(f"  identity: {_short_hash(rec.get('identity'))}")
+    note = (rec.get("result") or {}).get("note")
+    if note:
+        print(f"  note: {note}")
+    return 0
+
+
+def _do_export(wf: WorkflowAPI, args) -> int:
+    """13 §6.9: validation report → immutable export + inference contract.
+    A BLOCK (unknown format / unsupported operator) exits 1 and leaves
+    nothing behind — never a partial export."""
+
+    def _start() -> dict:
+        rec = wf.export_model(args.model, args.fmt)
+        return {**rec, "status": "exported", "exit": 0}
+
+    result = (
+        wf.execute_idempotent(
+            args.command_id, "export", _start,
+            kind="model",
+            run_id=lambda r: (r or {}).get("model_id"),
+        )
+        if args.command_id else _start()
+    )
+    if args.json:
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return 0
+    labels = {"architecture": "Architecture", "operators": "Operators",
+              "dynamic_shapes": "Dynamic shapes"}
+    validations = result.get("validations") or {}
+    num = result.get("numerical_validation") or {}
+    print("Export")
+    print(f"  Source: {result['model_ref']} → "
+          f"Target: {str(result.get('format', '')).upper()}")
+    print("  Validating: " + " · ".join(
+        f"{labels.get(key, key)} {value}"
+        for key, value in validations.items()
+    ))
+    print(f"  Numerical validation: max error {num.get('max_error')} "
+          f"(tolerance {num.get('tolerance')}) {num.get('result')}  "
+          f"[{num.get('harness')} harness]")
+    print(f"  Export artifact: {result['export_id']} "
+          f"(own artifact identity {_short_hash(result.get('identity'))})")
+    return 0
+
+
+def _do_package(wf: WorkflowAPI, args) -> int:
+    """12 §15.3: contract required, secrets scan, immutable bundle.
+    Packaging changes NO state — it only records bundle_created."""
+
+    def _start() -> dict:
+        rec = wf.package_model(args.model)
+        return {**rec, "status": "packaged", "exit": 0}
+
+    result = (
+        wf.execute_idempotent(
+            args.command_id, "package", _start,
+            kind="model",
+            run_id=lambda r: (r or {}).get("model_id"),
+        )
+        if args.command_id else _start()
+    )
+    if args.json:
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return 0
+    integrity = result.get("integrity") or {}
+    print("Package")
+    print(f"  Model:     {result['model_ref']} "
+          f"(contract {_short_hash(result.get('contract_hash'))})")
+    print("  Secrets:   PASS (model, run, and contract sources scanned)")
+    print(f"  Integrity: {' · '.join(integrity)}")
+    print(f"  Bundle:    {result['bundle_id']} → "
+          f"bundles/{result['bundle_id']}/")
+    print(f"  Files:     {' '.join(result.get('files') or [])}")
+    return 0
+
+
 def main(argv: list[str] | None = None, *, wf_factory=None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
@@ -1218,6 +1594,18 @@ def main(argv: list[str] | None = None, *, wf_factory=None) -> int:
         print(
             f"[NOT_IMPLEMENTED] `mlforge {args.command}` arrives in build step {step} "
             f"(13 §11). Nothing was executed.",
+            file=sys.stderr,
+        )
+        return 4
+
+    if args.command == "serve":
+        # Deliberately NOT in _PENDING: no build step (13 §11 runs through
+        # 12) will ever deliver it — honest message, still fail-closed.
+        print(
+            "[NOT_IMPLEMENTED] `mlforge serve` (long-running model server, "
+            "13 §4.1) has no build step yet (13 §11 covers through 12) — "
+            "`mlforge infer` is the contract-checked one-shot path today. "
+            "Nothing was executed.",
             file=sys.stderr,
         )
         return 4
@@ -1244,6 +1632,16 @@ def main(argv: list[str] | None = None, *, wf_factory=None) -> int:
             return _do_dataset(wf, args)
         if args.command == "prepare":
             return _do_prepare(wf, args)
+        if args.command == "evaluate":
+            return _do_evaluate(wf, args)
+        if args.command == "compare":
+            return _do_compare(wf, args)
+        if args.command == "infer":
+            return _do_infer(wf, args)
+        if args.command == "export":
+            return _do_export(wf, args)
+        if args.command == "package":
+            return _do_package(wf, args)
         if args.command == "status":
             return _do_status(wf, args)
 
@@ -1295,7 +1693,28 @@ def main(argv: list[str] | None = None, *, wf_factory=None) -> int:
             return 0
 
         if args.command == "validate":
-            report = wf.validate_run(args.run_id)
+            obj = args.object_id
+            try:
+                report = wf.validate_run(obj)
+            except NotFound as run_err:
+                # 13 §4.1: `validate <RUN|MODEL>` — a model ref falls
+                # through to registry/contract integrity checks; a genuine
+                # unknown id keeps exit 2 with the run's message.
+                try:
+                    mreport = wf.model_integrity_report(obj)
+                except NotFound:
+                    raise run_err from None
+                if args.json:
+                    print(json.dumps(mreport, indent=2, sort_keys=True))
+                else:
+                    print(f"MODEL VALIDATION  {mreport['model_ref']}  "
+                          f"[{mreport['state']}]")
+                    for check in mreport["checks"]:
+                        print(f"[{check['status']}] {check['name']}: "
+                              f"{check['detail']}")
+                    print("RESULT: " + ("MODEL BLOCKED" if mreport["blocked"]
+                                        else "MODEL OK"))
+                return 1 if mreport["blocked"] else 0
             if args.json:
                 print(json.dumps(report.to_dict(), indent=2, sort_keys=True))
             else:

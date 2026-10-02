@@ -614,10 +614,12 @@ def test_cli_model_list_and_inspect(tmp_path, capsys):
     assert data["lineage"]["origin"] == "train"
 
 
-def test_cli_model_import_pending_exit_4(tmp_path, capsys):
-    code = main(["--root", str(tmp_path), "model", "import", "x.tar"])
-    assert code == 4
-    assert "[NOT_IMPLEMENTED]" in capsys.readouterr().err
+def test_cli_model_import_missing_path_exit_2(tmp_path, capsys):
+    # build step 11: `model import` is implemented — a path that is not a
+    # package directory is a clean NotFound (13 §7), never exit 4
+    code = main(["--root", str(tmp_path), "model", "import", "x_missing"])
+    assert code == 2
+    assert "not found" in capsys.readouterr().err
 
 
 def test_cli_inspect_run_includes_lineage(tmp_path, capsys):

@@ -100,12 +100,27 @@ mlforge/
     menu, NEW run + NEW model, base → `USED_AS_FINE_TUNE_BASE` and
     never mutated), completion publishes the model (`name:vN`,
     provenance, artifact = newest COMMIT marker) with per-name version
-    bumps, `model list|inspect` (+ lineage chain) and `model import`
-    pending exit 4, allowlisted `--set`/`--config` overrides (typo ⇒
-    BLOCK), `--command-id` dedupe, `inspect <run>` carries lineage,
+    bumps, `model list|inspect` (+ lineage chain), allowlisted
+    `--set`/`--config` overrides (typo ⇒ BLOCK), `--command-id` dedupe, `inspect <run>` carries lineage,
     monotonic ULIDs (same-ms ids sort by creation — retrain source is
     deterministic)
-11. ⛔ Evaluate/compare/infer/export/package
+11. ✅ Evaluate/compare/infer/export/package + `model import` —
+    five-component evaluation identity (model+dataset+code+environment+
+    protocol, 12 §15.4) with SHOW PROTOCOL preview that equals the
+    recorded artifact, write-once evaluation/export/bundle artifacts,
+    first-consumption model state marker (AVAILABLE → exactly one of
+    EVALUATED/EXPORTED/...; later consumptions journal no-`to` events),
+    operator/format validation (unknown format or unsupported operator ⇒
+    BLOCK with the closed registry, never a partial export), contract
+    reuse + runtime retargeting, package (contract required, secrets
+    scan, provenance, no state change), one-shot `infer` (contract
+    check SAFE|BLOCK, missing input ⇒ exit 2, deterministic output
+    identity), descriptive `compare` (NOT_COMPARABLE = different
+    protocol, shown never averaged, never a winner), `evaluate/export/
+    package --command-id` dedupe (original result, never recomputed),
+    `model import` (declared identity, hashed weights, duplicate `name:vN`
+    BLOCKs, origin `import`), `validate <RUN|MODEL>`, `serve` honest
+    exit 4 (no build step yet)
 12. ⛔ TUI/GUI over the same Workflow API
 
 ## Invariants already enforced in code
@@ -198,6 +213,30 @@ mlforge/
   `finetune` all create runs; the parent's `run_spec.json` is never
   touched (frozen identity), and a fork that changes nothing BLOCKs
   (resume continues, retrain repeats — 12 §4, 13 §6.3).
+* **An evaluation identity has exactly five components** — model hash,
+  re-hashed dataset identity, code hash, environment fingerprint, and
+  the evaluation protocol hash (metric definitions + harness code hash
+  are derived, never user-overridable — faking them would fake
+  comparability). SHOW PROTOCOL shows exactly what gets recorded; a
+  different protocol is a DIFFERENT artifact, never an update
+  (12 §15.4, 13 §6.7).
+* **Comparison is descriptive, never a verdict** — protocol-hash
+  equality decides `comparable`; a different protocol renders
+  `NOT_COMPARABLE` and the rows are shown side by side but never
+  averaged; comparison never picks a winner (13 §6.10).
+* **The model's consumption marker fires once** — AVAILABLE fans out to
+  exactly one of EVALUATED/EXPORTED/DEPLOYED/USED_AS_FINE_TUNE_BASE;
+  later consumptions (second evaluation, export after evaluate) write
+  their artifact plus a no-`to` journal event and never flip state back
+  (13 §5.4).
+* **No partial exports, no invented contracts** — an unknown format or
+  an unsupported operator BLOCKs before anything is written, listing the
+  closed registry / the offending operators and the formats that can
+  host the graph; `package` and `infer` BLOCK without a contract, and an
+  existing contract is reused (operators preserved) with only the
+  runtime retargeted (13 §6.9, 12 §15.3).
+* **Secrets never enter artifacts** — export and package scan the model,
+  run, and contract sources; any finding BLOCKs (12 §16, 13 §7).
 * **Run completion publishes its model** — `COMPLETED` ⇒ registry
   entry CREATED → VALIDATED → AVAILABLE with provenance (`name:vN`,
   run, spec hash, artifact = newest COMMIT marker or null) and a

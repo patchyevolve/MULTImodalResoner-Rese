@@ -70,6 +70,22 @@ def new_eval_id() -> str:
     return f"eval_{new_ulid()}"
 
 
+def new_export_id() -> str:
+    """Export artifact identity (13 §4.1 `export` — "own artifact
+    identity", §6.9)."""
+    return f"exp_{new_ulid()}"
+
+
+def new_bundle_id() -> str:
+    """Inference bundle identity (13 §4.1 `package`)."""
+    return f"bdl_{new_ulid()}"
+
+
+def new_output_id() -> str:
+    """One-shot inference output identity (13 §6.8 `infer`)."""
+    return f"out_{new_ulid()}"
+
+
 def new_command_id() -> str:
     """Client-supplied idempotency key (13 §4.4). CLI generates one per
     invocation when the user does not supply --command-id."""
