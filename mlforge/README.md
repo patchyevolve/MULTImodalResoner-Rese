@@ -4,6 +4,38 @@ A hardware-agnostic, project-agnostic ML training system: immutable experiment
 identity, cryptographic artifact identities, fail-closed validation, explicit
 resume/fork semantics, crash reconciliation, and portable run folders.
 
+## Install
+
+Zero runtime dependencies — the wheel is self-contained and installs
+anywhere Python ≥ 3.11 lives:
+
+```bash
+# recommended: isolated CLI on your PATH
+pipx install /path/to/repo/multimodal_reasoner_research/mlforge
+
+# or into any virtualenv / conda env
+pip install /path/to/repo/multimodal_reasoner_research/mlforge
+
+# or build a portable wheel for lab machines (offline-installable)
+python -m pip wheel . -w dist --no-deps
+pip install dist/mlforge-0.1.0-py3-none-any.whl
+```
+
+Then `mlforge` is a single command from any directory (`--root` defaults
+to the current directory):
+
+```bash
+mlforge                  # opens the command reference (exit 0)
+mlforge --version        # mlforge 0.1.0
+mlforge status           # overview of runs in this directory's workspace
+mlforge watch            # live dashboard (TUI)
+mlforge gui              # localhost web dashboard (http://127.0.0.1:8765)
+python -m mlforge ...    # same entry point when scripts-dir isn't on PATH
+```
+
+`pip install --user` places the command in `~/.local/bin` — add that to
+PATH if your shell does not find `mlforge`.
+
 ## Ground truth (normative)
 
 Implementation follows these two documents exactly; where code and docs
