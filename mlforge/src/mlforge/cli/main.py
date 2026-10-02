@@ -43,6 +43,10 @@ from mlforge.ingest.config import (
     set_path as ingest_set_path,
     write_registry as ingest_write_registry,
 )
+from mlforge.ingest.transforms import (
+    dataset_types as ingest_dataset_types,
+    suggest_transforms,
+)
 from mlforge.leases import LeaseState, RunLeaseManager
 from mlforge.ops import DEFAULT_METRIC_NAMES, contract_source_dir
 from mlforge.planner import (
@@ -378,6 +382,13 @@ def _build_parser() -> argparse.ArgumentParser:
     ds_ver.add_argument("--command-id", default=None)
     ds_ver.add_argument("--json", action="store_true")
 
+    ds_types = ds_sub.add_parser(
+        "types",
+        help="supported dataset types & transforms — what fits what",
+    )
+    ds_types.add_argument("--json", action="store_true",
+                          help="machine-readable catalog")
+
     pr = sub.add_parser(
         "prepare",
         help="transform VERIFIED sources into <model>_prepared (13 §6.6)",
@@ -701,6 +712,10 @@ def _print_init_next_steps(name: str, target: Path) -> None:
     print(f"  cd {target}")
     print("  mlforge dataset add <ID> <PATH>     "
           "# register + verify identity; sets this machine's path")
+    print("  mlforge dataset verify <ID>         "
+          "# prove the bytes still match (prepare gate)")
+    print("  mlforge dataset types               "
+          "# supported formats & their transforms")
     print("  $EDITOR ingestion.yaml              "
           "# say which transform feeds which model")
     print("  mlforge prepare <MODEL>             # derived <MODEL>_prepared (§6.6)")
@@ -1566,6 +1581,13 @@ def _dataset_add(wf: WorkflowAPI, args) -> int:
     else:
         print(f"{args.dataset_id}: {result['status'].upper()} — "
               f"{result['identity']}")
+        candidates = suggest_transforms(
+            [e.relative_path for e in manifest.files])
+        if candidates:
+            print(f"  likely transform: {' / '.join(candidates)}")
+            print(f"  next: mlforge dataset verify {args.dataset_id} → set "
+                  "`transform:` (mlforge dataset types) in ingestion.yaml "
+                  "→ mlforge prepare <model>")
     return 0
 
 
@@ -1685,7 +1707,38 @@ def _do_dataset(wf: WorkflowAPI, args) -> int:
         return _dataset_list(wf, args)
     if args.dataset_command == "verify":
         return _dataset_verify(wf, args)
+    if args.dataset_command == "types":
+        return _dataset_types(args)
     return 4  # argparse required=True keeps this unreachable
+
+
+def _dataset_types(args) -> int:
+    """The answer to 'what options are there, which does what' — a stable,
+    readable catalog of input type → transform → output, plus the honest
+    gaps (never faked, fail-closed)."""
+    catalog = ingest_dataset_types()
+    if args.json:
+        print(json.dumps(catalog, indent=2, sort_keys=True))
+        return 0
+    print("MLForge dataset types — set one as `transform:` in ingestion.yaml")
+    print()
+    for entry in catalog["supported"]:
+        print(f"  {entry['name']}   [{entry['title']}]")
+        print(f"    input:    {entry['inputs']}")
+        print(f"    produces: {entry['produces']}")
+        print()
+    print("Not supported yet — fail-closed, never faked:")
+    for entry in catalog["planned"]:
+        print(f"  {entry['name']} ({entry['title']}): {entry['reason']}")
+    print()
+    print("Then, in ingestion.yaml (12 §10.2):")
+    print("  models:")
+    print("    <model_name>:")
+    print(f"      transform: {catalog['supported'][0]['name']}   "
+          "# one of the names above")
+    print("      train_sources: [<dataset_id>:train]")
+    print("  and run:  mlforge prepare <model_name>")
+    return 0
 
 
 def _do_prepare(wf: WorkflowAPI, args) -> int:
@@ -2044,8 +2097,12 @@ def _do_hello(args) -> int:
         print()
         print("Start here:")
         print("  mlforge init myproj && cd myproj   # create a workspace")
+        print("  mlforge dataset types              "
+              "# what formats are supported, which transform fits")
         print("  mlforge dataset add books /path/to/books --yes"
               "   # registers identity + this machine's path")
+        print("  mlforge dataset verify books         "
+              "# prove the bytes still match (prepare gate)")
         print("  $EDITOR ingestion.yaml             "
               "# say which transform feeds which model")
         print("  mlforge prepare <model>            # extract → chunk")

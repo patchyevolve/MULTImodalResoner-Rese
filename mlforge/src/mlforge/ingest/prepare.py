@@ -236,10 +236,11 @@ def prepare(root: str | Path, model: str, *, workflow: Any) -> PreparedResult:
                 + (", ".join(sorted(plans)) or "(none)")
                 + " | registered transforms: "
                 + ", ".join(registry_names())
+                + " (full catalog: mlforge dataset types)"
                 + " — declare yours (12 §10.2):\n"
                 "        models:\n"
                 f"          {model}:\n"
-                "            transform: text_corpus   # or coco_detection\n"
+                "            transform: text_corpus   # see mlforge dataset types\n"
                 "            train_sources: [<dataset>:train]"
             ),
         )

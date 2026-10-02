@@ -10,7 +10,9 @@ four identity fields.
 
 from __future__ import annotations
 
+import io
 import json
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -29,10 +31,15 @@ from mlforge.ingest.prepare import derived_dataset_id, prepare
 from mlforge.ingest.transforms import (
     ResolvedSource,
     cache_key,
+    dataset_types,
     env_fingerprint,
     get_transform,
+    mot_challenge,
+    reid_crops,
     registry_names,
     run_transform,
+    suggest_transforms,
+    tabular,
     transform_identity,
 )
 from mlforge.validation import RESUME_GATE_STEPS, provide_pass
@@ -633,3 +640,219 @@ def test_explicit_dataset_provider_wins(ws, home, tmp_path):
     run_id = wf.create_run(_spec()).run_id  # nothing registered
     report = wf.validate_run(run_id)
     assert not report.blocked, report.render()
+
+
+# ---------------------------------------------------------------------------
+# dataset types catalog + new transforms (02_dataset_preparation; 12 §10.2)
+# ---------------------------------------------------------------------------
+
+#: 9-column MOTChallenge layout from 02_dataset_preparation §3 — MOT17,
+#: MOT20 and SportsMOT all ship this (with the `frame,id,bb_left,...`
+#: header spelling real gt.txt files use).
+MOT_CSV = (
+    "frame,id,bb_left,bb_top,bb_width,bb_height,conf,class,visibility\n"
+    "1,1,10,20,30,40,1,1,0.85\n"
+    "2,1,11,21,31,41,1,1,0.90\n"
+)
+
+
+def _src(tmp_path: Path, name: str, files: dict[str, bytes]) -> ResolvedSource:
+    """A ResolvedSource over a fresh file tree (identity computed for real)."""
+    base = _tree(tmp_path / "type-sources", name, files)
+    manifest = build_manifest(base, name)
+    return ResolvedSource(ref=f"{name}:train", split="train",
+                          dataset_id=name, path=base,
+                          identity=manifest.identity, entries=manifest.files)
+
+
+# -- mot_challenge (MOT17 / MOT20 / SportsMOT, 02 §3) ----------------------
+
+def test_mot_challenge_valid_gt(tmp_path):
+    src = _src(tmp_path, "mot17",
+               {"gt/gt.txt": MOT_CSV.encode(),
+                "img1/000001.jpg": b"jpgframe"})
+    out = mot_challenge([src])
+    assert out["output_schema"] == "mot_challenge.v1"
+    # every file (frames included) is a provenance record
+    assert {r["relative_path"] for r in out["records"]} == {
+        "gt/gt.txt", "img1/000001.jpg"}
+    ann = out["annotations"][0]
+    assert (ann["boxes"], ann["frames"], ann["tracks"]) == (2, 2, 1)
+    assert ann["canonical_sha256"]
+
+
+def test_mot_challenge_headerless_ok(tmp_path):
+    src = _src(tmp_path, "mot20",
+               {"gt.csv": b"1,1,10,20,30,40,1,1,0.5\n"})
+    out = mot_challenge([src])
+    assert out["annotations"][0]["boxes"] == 1
+
+
+def test_mot_challenge_wrong_layout_blocks(tmp_path):
+    src = _src(tmp_path, "badmot", {"gt.csv": b"a,b,c\n1,2,3\n"})
+    with pytest.raises(ValidationBlock, match="MOTChallenge"):
+        mot_challenge([src])
+
+
+def test_mot_challenge_bad_value_blocks(tmp_path):
+    src = _src(tmp_path, "badval",
+               {"gt.csv": b"1,1,10,20,30,40,1,1,42\n"})  # visibility 0..1
+    with pytest.raises(ValidationBlock, match="0..1"):
+        mot_challenge([src])
+
+
+def test_mot_challenge_stray_txt_skipped_no_annotations_blocks(tmp_path):
+    src = _src(tmp_path, "readmeonly", {"readme.txt": b"see motchallenge.net"})
+    with pytest.raises(ValidationBlock, match="no MOTChallenge CSV"):
+        mot_challenge([src])
+
+
+# -- reid_crops (Market1501, 02 §5 / 12 §10.2) -----------------------------
+
+def test_reid_crops_manifest(tmp_path):
+    src = _src(tmp_path, "market", {
+        "bounding_box_train/0001_c1s1_000001_01.jpg": b"a",
+        "bounding_box_train/0001_c2s1_000002_01.jpg": b"b",
+        "bounding_box_train/0002_c1s1_000003_01.jpg": b"c",
+        "query/0001_c3s1_000004_01.jpg": b"d",
+        "readme.txt": b"x",
+    })
+    out = reid_crops([src])
+    assert out["output_schema"] == "reid_crops.v1"
+    assert {r["identity"] for r in out["records"]} == {"0001", "0002"}
+    # split comes from the folder, not from the caller's assumption
+    assert [r for r in out["records"] if r["split"] == "query"][0]["identity"] == "0001"
+    by_id = {i["identity"]: i for i in out["identities"]}
+    assert by_id["0001"]["images"] == 3
+    assert by_id["0001"]["cameras"] == [1, 2, 3]
+
+
+def test_reid_crops_wrong_naming_blocks(tmp_path):
+    src = _src(tmp_path, "plainimgs", {"imgs/cat.jpg": b"x"})
+    with pytest.raises(ValidationBlock, match="Market1501"):
+        reid_crops([src])
+
+
+# -- tabular (csv / tsv / jsonl / xlsx) ------------------------------------
+
+def test_tabular_csv_strict_rows(tmp_path):
+    src = _src(tmp_path, "tables",
+               {"data.csv": b"name,age\nalice,30\nbob,25\n"})
+    out = tabular([src])
+    assert out["output_schema"] == "tabular.v1"
+    assert [r["data"] for r in out["records"]] == [
+        {"name": "alice", "age": "30"}, {"name": "bob", "age": "25"}]
+    assert out["tables"][0]["columns"] == ["name", "age"]
+    assert out["tables"][0]["rows"] == 2
+
+
+def test_tabular_ragged_rows_block(tmp_path):
+    src = _src(tmp_path, "ragged", {"data.csv": b"a,b\n1,2\n3\n"})
+    with pytest.raises(ValidationBlock, match="never padded"):
+        tabular([src])
+
+
+def test_tabular_duplicate_header_blocks(tmp_path):
+    src = _src(tmp_path, "dupe", {"data.csv": b"a,a\n1,2\n"})
+    with pytest.raises(ValidationBlock, match="duplicate"):
+        tabular([src])
+
+
+def test_tabular_jsonl(tmp_path):
+    src = _src(tmp_path, "jl", {"rows.jsonl": b'{"x": 1}\n{"y": true}\n'})
+    out = tabular([src])
+    assert len(out["records"]) == 2
+    # non-string JSON values stay canonical JSON scalars — never str()'d
+    assert out["records"][1]["data"]["y"] == "true"
+
+
+def test_tabular_jsonl_non_object_blocks(tmp_path):
+    src = _src(tmp_path, "jl2", {"rows.jsonl": b"[1,2]\n"})
+    with pytest.raises(ValidationBlock, match="JSON object"):
+        tabular([src])
+
+
+def _xlsx_bytes() -> bytes:
+    """Minimal workbook: sharedStrings + typed + inline + sparse cells."""
+    ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr(
+            "xl/sharedStrings.xml",
+            f'<?xml version="1.0"?><sst xmlns="{ns}" count="2" uniqueCount="2">'
+            "<si><t>name</t></si><si><t>score</t></si></sst>")
+        zf.writestr(
+            "xl/worksheets/sheet1.xml",
+            f'<?xml version="1.0"?><worksheet xmlns="{ns}"><sheetData>'
+            '<row r="1"><c r="A1" t="s"><v>0</v></c>'
+            '<c r="B1" t="s"><v>1</v></c></row>'
+            '<row r="2"><c r="A1" t="inlineStr"><is><t>ada</t></is></c>'
+            '<c r="B1"><v>9.5</v></c></row>'
+            '<row r="3"><c r="A1" t="inlineStr"><is><t>bo</t></is></c></row>'
+            "</sheetData></worksheet>")
+    return buf.getvalue()
+
+
+def test_tabular_xlsx_reader(tmp_path):
+    src = _src(tmp_path, "xlsx", {"book.xlsx": _xlsx_bytes()})
+    out = tabular([src])
+    assert out["tables"][0]["columns"] == ["name", "score"]
+    rows = [r["data"] for r in out["records"]]
+    assert rows[0] == {"name": "ada", "score": "9.5"}
+    # sparse cell → empty string (sheets are sparse by nature)
+    assert rows[1] == {"name": "bo", "score": ""}
+    assert out["records"][0]["relative_path"] == "book.xlsx#sheet1"
+
+
+def test_tabular_xlsx_not_a_zip_blocks(tmp_path):
+    src = _src(tmp_path, "badxlsx", {"book.xlsx": b"not a zip"})
+    with pytest.raises(ValidationBlock, match="readable .xlsx"):
+        tabular([src])
+
+
+def test_tabular_no_table_files_blocks(tmp_path):
+    src = _src(tmp_path, "notabs", {"img.jpg": b"x"})
+    with pytest.raises(ValidationBlock, match="no table files"):
+        tabular([src])
+
+
+# -- catalog invariant + post-add suggestions ------------------------------
+
+def test_dataset_types_catalog_matches_registry():
+    """Every advertised transform must actually be registered — the
+    catalog can never drift from what `prepare` can run (fail-closed)."""
+    catalog = dataset_types()
+    registered = set(registry_names())
+    names = [t["name"] for t in catalog["supported"]]
+    assert len(names) == len(set(names))
+    for name in names:
+        assert name in registered, f"catalog advertises unregistered {name!r}"
+    assert {p["name"] for p in catalog["planned"]} >= {"video", "audio"}
+
+
+def test_suggest_transforms_priority_and_hints():
+    assert suggest_transforms(["gt.csv", "readme.md"]) == [
+        "text_corpus", "mot_challenge", "tabular"]
+    assert suggest_transforms(["a.xlsx"]) == ["tabular"]
+    assert suggest_transforms(["imgs/0001_c1s1_000001_01.jpg"]) == ["reid_crops"]
+    assert suggest_transforms(["annotations.json", "imgs/a.jpg"]) == ["coco_detection"]
+    assert suggest_transforms(["raw.zip"]) == []   # ambiguous — no bad advice
+
+
+# -- discovery surfaces point at the catalog -------------------------------
+
+def test_prepare_unknown_model_hint_points_to_types(ws, home, capsys):
+    _ingestion(ws, "models:\n  m:\n    transform: text_corpus\n    "
+                   "train_sources: []\n")
+    assert main(["--root", str(ws), "prepare", "ghost"]) == 2
+    err = capsys.readouterr().err
+    assert "mlforge dataset types" in err
+
+
+def test_add_prints_transform_suggestion(ws, home, tmp_path, capsys):
+    d = _tree(tmp_path, "motsrc", {"gt.csv": MOT_CSV.encode(),
+                                   "readme.md": b"hi"})
+    assert _add(ws, "mtrack", d) == 0
+    out = capsys.readouterr().out
+    assert "likely transform: text_corpus / mot_challenge / tabular" in out
+    assert "mlforge dataset types" in out

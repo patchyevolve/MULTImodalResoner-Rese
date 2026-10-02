@@ -269,3 +269,25 @@ def test_lease_without_subcommand_exits_4(tmp_path, capsys):
     # a bare `mlforge lease` reaches our dispatch → NOT_IMPLEMENTED (4).
     assert main(["--root", str(tmp_path), "lease"]) == 4
     assert "NOT_IMPLEMENTED" in capsys.readouterr().err
+
+
+def test_dataset_types_lists_catalog(capsys):
+    """The 'what options are there' command — discoverable, no project needed."""
+    assert main(["dataset", "types"]) == 0
+    out = capsys.readouterr().out
+    for name in ("text_corpus", "coco_detection", "mot_challenge",
+                 "reid_crops", "tabular"):
+        assert name in out
+    assert "Not supported yet" in out
+    assert "ingestion.yaml" in out
+    # the YAML example nests correctly under the model name
+    assert "      transform: text_corpus" in out
+
+
+def test_dataset_types_json(capsys):
+    assert main(["dataset", "types", "--json"]) == 0
+    catalog = json.loads(capsys.readouterr().out)
+    names = {t["name"] for t in catalog["supported"]}
+    assert {"text_corpus", "coco_detection", "mot_challenge",
+            "reid_crops", "tabular"} <= names
+    assert any(p["name"] == "video" for p in catalog["planned"])
