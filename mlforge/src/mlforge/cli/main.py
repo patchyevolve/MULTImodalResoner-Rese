@@ -106,7 +106,18 @@ def _build_parser() -> argparse.ArgumentParser:
     cfg_sub = cfg.add_subparsers(dest="configure_command", required=True)
     cds = cfg_sub.add_parser(
         "datasets",
-        help="verify + set machine-local dataset paths (12 §10.1)",
+        help="re-point/verify machine-local dataset paths (12 §10.1)",
+        description=(
+            "Machine-local dataset paths (12 §10.1): identity lives in "
+            "the project (portable), paths live per machine. You normally "
+            "don't need this right after `mlforge dataset add` — add "
+            "already records the path on the machine where it ran. Use "
+            "configure when (a) you cloned/synced this project to a new "
+            "machine, (b) the data folder moved, or (c) several datasets "
+            "need paths at once. Every candidate path is hashed against "
+            "its registration before being written — wrong path ⇒ "
+            "explicit mismatch, never silent acceptance."
+        ),
     )
     cds.add_argument("--set", action="append", default=[], metavar="ID=PATH",
                      help="non-interactive path assignment (repeatable)")
@@ -2032,8 +2043,8 @@ def _do_hello(args) -> int:
         print()
         print("Start here:")
         print("  mlforge init myproj && cd myproj   # create a workspace")
-        print("  mlforge dataset add books /path/to/books --yes")
-        print("  mlforge configure datasets --set books=/path/to/books")
+        print("  mlforge dataset add books /path/to/books --yes"
+              "   # registers identity + this machine's path")
         print("  $EDITOR ingestion.yaml             # model → transform")
         print("  mlforge prepare <model>            # extract → chunk")
         print("  mlforge train --config configs/train.example.json --yes")
