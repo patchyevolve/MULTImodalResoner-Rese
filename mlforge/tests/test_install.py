@@ -38,10 +38,32 @@ def test_module_execution_prints_version(tmp_path):
 
 
 def test_bare_module_execution_opens_help(tmp_path):
-    """Typing `mlforge` with no subcommand opens the reference, exit 0."""
+    """Typing `mlforge` with no subcommand opens the landing screen,
+    exit 0 — with the usage line (reference stays one flag away)."""
     proc = _run(cwd=tmp_path)
     assert proc.returncode == 0
     assert "usage:" in proc.stdout and "MLForge" in proc.stdout
+
+
+def test_bare_module_outside_project_is_a_quickstart(tmp_path):
+    """A newcomer in an empty folder gets the shortest working recipe."""
+    proc = _run(cwd=tmp_path)
+    assert proc.returncode == 0
+    assert "No MLForge project" in proc.stdout
+    assert "mlforge init" in proc.stdout
+    assert "mlforge prepare" in proc.stdout
+
+
+def test_bare_module_inside_project_shows_workspace_facts(tmp_path):
+    """Inside a project the landing shows the real state + next steps."""
+    init = _run("init", "demo", cwd=tmp_path)
+    assert init.returncode == 0
+    proc = _run(cwd=tmp_path / "demo")
+    assert proc.returncode == 0
+    assert "Project: demo" in proc.stdout
+    assert "datasets: none registered yet" in proc.stdout
+    assert "runs: none yet" in proc.stdout
+    assert "mlforge dataset add" in proc.stdout  # the next step to take
 
 
 def test_module_execution_status_from_empty_workspace(tmp_path):

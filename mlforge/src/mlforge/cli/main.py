@@ -2012,13 +2012,94 @@ def _do_gui(wf: WorkflowAPI, args) -> int:
         ) from exc
 
 
+def _do_hello(args) -> int:
+    """Bare `mlforge` — a contextual landing screen, not a usage dump.
+
+    Outside a project: the shortest working recipe (init → add →
+    prepare → train). Inside: the workspace's real facts (datasets,
+    runs) and what to do next. Exit 0 either way; never crashes on a
+    broken workspace (the landing must always render)."""
+    root = Path(args.root).expanduser().resolve()
+    print("MLForge — hardware-agnostic ML training system "
+          "(spec: 10_training_plan/12 + 13)")
+    print("usage: mlforge <command> [options]        "
+          "mlforge --help · mlforge <command> --help · mlforge --version")
+    print()
+
+    proj_file = root / "project.yaml"
+    if not proj_file.is_file():
+        print("No MLForge project in this folder yet.")
+        print()
+        print("Start here:")
+        print("  mlforge init myproj && cd myproj   # create a workspace")
+        print("  mlforge dataset add books /path/to/books --yes")
+        print("  mlforge configure datasets --set books=/path/to/books")
+        print("  $EDITOR ingestion.yaml             # model → transform")
+        print("  mlforge prepare <model>            # extract → chunk")
+        print("  mlforge train --config configs/train.example.json --yes")
+        print("  mlforge watch                      # live loss dashboard")
+        return 0
+
+    try:
+        from mlforge.ingest.config import load_paths, load_registry
+
+        meta = yaml_load_file(proj_file)
+        name = str((meta or {}).get("name") or root.name)
+        registered = sorted(load_registry(root))
+        configured = sorted(load_paths(root))
+        runs = WorkflowAPI(root).list_runs()
+
+        print(f"Project: {name}  ({root})")
+        if registered:
+            configured_note = (
+                f", {len(configured)} configured here"
+                if configured else ", path not configured on this machine"
+            )
+            print(f"  datasets: {', '.join(registered)} "
+                  f"({len(registered)} registered{configured_note})")
+        else:
+            print("  datasets: none registered yet")
+        if runs:
+            states: dict[str, int] = {}
+            for run in runs:
+                state = str(run.get("state") or "?")
+                states[state] = states.get(state, 0) + 1
+            summary = ", ".join(f"{s} ×{n}" for s, n in sorted(states.items()))
+            print(f"  runs: {len(runs)} total ({summary})")
+            latest = runs[-1]
+            print(f"  latest: {latest.get('id')} — {latest.get('state')}")
+        else:
+            print("  runs: none yet")
+        print()
+        print("Try next:")
+        if not runs:
+            if not registered:
+                print("  mlforge dataset add <ID> /path/to/data --yes "
+                      "# a folder can live anywhere")
+            else:
+                print("  mlforge prepare <model>            # if not done")
+            print("  mlforge train --config configs/train.example.json")
+            print("  mlforge watch                      # live dashboard")
+        else:
+            print("  mlforge status                     # all runs")
+            print("  mlforge watch                      # live dashboard")
+            print("  mlforge dataset add <ID> /path/to/data --yes  "
+                  "# add more data any time")
+        print("  mlforge --help                     # every command")
+    except Exception:
+        # A broken workspace must never break the landing screen —
+        # point at the diagnostic that owns the detail instead.
+        print("(workspace partially unreadable — run `mlforge status` "
+              "for the diagnostic)")
+    return 0
+
+
 def main(argv: list[str] | None = None, *, wf_factory=None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
 
     if not args.command:
-        parser.print_help()
-        return 0
+        return _do_hello(args)
 
     if args.command in _PENDING:
         step = _PENDING[args.command]
