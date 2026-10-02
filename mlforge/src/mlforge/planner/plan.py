@@ -302,6 +302,32 @@ def _registered_dataset_bytes(root: Path, ref: str) -> int:
         return 0
 
 
+def disk_estimate_components(
+    root: Path,
+    spec: RunSpec,
+    *,
+    runtime: dict[str, Any] | None = None,
+) -> dict[str, int]:
+    """Worst-case disk inputs (12 §7.3) — shared by the gate's step 16
+    (facts) and the preflight context so both use the SAME numbers.
+    `runtime` overrides (`train --config` → state/runtime.json) win."""
+    runtime = runtime or {}
+    dataset_bytes = sum(
+        _registered_dataset_bytes(root, ref)
+        for ref in (
+            *spec.train_datasets,
+            *([spec.val_dataset] if spec.val_dataset else []),
+        )
+    )
+    return {
+        "checkpoint_bytes": int(runtime.get("checkpoint_bytes", 4 * GiB)),
+        "log_bytes": int(runtime.get("log_bytes", 2 * GiB)),
+        "safety_margin_bytes": int(runtime.get("safety_margin_bytes", 2 * GiB)),
+        "dataset_cache_bytes": int(runtime.get("dataset_cache_bytes",
+                                               dataset_bytes)),
+    }
+
+
 def estimate_required_disk_bytes(
     root: Path,
     spec: RunSpec,
@@ -311,17 +337,11 @@ def estimate_required_disk_bytes(
     """Worst-case disk for gate step 16 (12 §7.3 formula) + the planner's
     dataset-cache term (registered dataset bytes) — the estimate the
     workflow comment promised when the planner arrived (13 §11 step 9)."""
-    runtime = runtime or {}
-    checkpoint_bytes = int(runtime.get("checkpoint_bytes", 4 * GiB))
-    log_bytes = int(runtime.get("log_bytes", 2 * GiB))
-    safety_margin = int(runtime.get("safety_margin_bytes", 2 * GiB))
-    dataset_bytes = sum(
-        _registered_dataset_bytes(root, ref)
-        for ref in (*spec.train_datasets, *( [spec.val_dataset] if spec.val_dataset else []))
-    )
+    c = disk_estimate_components(root, spec, runtime=runtime)
     # checkpoint + temp checkpoint (transactional double-write) + dataset
     # cache + logs + safety margin — same shape preflight mandates
-    return 2 * checkpoint_bytes + dataset_bytes + log_bytes + safety_margin
+    return 2 * c["checkpoint_bytes"] + c["dataset_cache_bytes"] \
+        + c["log_bytes"] + c["safety_margin_bytes"]
 
 
 __all__ = [
@@ -329,6 +349,7 @@ __all__ = [
     "PLAN_SCHEMA_VERSION",
     "ExecutionPlan",
     "build_plan",
+    "disk_estimate_components",
     "estimate_required_disk_bytes",
     "load_runtime",
     "normalize_precision_policy",

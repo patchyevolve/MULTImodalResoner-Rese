@@ -57,11 +57,13 @@ def test_inspect_and_events(tmp_path, capsys):
     assert json.loads(lines[0])["event"] == "run_created"
 
 
-def test_pending_command_exits_4(tmp_path, capsys):
-    # build step 11 delivered evaluate/compare/infer/export/package —
-    # init/configure (step 1) are still the pending examples
-    assert main(["--root", str(tmp_path), "init"]) == 4
-    assert "NOT_IMPLEMENTED" in capsys.readouterr().err
+def test_step_1_init_creates_project(tmp_path, capsys):
+    # build step 1 finally landed: init creates the §10 project workspace
+    # (serve remains the only honest exit-4 command — see test_ops).
+    assert main(["--root", str(tmp_path), "init", "proj"]) == 0
+    assert (tmp_path / "proj" / "project.yaml").is_file()
+    assert (tmp_path / "proj" / "configs" / "train.example.json").is_file()
+    assert "NOT_IMPLEMENTED" not in capsys.readouterr().err
 
 
 def test_missing_run_exits_2(tmp_path, capsys):
@@ -125,8 +127,9 @@ def test_store_without_gc_subcommand_exits_4(tmp_path, capsys):
 
 
 def test_validate_fails_closed_on_fresh_run(tmp_path, capsys):
-    """No identity providers in this build step ⇒ unverifiable ⇒ BLOCK.
-    Fail-closed demo: exit 1, report printed, run left FAILED[FORK_ONLY]."""
+    """A fresh run has source+environment captures (12 §6.4) but no
+    configured dataset identity ⇒ unverifiable ⇒ BLOCK. Fail-closed
+    demo: exit 1, report printed, run left FAILED[FORK_ONLY]."""
     from mlforge.workflow import WorkflowAPI
 
     wf = WorkflowAPI(tmp_path)
@@ -135,7 +138,8 @@ def test_validate_fails_closed_on_fresh_run(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "VALIDATION REPORT" in out
     assert "[PASS] Run manifest integrity" in out
-    assert "[FAIL] Source artifact + code hash" in out
+    assert "[PASS] Source artifact + code hash" in out
+    assert "[FAIL] Dataset identity (cryptographic)" in out
     assert "TRAINING BLOCKED" in out          # flow=TRAIN for a CREATED run
     # train path: gate BLOCK → FAILED[FORK_ONLY] (13 §7)
     assert wf.get_run_state(h.run_id) == "FAILED"
@@ -150,7 +154,7 @@ def test_validate_json_report(tmp_path, capsys):
     assert main(["--root", str(tmp_path), "validate", h.run_id, "--json"]) == 1
     out = json.loads(capsys.readouterr().out)
     assert out["blocked"] is True
-    assert out["failed_step"] == 3
+    assert out["failed_step"] == 4  # dataset identity unverifiable
     assert out["run_id"] == h.run_id
 
 

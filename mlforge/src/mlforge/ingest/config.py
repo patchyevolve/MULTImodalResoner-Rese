@@ -43,10 +43,16 @@ def mlforge_home() -> Path:
 
 
 def project_slug(root: str | Path) -> str:
-    """Filename-safe project token. `mlforge init` (pending) will pin a
-    real project name; until then the workspace directory name is the
-    most stable machine-local key (12 §6.3: per-machine file)."""
-    return re.sub(r"[^A-Za-z0-9._-]", "_", Path(root).resolve().name) or "workspace"
+    """Filename-safe project token. `mlforge init` pins the real project
+    name in `project.yaml` (13 §10); workspaces without one keep the
+    directory name as the machine-local key (12 §6.3)."""
+    root_path = Path(root)
+    proj = root_path / "project.yaml"
+    if proj.is_file():
+        name = _load_yaml(proj, "project.yaml").get("name")
+        if isinstance(name, str) and name:
+            return re.sub(r"[^A-Za-z0-9._-]", "_", name)
+    return re.sub(r"[^A-Za-z0-9._-]", "_", root_path.resolve().name) or "workspace"
 
 
 def paths_file(root: str | Path) -> Path:

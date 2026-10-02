@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 import time
 from pathlib import Path
@@ -37,29 +38,33 @@ from mlforge.ingest import (
     prepare as ingest_prepare,
     recompute_identity as ingest_recompute_identity,
 )
-from mlforge.ingest.config import set_path as ingest_set_path, write_registry as ingest_write_registry
+from mlforge.ingest.config import (
+    paths_file as ingest_paths_file,
+    set_path as ingest_set_path,
+    write_registry as ingest_write_registry,
+)
 from mlforge.leases import LeaseState, RunLeaseManager
 from mlforge.ops import DEFAULT_METRIC_NAMES, contract_source_dir
-from mlforge.planner import build_plan
+from mlforge.planner import PLAN_FILENAME, ExecutionPlan, build_plan
 from mlforge.run_spec import RunSpec
 from mlforge.runtime.control import wait_for_state, write_control
 from mlforge.store import ArtifactRegistry, ContentStore
 from mlforge.supervisor import enqueue_spawn, ensure_supervisor
 from mlforge.validation import Preflight, ValidationGate
 from mlforge.workflow import WorkflowAPI
+from mlforge.yamlmini import YamlError, dump as yaml_dump, load_file as yaml_load_file
 
 # 13 §11 build-order gates: implemented vs pending.
+# Every §4.1 command is implemented now; `serve` (not in the build
+# order) keeps its honest exit-4 special case below.
 _IMPLEMENTED = {
     "status", "inspect", "events", "store", "validate", "preflight", "lease",
     "train", "resume", "pause", "stop", "watch", "hardware", "dataset",
     "prepare", "fork", "retrain", "finetune", "model",
     "evaluate", "compare", "infer", "export", "package",
-    "gui",
+    "gui", "init", "configure",
 }
-_PENDING = {
-    "init": 1,
-    "configure": 1,
-}
+_PENDING: dict[str, int] = {}
 
 #: States after which a worker is gone and `--attach` may stop waiting.
 _TERMINAL = {"COMPLETED", "FAILED", "STOPPED", "INTERRUPTED", "PAUSED"}
@@ -78,6 +83,27 @@ def _build_parser() -> argparse.ArgumentParser:
         help="workspace root (default: current directory)",
     )
     sub = p.add_subparsers(dest="command")
+
+    # PROJECT (13 §4.1)
+    ini = sub.add_parser("init", help="create a project workspace (13 §4.1)")
+    ini.add_argument("name",
+                     help="project name: letters, digits, '.', '_', '-'")
+    ini.add_argument("--path", default=None,
+                     help="place the project here instead of <root>/<name>")
+    ini.add_argument("--command-id", default=None,
+                     help="idempotency key for safe retries (13 §4.4)")
+    ini.add_argument("--json", action="store_true", help="machine-readable output")
+
+    cfg = sub.add_parser("configure",
+                         help="machine-local configuration (13 §10.1)")
+    cfg_sub = cfg.add_subparsers(dest="configure_command", required=True)
+    cds = cfg_sub.add_parser(
+        "datasets",
+        help="verify + set machine-local dataset paths (12 §10.1)",
+    )
+    cds.add_argument("--set", action="append", default=[], metavar="ID=PATH",
+                     help="non-interactive path assignment (repeatable)")
+    cds.add_argument("--json", action="store_true", help="machine-readable output")
 
     st = sub.add_parser(
         "status",
@@ -100,7 +126,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     wch = sub.add_parser("watch", help="live dashboard for a run (viewer only)")
     wch.add_argument("run_id", nargs="?", default=None,
-                     help="run to watch (default: the most active run)")
+                     help="run to watch (default: the live dashboard)")
     wch.add_argument("--interval", type=float, default=1.0,
                      help="refresh interval in seconds (default: 1)")
     wch.add_argument("--json", action="store_true",
@@ -484,6 +510,291 @@ def _launch(wf: WorkflowAPI, run_id: str) -> dict:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# init / configure (13 §4.1, §10.1 — build step 1, delivered last)
+# ---------------------------------------------------------------------------
+
+#: 13 §4.1 `init <name>` — POSIX-safe project token, max 64 chars.
+_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+
+#: 13 §10 product-view layout under the project root.
+_PROJECT_DIRS = ("configs", "models", "runs", "artifacts")
+
+#: 13 §10 `configs/` starter — every field RunSpec requires (12 §17);
+#: tests parse it against the live schema so it cannot silently rot.
+_EXAMPLE_TRAIN_CONFIG: dict[str, Any] = {
+    "schema_version": 1,
+    "model": "rf_detr_s",
+    "train_datasets": ["coco_2017:v1"],
+    "semantic": {
+        "optimizer": "adamw",
+        "learning_rate": 0.0001,
+        "scheduler": "cosine",
+        "loss": "l1",
+        "seed": 42,
+        "global_batch": 32,
+        "epochs": 50,
+        "precision_policy": "bf16",
+    },
+}
+
+
+def _stdin_is_tty() -> bool:
+    try:
+        return sys.stdin.isatty()
+    except (AttributeError, OSError, ValueError):
+        return False
+
+
+def _init_classify(target: Path, name: str) -> str:
+    """`new` (create here) | `ours` (already initialized) — anything
+    else RAISES before a single byte is written (never touch foreign)."""
+    if not target.exists():
+        return "new"
+    proj = target / "project.yaml"
+    if proj.is_file():
+        data = _load_project_yaml(proj)
+        if data.get("name") == name:
+            return "ours"
+        raise ValidationBlock(
+            f"target exists with a different project: {target}",
+            hint="it was initialized with another name — pick a different "
+                 "name/path, or remove it first",
+        )
+    try:
+        if not any(target.iterdir()):
+            return "new"  # an empty directory is a legitimate reservation
+    except OSError:
+        raise ValidationBlock(
+            f"target exists but is unreadable: {target}",
+            hint="check permissions, then retry",
+        ) from None
+    raise ValidationBlock(
+        f"target exists and is not an MLForge project: {target}",
+        hint="remove or rename it, choose another name, or place the "
+             "project elsewhere with --path",
+    )
+
+
+def _load_project_yaml(path: Path) -> dict[str, Any]:
+    try:
+        data = yaml_load_file(path)
+    except YamlError as exc:
+        raise PreconditionFailed(
+            f"project.yaml unreadable ({path}): {exc}",
+            hint="fix the YAML (supported subset: mappings, lists, flow "
+                 "collections) — the project will not be modified",
+        ) from exc
+    if not isinstance(data, dict):
+        raise PreconditionFailed(f"project.yaml must be a mapping: {path}")
+    return data
+
+
+def _init_scaffold(target: Path, name: str, *, status: str) -> dict[str, Any]:
+    """Create the 13 §10 project view. Every write is existence-guarded,
+    so a re-run (natural key or --command-id replay) is a no-op."""
+    target.mkdir(parents=True, exist_ok=True)
+    proj_path = target / "project.yaml"
+    if not proj_path.exists():
+        proj_path.write_text(yaml_dump({
+            "schema_version": 1,
+            "name": name,
+            "created_ts": time.time(),
+            "mlforge": mlforge.__version__,
+        }), encoding="utf-8")
+    for d in _PROJECT_DIRS:
+        (target / d).mkdir(exist_ok=True)
+    registry = target / "datasets.yaml"
+    if not registry.exists():
+        registry.write_text(yaml_dump({}), encoding="utf-8")
+    example = target / "configs" / "train.example.json"
+    if not example.exists():
+        example.write_text(
+            json.dumps(_EXAMPLE_TRAIN_CONFIG, indent=2) + "\n",
+            encoding="utf-8",
+        )
+    if not (target / "projects" / name).is_dir():
+        WorkflowAPI(target).create_project(name)  # journaled genesis (§5.1)
+    return {
+        "name": name,
+        "path": str(target),
+        "status": status,
+        "created_ts": _load_project_yaml(proj_path).get("created_ts"),
+        "example_config": "configs/train.example.json",
+        "dirs": list(_PROJECT_DIRS),
+    }
+
+
+def _print_init_next_steps(name: str, target: Path) -> None:
+    print(f"Initialized project {name!r} at {target}\n")
+    print("  project.yaml                    project identity (13 §5.1)")
+    print("  datasets.yaml                   dataset identity registry")
+    print("  configs/train.example.json      starter training config — edit it")
+    print("  models/  runs/  artifacts/      §10 layout")
+    print("\nNext steps:")
+    print(f"  cd {target}")
+    print("  mlforge dataset add <ID> <PATH>     # register + verify identity")
+    print("  mlforge configure datasets          # machine-local paths (12 §10.1)")
+    print("  $EDITOR ingestion.yaml              # model → transform (12 §10.2)")
+    print("  mlforge prepare <MODEL>             # derived <MODEL>_prepared (§6.6)")
+    print("  mlforge train --config configs/train.example.json")
+
+
+def _do_init(wf: WorkflowAPI, args) -> int:
+    name = args.name
+    if not _NAME_RE.match(name):
+        raise ValidationBlock(
+            f"invalid project name {name!r}",
+            hint="1-64 characters of letters, digits, '.', '_', '-'; "
+                 "must start with a letter or digit",
+        )
+    target = Path(args.path).expanduser() if args.path else Path(args.root) / name
+    kind = _init_classify(target, name)  # foreign ⇒ raises, nothing written
+
+    def _scaffold() -> dict[str, Any]:
+        return _init_scaffold(
+            target, name,
+            status="already_present" if kind == "ours" else "created",
+        )
+
+    if args.command_id:
+        # The command journal lives INSIDE the target — WorkflowAPI's
+        # constructor is pure, so building it before the directory exists
+        # is safe (reads return [], appends mkdir as needed, 13 §4.4).
+        result = WorkflowAPI(target).execute_idempotent(
+            args.command_id, "init_project", _scaffold,
+            kind="project", run_id=name,
+        )
+    else:
+        result = _scaffold()
+    if args.json:
+        print(json.dumps(result, indent=2, sort_keys=True, default=str))
+    elif result.get("status") == "already_present":
+        print(f"Project {name!r} already initialized at {result['path']} "
+              "— no changes.")
+    else:
+        _print_init_next_steps(name, Path(result["path"]))
+    return 0
+
+
+def _prompt_dataset_path(dataset_id: str) -> str:
+    """12 §10.1: ask for the path — explicit input, never a scan."""
+    try:
+        answer = input(f"  {dataset_id} path? ").strip()
+    except EOFError:
+        answer = ""
+    if not answer:
+        raise ValidationBlock(
+            f"{dataset_id}: a path is required",
+            hint=f"pass --set {dataset_id}=<PATH> for non-interactive "
+                 "configuration",
+        )
+    return answer
+
+
+def _do_configure(wf: WorkflowAPI, args) -> int:
+    if args.configure_command == "datasets":
+        return _do_configure_datasets(wf, args)
+    # argparse `required=True` on the subparsers keeps this unreachable.
+    raise NotFound(f"unknown configure subcommand {args.configure_command!r}")
+
+
+def _do_configure_datasets(wf: WorkflowAPI, args) -> int:
+    """12 §10.1 one-time-per-machine path configuration.
+
+    Every candidate path is HASHED against its registration BEFORE any
+    write — wrong path ⇒ mismatch ⇒ explicit error with fix options;
+    the system verifies identity, it never scans or guesses.
+    """
+    datasets = wf.list_datasets()
+    if not datasets:
+        raise NotFound(
+            "no registered datasets to configure",
+            hint="register one first: mlforge dataset add <ID> <PATH>",
+        )
+    sets: dict[str, str] = {}
+    for entry in args.set or []:
+        did, sep, path = str(entry).partition("=")
+        if not sep or not did or not path:
+            raise ValidationBlock(
+                f"--set expects ID=PATH, got {entry!r}",
+                hint="example: --set coco_2017=/data/coco",
+            )
+        sets[did] = path
+    known = {d["id"] for d in datasets}
+    for did in sets:
+        if did not in known:
+            raise NotFound(
+                f"dataset {did!r} is not registered",
+                hint=f"registered datasets: {', '.join(sorted(known))}",
+            )
+    configured = ingest_load_paths(wf.root)
+    results: list[dict[str, Any]] = []
+    if not args.json:
+        print("Configure dataset paths (machine-local — never identity, 12 §6.3)")
+    for d in sorted(datasets, key=lambda x: x["id"]):
+        did = d["id"]
+        if did in sets:
+            path = sets[did]
+        elif did in configured:
+            path = configured[did]
+        elif _stdin_is_tty():
+            path = _prompt_dataset_path(did)
+        else:
+            raise PreconditionFailed(
+                f"no machine-local path for {did!r} and stdin is not a TTY",
+                hint=f"pass --set {did}=<PATH> (paths are explicit, never "
+                     "discovered — 12 §6.3)",
+            )
+        reg = json.loads(
+            (Path(wf.root) / "datasets" / did / "identity.json")
+            .read_text(encoding="utf-8")
+        )
+        try:
+            found, manifest = ingest_recompute_identity(
+                path, did, str(reg.get("version") or "v1"),
+                schema=reg.get("schema"),
+            )
+        except (NotFound, OSError) as exc:
+            raise PreconditionFailed(
+                f"{did}: cannot read dataset at {path}: {exc}",
+                hint=f"check the path — {path} must be a directory of "
+                     "dataset files",
+            ) from exc
+        registered = reg.get("identity")
+        if registered and found != registered:
+            raise ValidationBlock(
+                f"{did}: identity mismatch at {path} "
+                f"(registered {registered}, found {found})",
+                hint=f"fix the path, or re-register changed content: "
+                     f"mlforge dataset add {did} {path} --force "
+                     "(13 §5.2 — never silently reinterpret identity)",
+            )
+        changed = configured.get(did) != str(Path(path))
+        ingest_set_path(wf.root, did, path)
+        if changed:
+            wf.note_dataset_path(did, path)  # journal-only audit (12 §6.3)
+        results.append({
+            "dataset": did,
+            "path": str(Path(path)),
+            "identity": found,
+            "status": "path_updated" if changed else "verified",
+            "file_count": manifest.file_count,
+            "total_bytes": manifest.total_bytes,
+        })
+        if not args.json:
+            print(f"  {did:<20} {path}")
+            print(f"    → verifying content hash... ✅ matches {found}")
+    if args.json:
+        print(json.dumps({
+            "file": str(ingest_paths_file(wf.root)),
+            "datasets": results,
+        }, indent=2, sort_keys=True, default=str))
+    else:
+        print(f"\nSaved: {ingest_paths_file(wf.root)}")
+    return 0
+
+
 def _do_status(wf: WorkflowAPI, args) -> int:
     if args.run_id:
         detail = status_layer.collect_run(wf.root, args.run_id, verbose=args.verbose)
@@ -636,7 +947,9 @@ def _start_pipeline(
             print(report.render())
         return {"status": "blocked", "run_id": run_id,
                 "failed_step": report.failed_step, "exit": 1}
-    pre = wf.preflight_run(run_id, gpu_required=bool(runtime.get("gpu", True)))
+    pre = wf.preflight_run(
+        run_id, gpu_required=_gpu_required_for(wf.root, run_id, runtime)
+    )
     if pre.blocked:
         if not args.json:
             print(pre.render())
@@ -909,16 +1222,28 @@ def _do_model(wf: WorkflowAPI, args) -> int:
     return 4
 
 
-def _resume_gpu_required(root: Path, run_id: str) -> bool:
-    """GPU expectation travels with the run's runtime config (written at
-    train time); default = GPU required (fail-closed for real training)."""
-    p = root / "runs" / run_id / "state" / "runtime.json"
-    if p.is_file():
-        try:
-            return bool(json.loads(p.read_text(encoding="utf-8")).get("gpu", True))
-        except json.JSONDecodeError:
-            pass
-    return True
+def _gpu_required_for(root: Path, run_id: str, runtime: dict | None = None) -> bool:
+    """`runtime["gpu"]` (train config) is the explicit override; otherwise
+    the validated execution plan decides — a plan measured on a GPU host
+    requires `nvidia-smi` at preflight, a CPU/PORTABLE plan does not
+    (12 §14: the plan already negotiated the device). No plan yet ⇒
+    fail-closed: GPU required (the historical default)."""
+    if runtime is not None and "gpu" in runtime:
+        return bool(runtime["gpu"])
+    if runtime is None:  # resume path: read the stored runtime config
+        p = root / "runs" / run_id / "state" / "runtime.json"
+        if p.is_file():
+            try:
+                data = json.loads(p.read_text(encoding="utf-8"))
+                if isinstance(data, dict) and "gpu" in data:
+                    return bool(data["gpu"])
+            except json.JSONDecodeError:
+                pass
+    try:
+        plan = ExecutionPlan.read(root / "runs" / run_id / PLAN_FILENAME)
+        return int(plan.capabilities.get("gpu_count") or 0) > 0
+    except Exception:
+        return True
 
 
 def _do_resume(wf: WorkflowAPI, args) -> int:
@@ -949,7 +1274,7 @@ def _do_resume(wf: WorkflowAPI, args) -> int:
             # validated earlier (e.g., launch was interrupted) — go straight
             # to launch; re-running the gate would re-acquire our own lease.
             pre = wf.preflight_run(
-                run_id, gpu_required=_resume_gpu_required(wf.root, run_id)
+                run_id, gpu_required=_gpu_required_for(wf.root, run_id)
             )
             if pre.blocked:
                 if not args.json:
@@ -961,7 +1286,7 @@ def _do_resume(wf: WorkflowAPI, args) -> int:
         # Preflight BEFORE the gate on the resume path: both failure modes
         # then leave the run completely untouched ("No changes were made").
         pre = wf.preflight_run(
-                run_id, gpu_required=_resume_gpu_required(wf.root, run_id)
+                run_id, gpu_required=_gpu_required_for(wf.root, run_id)
             )
         if pre.blocked:
             if not args.json:
@@ -1652,6 +1977,10 @@ def main(argv: list[str] | None = None, *, wf_factory=None) -> int:
 
     try:
         wf = (wf_factory or WorkflowAPI)(args.root)
+        if args.command == "init":
+            return _do_init(wf, args)
+        if args.command == "configure":
+            return _do_configure(wf, args)
         if args.command == "train":
             return _do_train(wf, args)
         if args.command == "fork":

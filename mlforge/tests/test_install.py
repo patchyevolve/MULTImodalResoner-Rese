@@ -51,7 +51,10 @@ def test_module_execution_status_from_empty_workspace(tmp_path):
 
 
 def test_module_execution_pending_command_fails_closed(tmp_path):
-    """Installed binary keeps the spec's exit 4 (never fake success)."""
-    proc = _run("--root", str(tmp_path), "init", cwd=tmp_path)
+    """Installed binary keeps the spec's exit 4 (never fake success).
+
+    `init`/`configure` are implemented now; `serve` (no build step)
+    remains the honest NOT_IMPLEMENTED example."""
+    proc = _run("--root", str(tmp_path), "serve", cwd=tmp_path)
     assert proc.returncode == 4
     assert "[NOT_IMPLEMENTED]" in proc.stderr

@@ -126,11 +126,16 @@ from mlforge.validation import (
     PreflightContext,
     ValidationGate,
     ValidationReport,
+    provide_checkpoint,
     provide_dataset_identity,
+    provide_driver,
     provide_global_batch,
+    provide_hardware,
+    provide_model,
     provide_plan,
     provide_precision,
     provide_topology,
+    provide_transform,
 )
 
 _KINDS = {
@@ -182,15 +187,39 @@ class WorkflowAPI:
         re-hashes every configured source against its registration
         (12 §6.2). Steps 10–13 (`plan`, `global_batch`, `precision`,
         `topology`) come from build step 9: measured capabilities +
-        the feasibility solver (12 §13). Explicit providers always win
-        (`setdefault`) — callers that can verify more honestly keep
-        their wiring."""
+        the feasibility solver (12 §13). Steps 3/7 (`source_code`,
+        `environment`) verify the captures written at creation
+        (12 §6.4); step 5 (`transform`) verifies prepared artifacts;
+        step 6 (`model`) verifies base-weights identity for finetune;
+        steps 8/9/14 (`driver`, `hardware`, `checkpoint`) verify against
+        live detection and the checkpoint store; steps 15/16 (`lease`,
+        `revalidate`) close the TOCTOU window (12 §18, §23.3) — the
+        launch path reuses the session token the gate acquired.
+        Explicit providers always win (`setdefault`) — callers that can
+        verify more honestly keep their wiring."""
+        from mlforge.capture import provide_environment, provide_source_code
+        from mlforge.leases import RunLeaseManager, provide_revalidation, provide_run_lease
+
+        dataset_provider = provide_dataset_identity(self.root)
         providers = dict(self.gate_providers or {})
-        providers.setdefault("dataset", provide_dataset_identity(self.root))
+        providers.setdefault("source_code", provide_source_code(self.root))
+        providers.setdefault("dataset", dataset_provider)
+        providers.setdefault("transform", provide_transform(self.root))
+        providers.setdefault("model", provide_model(self.root))
+        providers.setdefault("environment", provide_environment(self.root))
         providers.setdefault("plan", provide_plan())
         providers.setdefault("global_batch", provide_global_batch())
         providers.setdefault("precision", provide_precision())
         providers.setdefault("topology", provide_topology())
+        providers.setdefault("driver", provide_driver())
+        providers.setdefault("hardware", provide_hardware())
+        providers.setdefault("checkpoint", provide_checkpoint())
+        leases = RunLeaseManager(self.root)
+        providers.setdefault("lease", provide_run_lease(leases))
+        providers.setdefault(
+            "revalidate",
+            provide_revalidation(leases, dataset_provider=dataset_provider),
+        )
         return providers
 
     # ------------------------------------------------------------------
@@ -349,6 +378,21 @@ class WorkflowAPI:
         spec.write_once(d / "run_spec.json")
         lin = dict(lineage) if lineage else None
         write_lineage(d, lin or {})
+        # 12 §6.4: every run records source + environment identity at
+        # creation — the snapshot is the recovery authority if the
+        # working tree later disappears. Fail-closed: a run that cannot
+        # record its identity must not exist.
+        from mlforge.capture import capture_run_identity
+        try:
+            capture_run_identity(self.root, d)
+        except ValidationBlock:
+            raise
+        except Exception as exc:
+            raise ValidationBlock(
+                f"run {run_id}: identity capture failed: {exc}",
+                hint="runs must record source + environment identity "
+                     "(12 §6.4) — resolve the capture error first",
+            ) from exc
         self._journal("run", run_id).append(
             "run_created",
             frm=None,
@@ -1031,6 +1075,14 @@ class WorkflowAPI:
         (one vocabulary, two invocations); unwired ⇒ fail-closed FAIL."""
         self._require("run", run_id)
         spec = self._run_spec(run_id)
+        # Worst-case disk inputs: the SAME runtime-aware components the
+        # gate's step 16 uses (12 §7.3) — one formula, two invocations.
+        from mlforge.planner import disk_estimate_components
+
+        for key, value in disk_estimate_components(
+            self.root, spec, runtime=load_runtime(self._dir("run", run_id))
+        ).items():
+            ctx_kwargs.setdefault(key, value)
         ctx = PreflightContext(
             run_id=run_id, root=self.root, run_spec=spec, **ctx_kwargs
         )

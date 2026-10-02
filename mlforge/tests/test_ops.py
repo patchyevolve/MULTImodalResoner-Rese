@@ -705,8 +705,11 @@ def test_step_11_gates_flipped():
     for cmd in ("evaluate", "compare", "infer", "export", "package"):
         assert cmd in _IMPLEMENTED, cmd
         assert cmd not in _PENDING, cmd
-    # init/configure remain pending (build step 1)
-    assert _PENDING.get("init") == 1 and _PENDING.get("configure") == 1
+    # build step 1 delivered init/configure — nothing is pending anymore
+    # (`serve` has no build step and keeps its special case instead).
+    for cmd in ("init", "configure", "status", "train", "watch"):
+        assert cmd in _IMPLEMENTED, cmd
+    assert not _PENDING
 
 
 def test_model_inspect_shows_contract_presence(monkeypatch, capsys, tmp_path):

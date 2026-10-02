@@ -36,6 +36,25 @@ python -m mlforge ...    # same entry point when scripts-dir isn't on PATH
 `pip install --user` places the command in `~/.local/bin` — add that to
 PATH if your shell does not find `mlforge`.
 
+## Quickstart (try-it flow)
+
+```bash
+mlforge init myproj && cd myproj          # project scaffold (13 §4.1)
+mlforge dataset add coco_2017 /data/coco  # register + explicit path
+mlforge dataset verify coco_2017          # re-hash → VERIFIED
+mlforge configure datasets                # machine-local paths ($MLFORGE_HOME)
+$EDITOR ingestion.yaml                    # 12 §10.2: model → transform/sources
+mlforge prepare rf_detr_s                 # derived rf_detr_s_prepared (§6.6)
+$EDITOR configs/train.example.json        # train_datasets: [<model>_prepared:v1]
+mlforge train --config configs/train.example.json   # gate 16/16 → preflight → run
+mlforge watch                             # live dashboard while it trains
+```
+
+The gate is fail-closed at every step: raw datasets BLOCK with the
+`prepare` hint, missing captures BLOCK, disk/GPU expectations derive
+from the run's runtime config + execution plan (12 §7.3/§14), and a
+passing gate acquires the run lease before launch (12 §18 step 15).
+
 ## Ground truth (normative)
 
 Implementation follows these two documents exactly; where code and docs
@@ -80,11 +99,21 @@ mlforge/
 
 1. ✅ Workflow API + state machines (project/dataset/run/model)
 2. ✅ Artifact registry + content store + run_spec canonical hashing
-3. ✅ Validation gate + preflight (fail-closed core)
-4. 🟡 CLI contract — `status` / `inspect` / `events` / `store gc` /
-   `validate` / `preflight` / `lease status` / `lease break` /
-   `dataset add|list|verify` / `prepare` work; other commands exit 4
-   with `NOT_IMPLEMENTED` (never fake success)
+3. ✅ Validation gate + preflight (fail-closed core) — the default
+   provider set now covers ALL 16 steps: source/environment captures
+   written at run creation (`code/source.snapshot.tar.gz` + tree hash +
+   `environment/fingerprint.json`, 12 §6.4), store-backed prepared
+   datasets (identity re-hashed from the content store), transform
+   (EXACT-required artifact verify), model (from-scratch =
+   source-derived; finetune base weights = registry + COMMIT marker),
+   driver/hardware (live detection), checkpoint (newest-valid), lease +
+   revalidate (TOCTOU close, session token reused by launch), and the
+   disk/GPU expectations shared between step 16 and preflight
+4. ✅ CLI contract — every §4.1 command implemented (`init`,
+   `configure datasets`, train/resume/pause/stop, fork/retrain/finetune,
+   dataset/prepare, validate/preflight/lease, evaluate/compare/infer/
+   export/package, watch/gui); `serve` alone stays honest exit 4 (no
+   build step will ever deliver it — never fake success)
 5. ✅ Supervisor daemon + run leases + idempotency journal
 6. ✅ Training runtime — transactional checkpoints (12 §11 write
    protocol / newest-valid predicate / verify / components), heartbeat
@@ -302,6 +331,24 @@ mlforge/
   accept only identity fields (plus `lr`/`batch`/`precision` aliases);
   a typo BLOCKs before anything exists, never a silent different
   experiment (12 §13.3).
+* **Every run records its identity at creation** — source tree hash +
+  full `code/source.snapshot.tar.gz` + git provenance and the
+  environment fingerprint are written before the run is journaled; a
+  run that cannot record identity does not exist (12 §6.4). The gate
+  then freezes them: tree changed, snapshot tampered, or environment
+  moved ⇒ FAIL (12 §13.3).
+* **One disk/GPU story across gate and preflight** — step 16 and the
+  preflight disk probe read the same `disk_estimate_components()`
+  (runtime overrides from `train --config` honored in both), and the
+  preflight GPU expectation follows the validated execution plan
+  (CPU/PORTABLE plan never demands `nvidia-smi`; explicit
+  `runtime.gpu` still wins — 12 §14).
+* **`validate` runs the full 16-step gate, lease included** — a
+  passing gate holds the single-writer lease (launch reuses that
+  session token), so a second validate while the lease is held is the
+  spec'd exit-3 `RUN_ALREADY_EXECUTING` (12 §18 step 15, 13 §7);
+  a BLOCKED gate releases whatever it acquired ("no changes" includes
+  the lease).
 
 ## Develop
 

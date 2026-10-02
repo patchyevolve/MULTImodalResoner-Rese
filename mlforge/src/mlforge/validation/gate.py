@@ -307,6 +307,10 @@ def provide_dataset_identity(root: str | Path) -> Provider:
     Check sequence per dataset — each failure mode has ONE message:
       not registered  → FAIL (register first, `mlforge dataset add`)
       version differs → FAIL (never reinterpret a version)
+      store-backed    → content store must hold the exact registered
+                        bytes (prepared datasets, 12 §6.4 — no
+                        machine-local path exists for a derived dataset;
+                        the transform step then verifies its identity)
       no path config  → FAIL (paths are explicit, never discovered)
       hash mismatch   → FAIL (content changed since registration)
       unreadable      → FAIL (path gone / symlink / empty — fail-closed)
@@ -314,6 +318,7 @@ def provide_dataset_identity(root: str | Path) -> Provider:
     """
     from mlforge.ingest import config as ingest_config
     from mlforge.ingest.identity import parse_ref, recompute_identity
+    from mlforge.store import ContentStore
 
     def _p(ctx: GateContext) -> Check:
         spec = ctx.run_spec
@@ -324,6 +329,7 @@ def provide_dataset_identity(root: str | Path) -> Provider:
             paths = ingest_config.load_paths(ctx.root)
         except PreconditionFailed as exc:
             return Check(0, "", "", FAIL, f"dataset path config unreadable: {exc}")
+        store = ContentStore(ctx.root / "store")  # prepared datasets live here
         verified: list[str] = []
         files_hashed = 0
         for ref in refs:
@@ -345,8 +351,24 @@ def provide_dataset_identity(root: str | Path) -> Provider:
                 return Check(
                     0, "", "", FAIL,
                     f"{ref}: registered version {reg_version!r} != {version!r} "
-                    f"(versions are identity, never reinterpreted)",
+                    "(versions are identity, never reinterpreted)",
                 )
+            identity = reg.get("identity")
+            # Store-backed (prepared) datasets: identity == artifact digest.
+            # The content store must still hold those exact bytes.
+            if identity and store.contains(identity):
+                try:
+                    store.get_bytes(identity, verify=True)
+                except (ValidationBlock, NotFound, OSError) as exc:
+                    detail = (exc.message if isinstance(exc, ValidationBlock)
+                              else str(exc))
+                    return Check(
+                        0, "", "", FAIL,
+                        f"{ref}: content store artifact failed integrity "
+                        f"verification — {detail}",
+                    )
+                verified.append(ref)
+                continue
             path = paths.get(name)
             if not path:
                 return Check(
@@ -511,4 +533,295 @@ def provide_topology() -> Provider:
             f"{topo['collective_backend']}/{topo['network_fabric']})",
             {"topology": topo},
         )
+    return _p
+
+
+# ---------------------------------------------------------------------------
+# Host/runtime providers — gate steps 8/9/14 (12 §13, §11.2; build 3)
+# ---------------------------------------------------------------------------
+
+
+def provide_hardware() -> Provider:
+    """Step 9: hardware capabilities measured live (12 §13.1 — never
+    guessed; broken detection is ValidationBlock ⇒ engine FAIL)."""
+    def _p(ctx: GateContext) -> Check:
+        from mlforge.planner import detect_capabilities
+
+        caps = detect_capabilities()
+        parts = [f"{caps.cpu_count} CPU", f"{caps.ram_bytes // (1 << 30)} GiB RAM"]
+        if caps.gpus:
+            vram = max(g.vram_total_mb for g in caps.gpus)
+            parts.append(
+                f"{caps.gpu_count} GPU ({caps.gpus[0].name}, {vram} MiB)"
+            )
+        parts.append(f"source {caps.source}")
+        return Check(
+            0, "", "", PASS, "detected: " + " · ".join(parts),
+            {"gpu_count": caps.gpu_count, "cpu_count": caps.cpu_count,
+             "interconnect": caps.interconnect, "source": caps.source},
+        )
+    return _p
+
+
+def provide_driver() -> Provider:
+    """Step 8: driver compatibility (12 §18).
+
+    GPUs are only ever measured *through* a responding driver
+    (detect_capabilities shells out to nvidia-smi and raises when it is
+    present but broken), so a successful GPU detection is itself the
+    driver-responds evidence; a CPU-only host has nothing to drive."""
+    def _p(ctx: GateContext) -> Check:
+        from mlforge.planner import detect_capabilities
+
+        caps = detect_capabilities()
+        if not caps.gpus:
+            return Check(
+                0, "", "", PASS,
+                "no CUDA device — driver compatibility not applicable "
+                "(CPU execution)",
+                {"gpu_count": 0},
+            )
+        return Check(
+            0, "", "", PASS,
+            f"driver responding — nvidia-smi measured {caps.gpu_count} "
+            "GPU(s) (12 §13.1)",
+            {"gpu_count": caps.gpu_count, "source": caps.source},
+        )
+    return _p
+
+
+def provide_checkpoint() -> Provider:
+    """Step 14: newest-valid predicate (12 §11.2).
+
+    TRAIN (fresh): no checkpoint to restore — PASS with that fact.
+    RESUME: the store must yield a verified newest-valid checkpoint or
+    the run does not resume (fail-closed)."""
+    def _p(ctx: GateContext) -> Check:
+        from mlforge.runtime.checkpoints import CheckpointStore
+
+        store = CheckpointStore(ctx.run_dir)
+        selection = store.newest_valid()
+        if getattr(ctx, "flow", "TRAIN") == "TRAIN":
+            return Check(
+                0, "", "", PASS,
+                "fresh run — no checkpoint to restore (12 §11.2)",
+                {"flow": "TRAIN"},
+            )
+        if selection.selected is None:
+            skips = len(selection.skips)
+            detail = "no newest-valid checkpoint — resume cannot proceed"
+            if skips:
+                detail += f" ({skips} candidate(s) failed verification)"
+            return Check(0, "", "", FAIL, detail,
+                         {"attempted_newest": selection.attempted_newest})
+        cand = selection.selected
+        step = (f", global_step {cand.global_step}"
+                if cand.global_step is not None else "")
+        return Check(
+            0, "", "", PASS,
+            f"ckpt-{cand.ordinal:06d} verified (newest-valid{step})",
+            {"resume_ordinal": cand.ordinal, "skips": len(selection.skips)},
+        )
+    return _p
+
+
+# ---------------------------------------------------------------------------
+# Artifact providers — gate steps 5/6 (12 §6.4 EXACT-required identity)
+# ---------------------------------------------------------------------------
+
+
+def provide_transform(root: str | Path) -> Provider:
+    """Step 5: transform identity for every dataset in the run (12 §18).
+
+    The prepared artifact's registered content hash IS the transform
+    identity anchor: the content store must still hold the exact bytes
+    (verify=True re-hashes) and the artifact must carry a registered
+    transform name. A raw, un-prepared dataset has no transform artifact
+    ⇒ FAIL with the prepare hint — EXACT-required, never a guess
+    (12 §8.4: "artifact hash must match → else BLOCK")."""
+
+    def _p(ctx: GateContext) -> Check:
+        from mlforge.ingest.identity import parse_ref
+        from mlforge.ingest.transforms import registry_names
+        from mlforge.store import ContentStore
+
+        spec = ctx.run_spec
+        refs: list[str] = list(spec.train_datasets)
+        if spec.val_dataset:
+            refs.append(spec.val_dataset)
+        store = ContentStore(Path(root) / "store")
+        known = set(registry_names())
+        verified: list[str] = []
+        for ref in refs:
+            name, _version = parse_ref(ref)
+            reg_path = Path(root) / "datasets" / name / "identity.json"
+            if not reg_path.is_file():
+                return Check(0, "", "", FAIL,
+                             f"{ref}: not registered — "
+                             f"mlforge dataset add {name} <PATH>")
+            try:
+                reg = json.loads(reg_path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError as exc:
+                return Check(0, "", "", FAIL,
+                             f"{name}: registration unreadable ({exc})")
+            identity = reg.get("identity")
+            if not identity:
+                return Check(0, "", "", FAIL,
+                             f"{name}: no recorded identity — re-register")
+            if not store.contains(identity):
+                return Check(
+                    0, "", "", FAIL,
+                    f"{name}: raw dataset — no transform artifact recorded "
+                    "(transform identity is EXACT-required, 12 §6.4/§8.4); "
+                    "derive it first: mlforge prepare <MODEL>",
+                )
+            try:
+                doc = json.loads(store.get_bytes(identity, verify=True))
+            except ValidationBlock as exc:
+                return Check(0, "", "", FAIL,
+                             f"{name}: transform artifact failed integrity "
+                             f"verification — {exc.message}")
+            except Exception as exc:
+                return Check(0, "", "", FAIL,
+                             f"{name}: transform artifact unreadable: {exc}")
+            transform = doc.get("transform")
+            if not isinstance(transform, dict) or not transform.get("name"):
+                return Check(
+                    0, "", "", FAIL,
+                    f"{name}: artifact carries no transform identity — "
+                    "re-run `mlforge prepare <MODEL>`",
+                )
+            t_name = str(transform["name"])
+            if t_name not in known:
+                return Check(
+                    0, "", "", FAIL,
+                    f"{name}: transform {t_name!r} not in the closed "
+                    f"registry ({', '.join(sorted(known)) or 'empty'}) — "
+                    "unverifiable transform code",
+                )
+            verified.append(f"{name}→{t_name}")
+        return Check(
+            0, "", "", PASS,
+            f"{len(verified)} transformed dataset(s) verified — "
+            + ", ".join(verified),
+            {"datasets": verified},
+        )
+
+    return _p
+
+
+def provide_model(root: str | Path) -> Provider:
+    """Step 6: model architecture + base weights hash (12 §18).
+
+    * from scratch (train/fork): nothing external to verify — the
+      architecture is defined by the source captured at step 3 and the
+      frozen `run_spec.model`; no base weights exist to hash.
+    * finetune (`lineage.origin == "finetune"`, `parent_model` = base
+      ref): the base registry entry must be published AND its weights
+      artifact must still verify — for run-published models the weights
+      digest is the producing run's newest COMMIT marker (re-read +
+      match); for imported packages the recorded digest is the authority.
+    * retrain (`parent_model`, other origins): the parent model must
+      exist and be published (fresh init needs the model identity, not
+      weights)."""
+
+    def _p(ctx: GateContext) -> Check:
+        from mlforge.lineage import read_lineage
+
+        try:
+            lineage = read_lineage(ctx.run_dir)
+        except ValidationBlock as exc:
+            return Check(0, "", "", FAIL, f"lineage unreadable: {exc.message}")
+        origin = str(lineage.get("origin") or "train")
+        parent = lineage.get("parent_model")
+        # Production writes finetune's base as parent_model (+ origin);
+        # base_model is honored too if a writer ever persists it.
+        needs_weights = origin == "finetune" or bool(lineage.get("base_model"))
+        ref = lineage.get("base_model") or parent
+        name = ctx.run_spec.model
+
+        if not ref:
+            return Check(
+                0, "", "", PASS,
+                f"train from scratch — model '{name}'; architecture from "
+                "captured source (step 3), no base weights to hash",
+                {"model": name},
+            )
+
+        ref = str(ref)
+        # Lazy: workflow is fully loaded by the time the gate runs.
+        from mlforge.workflow import WorkflowAPI
+
+        wf = WorkflowAPI(Path(root))
+        try:
+            entry = wf.resolve_model(ref)
+        except (NotFound, PreconditionFailed, ValidationBlock) as exc:
+            return Check(
+                0, "", "", FAIL,
+                f"base model {ref} not in the registry — {exc}"
+                if not isinstance(exc, ValidationBlock)
+                else f"base model {ref}: {exc.message}",
+            )
+        state = entry.get("state")
+        if state not in {"AVAILABLE", "EVALUATED", "EXPORTED", "DEPLOYED",
+                         "USED_AS_FINE_TUNE_BASE"}:
+            return Check(
+                0, "", "", FAIL,
+                f"base model {ref} is {state or 'unpublished'} — a base "
+                "must be published (models appear when a run completes, "
+                "13 §5.5)",
+            )
+        canonical = f"{entry.get('name')}:{entry.get('version')}"
+        artifact = entry.get("artifact_hash")
+
+        if not needs_weights:  # retrain — fresh init, identity is enough
+            detail = f"parent model {canonical} available (state {state})"
+            if artifact:
+                detail += f" · recorded artifact {str(artifact)[:19]}…"
+            return Check(0, "", "", PASS, detail,
+                         {"model": canonical, "state": state})
+
+        if not artifact:
+            return Check(
+                0, "", "", FAIL,
+                f"base model {canonical} has no weights artifact — "
+                "nothing to initialize from (12 §15.3)",
+            )
+        if (entry.get("origin") or "run") != "run":
+            # Imported package: the weight bytes live outside the
+            # workspace — the registry digest is the authority (12 §15.3).
+            return Check(
+                0, "", "", PASS,
+                f"base weights digest recorded — imported {canonical}, "
+                f"{str(artifact)[:19]}…",
+                {"model": canonical, "artifact_hash": artifact},
+            )
+        src_run = entry.get("run_id")
+        marker_found = False
+        ckpt_root = Path(root) / "runs" / str(src_run) / "checkpoints"
+        if ckpt_root.is_dir():
+            for d in sorted(ckpt_root.iterdir()):
+                marker = d / "COMMIT" if d.is_dir() else None
+                if marker is not None and marker.is_file():
+                    try:
+                        if marker.read_text(encoding="utf-8").strip() == artifact:
+                            marker_found = True
+                            break
+                    except OSError:
+                        continue
+        if not marker_found:
+            return Check(
+                0, "", "", FAIL,
+                f"base weights {str(artifact)[:19]}… not found under run "
+                f"{src_run} — the producing run's checkpoint COMMIT marker "
+                "is missing or differs; finetune cannot initialize "
+                "fail-closed",
+            )
+        return Check(
+            0, "", "", PASS,
+            f"base weights verified — COMMIT {str(artifact)[:19]}… "
+            f"({canonical}, run {src_run})",
+            {"model": canonical, "artifact_hash": artifact},
+        )
+
     return _p
