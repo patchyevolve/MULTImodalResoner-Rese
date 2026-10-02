@@ -699,9 +699,10 @@ def _print_init_next_steps(name: str, target: Path) -> None:
     print("  models/  runs/  artifacts/      §10 layout")
     print("\nNext steps:")
     print(f"  cd {target}")
-    print("  mlforge dataset add <ID> <PATH>     # register + verify identity")
-    print("  mlforge configure datasets          # machine-local paths (12 §10.1)")
-    print("  $EDITOR ingestion.yaml              # adjust sources/transform")
+    print("  mlforge dataset add <ID> <PATH>     "
+          "# register + verify identity; sets this machine's path")
+    print("  $EDITOR ingestion.yaml              "
+          "# say which transform feeds which model")
     print("  mlforge prepare <MODEL>             # derived <MODEL>_prepared (§6.6)")
     print("  mlforge train --config configs/train.example.json")
 
@@ -2045,7 +2046,8 @@ def _do_hello(args) -> int:
         print("  mlforge init myproj && cd myproj   # create a workspace")
         print("  mlforge dataset add books /path/to/books --yes"
               "   # registers identity + this machine's path")
-        print("  $EDITOR ingestion.yaml             # model → transform")
+        print("  $EDITOR ingestion.yaml             "
+              "# say which transform feeds which model")
         print("  mlforge prepare <model>            # extract → chunk")
         print("  mlforge train --config configs/train.example.json --yes")
         print("  mlforge watch                      # live loss dashboard")

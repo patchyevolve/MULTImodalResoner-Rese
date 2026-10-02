@@ -38,6 +38,7 @@ from mlforge.ingest.transforms import (
     ResolvedSource,
     cache_key,
     env_fingerprint,
+    registry_names,
     run_transform,
     transform_identity,
 )
@@ -230,7 +231,17 @@ def prepare(root: str | Path, model: str, *, workflow: Any) -> PreparedResult:
     if model not in plans:
         raise NotFound(
             f"model {model!r} not found in ingestion.yaml",
-            hint="known models: " + (", ".join(sorted(plans)) or "(none)"),
+            hint=(
+                "known models: "
+                + (", ".join(sorted(plans)) or "(none)")
+                + " | registered transforms: "
+                + ", ".join(registry_names())
+                + " — declare yours (12 §10.2):\n"
+                "        models:\n"
+                f"          {model}:\n"
+                "            transform: text_corpus   # or coco_detection\n"
+                "            train_sources: [<dataset>:train]"
+            ),
         )
     # Explicit DAG walk — proves order is resolvable (12 §10.2) and
     # surfaces cycles as a BLOCK before any hashing work.
