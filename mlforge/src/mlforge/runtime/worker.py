@@ -82,6 +82,7 @@ class Worker:
         self.sleep = sleep
         self.max_iterations = max_iterations
         self._owns = False  # proven lease owner; gates cleanup rights
+        self._progress: dict[str, Any] | None = None  # live on_progress cell
 
     # -- plumbing -----------------------------------------------------------
 
@@ -185,6 +186,94 @@ class Worker:
             )
         return out
 
+    def _init_weights(self) -> bytes | None:
+        """Fine-tune initialization (13 §6.4, 12 §15.3): the parent run's
+        committed `model` component, matched by the lineage's
+        `parent_checkpoint` — the parent's COMMIT-marker manifest hash.
+
+        Only `origin == "finetune"` gets parent weights: retrain/fork/
+        train start fresh BY DESIGN (13 §6.3 "fresh init"). Resume (own
+        payloads present) bypasses this entirely — the caller decides.
+        """
+        from mlforge.lineage import read_lineage
+
+        lineage = read_lineage(self.run_dir)
+        if lineage.get("origin") != "finetune":
+            return None
+        parent_run = str(lineage.get("parent_run") or "")
+        parent_ck = str(lineage.get("parent_checkpoint") or "")
+        if not parent_run or not parent_ck:
+            raise PreconditionFailed(
+                f"run {self.run_id}: finetune lineage lacks parent_run / "
+                "parent_checkpoint — cannot initialize from weights",
+            )
+        parent_ckpt_root = self.root / "runs" / parent_run / "checkpoints"
+        if not parent_ckpt_root.is_dir():
+            raise PreconditionFailed(
+                f"parent run {parent_run} has no checkpoints — nothing to "
+                "initialize from",
+            )
+        short = parent_ck[:19]
+        for d in sorted(parent_ckpt_root.iterdir(), reverse=True):
+            marker = d / "COMMIT" if d.is_dir() else None
+            if marker is None or not marker.is_file():
+                continue
+            try:
+                digest = marker.read_text(encoding="utf-8").strip()
+            except OSError:
+                continue
+            if digest != parent_ck:
+                continue
+            # Match found — full §11.3 verification before trusting bytes.
+            try:
+                ordinal = int(d.name.split("-", 1)[1])
+            except (IndexError, ValueError) as exc:
+                raise PreconditionFailed(
+                    f"parent checkpoint directory unreadable: {d.name}"
+                ) from exc
+            ok, reason = CheckpointStore(
+                parent_ckpt_root
+            ).verify(ordinal)
+            if not ok:
+                raise PreconditionFailed(
+                    f"parent checkpoint {short}… failed verification: "
+                    f"{reason} — finetune cannot initialize fail-closed",
+                )
+            model_file = d / "model"
+            if not model_file.is_file():
+                raise PreconditionFailed(
+                    f"parent checkpoint {short}… has no `model` component "
+                    "— nothing to initialize from (12 §15.3)",
+                )
+            return model_file.read_bytes()
+        raise PreconditionFailed(
+            f"parent checkpoint COMMIT {short}… not found under run "
+            f"{parent_run} — the producing run's checkpoint is missing "
+            "or was replaced; finetune cannot initialize fail-closed",
+        )
+
+    def _progress_beater(self, hb: HeartbeatWriter, step: int, epoch: int):
+        """`on_progress` closure for trainer steps that outlive the
+        heartbeat interval (12 §23.2: 30s beats, 120s supervisor timeout —
+        a long RF-DETR epoch must beat DURING training or the run is
+        marked INTERRUPTED). Throttled: at most one beat per interval."""
+        cell = {
+            "global_step": step,
+            "epoch": epoch,
+            "last_beat": float(self.clock()),
+        }
+        self._progress = cell
+
+        def on_progress(detail: Any = None) -> None:
+            now = float(self.clock())
+            if now - float(cell["last_beat"]) < self.heartbeat_interval:
+                return
+            hb.beat(global_step=int(cell["global_step"]), state="RUNNING")
+            cell["last_beat"] = float(self.clock())
+
+        return on_progress
+
+
     # -- lifecycle ------------------------------------------------------------
 
     def run(self) -> int:
@@ -233,6 +322,12 @@ class Worker:
                         payloads = self._restore_payloads(
                             store, selection.selected.ordinal
                         )
+                    # Fine-tune init from the lineage parent — only when
+                    # this run is NOT resuming (resume and fine-tune init
+                    # are mutually exclusive; resume wins, never both).
+                    init_weights = (
+                        None if payloads is not None else self._init_weights()
+                    )
                     trainer = resolve_trainer(
                         self._runtime_config(),
                         start_step=start_step,
@@ -243,6 +338,11 @@ class Worker:
                         root=self.root,
                         payloads=payloads,
                         plan=plan,
+                        run_dir=self.run_dir,
+                        on_progress=self._progress_beater(
+                            hb, start_step, start_epoch
+                        ),
+                        init_weights=init_weights,
                     )
                 wf.preflight_pass(self.run_id)  # READY → RUNNING (runtime's step)
                 wf.create_execution_segment(
@@ -319,7 +419,20 @@ class Worker:
                     # explicit "checkpoint now" (13 §9.6 watch keybinding):
                     # obey once, then forget the intent.
                     clear_control(self.root, self.run_id)
-                    self._checkpoint(wf, store, trainer, tstate)
+                    if getattr(trainer, "checkpointable", True):
+                        self._checkpoint(wf, store, trainer, tstate)
+                    else:
+                        # e.g. RF-DETR: first epoch still training — there
+                        # is no framework state yet. Deferring is honest;
+                        # failing a healthy run over a stray keypress is
+                        # not (the periodic path checkpoints after step 1).
+                        self._write_live({
+                            "stage": "TRAINING",
+                            "global_step": tstate.global_step,
+                            "epoch": tstate.epoch,
+                            "note": "checkpoint deferred — first epoch not "
+                                    "finished yet",
+                        })
                 # corrupt/unknown intents are quarantined by read_control;
                 # they must not crash training — but they must not be obeyed.
 
@@ -335,6 +448,10 @@ class Worker:
             # payload must describe "trained THROUGH result.global_step"
             # (a lagged state meant resume restarted one step behind).
             tstate = TrainState(result.global_step, result.epoch, tstate.resume_from)
+            cell = getattr(self, "_progress", None)
+            if cell is not None:  # what the trainer's on_progress beats
+                cell["global_step"] = tstate.global_step
+                cell["epoch"] = tstate.epoch
             self._write_live({
                 "stage": "TRAINING",
                 "global_step": tstate.global_step,

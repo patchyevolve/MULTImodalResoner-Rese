@@ -141,11 +141,24 @@ def resolve_trainer(
     root: str | Path | None = None,
     payloads: Mapping[str, bytes] | None = None,
     plan: Any = None,
+    run_dir: str | Path | None = None,
+    on_progress: Any = None,
+    init_weights: bytes | None = None,
 ) -> Trainer:
     """The ONLY way production code obtains a trainer (fail-closed).
 
     Order: explicit `trainer:` id → harness opt-in → the REAL trainer
-    registered for `model` → refuse. No silent scaffold, ever."""
+    registered for `model` → refuse. No silent scaffold, ever.
+
+    Construction channels (12 §12.4 injection surface):
+      payloads      — newest-valid OWN checkpoint (resume)
+      init_weights  — parent run's `model` component (fine-tune: weights
+                      only, fresh optimizer; mutually exclusive with
+                      payloads — enforced by build_trainer)
+      run_dir       — this run's directory (framework scratch)
+      on_progress   — liveness callback for steps outliving the
+                      heartbeat interval (12 §23.2: 30s beats / 120s
+                      supervisor timeout)"""
     choice = str((runtime or {}).get("trainer", "")).strip().lower()
     if choice and choice != HARNESS_TRAINER:
         raise PreconditionFailed(
@@ -188,6 +201,9 @@ def resolve_trainer(
         start_step=start_step,
         start_epoch=start_epoch,
         plan=plan,
+        run_dir=Path(run_dir) if run_dir is not None else None,
+        on_progress=on_progress,
+        init_weights=init_weights,
     )
 
 

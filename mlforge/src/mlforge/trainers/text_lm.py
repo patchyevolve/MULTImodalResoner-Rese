@@ -53,6 +53,17 @@ def torch_available() -> bool:
     return _TORCH_IMPORT_ERROR is None
 
 
+def dependency_error() -> str | None:
+    """None = this trainer's framework is present here (registry probe)."""
+    if torch_available():
+        return None
+    return (
+        "torch is not installed — the real learning loop needs it; "
+        "pip install torch (CPU wheel: "
+        "pip install torch --index-url https://download.pytorch.org/whl/cpu)"
+    )
+
+
 @dataclass(frozen=True)
 class TextArch:
     """Architecture constants keyed by MODEL NAME (part of the run's
@@ -215,6 +226,9 @@ class TorchTextTrainer:
         start_step: int = 0,
         start_epoch: int = 0,
         plan: Any = None,
+        run_dir: Path | None = None,        # scratch dir (unused here)
+        on_progress: Any = None,            # fast steps: not needed
+        init_weights: bytes | None = None,
     ):
         if not torch_available():
             raise PreconditionFailed(
@@ -345,6 +359,12 @@ class TorchTextTrainer:
         )
 
         # -- restore (real continuation: weights + optimizer + RNG) --------
+        if payloads and init_weights is not None:
+            raise ValidationBlock(
+                "resume payloads and fine-tune init weights are mutually "
+                "exclusive — resume from THIS run's checkpoint or "
+                "initialize from the parent's weights, never both",
+            )
         if payloads:
             missing = [c for c in REQUIRED_COMPONENTS if c not in payloads]
             if missing:
@@ -353,6 +373,8 @@ class TorchTextTrainer:
                     f"{', '.join(missing)} (not resumable, 12 §11.4)",
                 )
             self._restore(dict(payloads))
+        elif init_weights is not None:
+            self._init_from_weights(init_weights)
         self.start_step = int(start_step)
         self.start_epoch = int(start_epoch)
 
@@ -386,6 +408,19 @@ class TorchTextTrainer:
         # bytes come from CheckpointStore.load/verify — integrity-checked
         # against the manifest before they reach the trainer.
         return torch.load(io.BytesIO(blob), weights_only=True, map_location="cpu")
+
+    def _init_from_weights(self, blob: bytes) -> None:
+        """Fine-tune (13 §6.4): the parent run's `model` component loads
+        into a FRESH optimizer/scheduler — weights only, never a resume."""
+        try:
+            self.model.load_state_dict(self._load(blob))
+        except Exception as exc:
+            raise ValidationBlock(
+                f"fine-tune init weights not loadable by trainer "
+                f"{self.model_name!r}: {exc}",
+                hint="the parent model must be the same architecture — "
+                     "fine-tuning across architectures is never implied",
+            ) from exc
 
     def _restore(self, payloads: dict[str, bytes]) -> None:
         try:
@@ -562,11 +597,17 @@ class TorchTextTrainer:
         }
 
 
+#: Registry hook consumed by mlforge.trainers.build_trainer.
+TRAINER_CLASS = TorchTextTrainer
+
+
 __all__ = [
     "MODEL_REGISTRY",
+    "TRAINER_CLASS",
     "TorchTextTrainer",
     "TinyGPT",
     "TextArch",
+    "dependency_error",
     "torch_available",
     "load_text_corpus",
 ]

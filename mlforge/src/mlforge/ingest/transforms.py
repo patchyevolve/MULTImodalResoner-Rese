@@ -57,6 +57,7 @@ class ResolvedSource:
     path: Path
     identity: str               # cryptographic identity (sha256:...)
     entries: tuple[FileEntry, ...]
+    generated_from: str | None = None  # producing model (derived data, 12 §10.2)
 
     @property
     def file_count(self) -> int:
@@ -808,7 +809,10 @@ PLANNED_DATASET_TYPES: tuple[dict[str, str], ...] = (
     {"name": "audio", "title": "Audio datasets",
      "reason": "AudioSet — needs feature extraction (later build step)"},
     {"name": "generated", "title": "Generated sources",
-     "reason": "calibration etc. — needs the model registry (12 §10.2)"},
+     "reason": "the {generated_from: <model>, dataset: <id>} source form "
+               "resolves against the model registry (12 §10.2); the "
+               "calibration transform itself (C5) arrives in a later "
+               "build step"},
 )
 
 

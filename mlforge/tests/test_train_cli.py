@@ -118,7 +118,7 @@ def test_train_refuses_without_real_trainer(tmp_path, capsys, no_supervisor,
     """Production default (no harness opt-in): nothing is created at all —
     exit 3 BEFORE any run/queue exists. No fake start, no fake loss."""
     monkeypatch.delenv("MLFORGE_HARNESS", raising=False)
-    cfg = _write_config(tmp_path)
+    cfg = _write_config(tmp_path, model="some_future_model")  # no trainer
     code = main(["--root", str(tmp_path), "train", "--config", cfg, "--yes"])
     assert code == 3
     err = capsys.readouterr().err

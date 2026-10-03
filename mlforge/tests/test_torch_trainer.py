@@ -261,17 +261,20 @@ def test_resolve_trainer_selects_real_by_model(tmp_path, tiny_model, monkeypatch
 def test_resolve_unknown_model_refuses(tmp_path, monkeypatch):
     monkeypatch.delenv("MLFORGE_HARNESS", raising=False)
     with pytest.raises(PreconditionFailed) as exc:
-        resolve_trainer({}, model="rf_detr_s", root=tmp_path)
+        resolve_trainer({}, model="some_future_model", root=tmp_path)
     out = exc.value.render()
-    assert "no real trainer integrated for model 'rf_detr_s'" in out
+    assert "no real trainer integrated for model 'some_future_model'" in out
     assert "harness-scaffold" in out  # hint still names the only opt-in
+    # the refusal teaches what IS trainable (discovery, never a shrug)
+    assert "reasoner_s" in out and "rf_detr_s" in out
 
 
 def test_require_trainable_is_cheap_and_model_aware(monkeypatch):
     monkeypatch.delenv("MLFORGE_HARNESS", raising=False)
     require_trainable({}, model="reasoner_s")  # torch present → ok
+    require_trainable({}, model="rf_detr_s")  # rfdetr present → ok
     with pytest.raises(PreconditionFailed):
-        require_trainable({}, model="rf_detr_s")
+        require_trainable({}, model="some_future_model")
     with pytest.raises(PreconditionFailed) as exc:
         require_trainable({})
     assert "no model context" in str(exc.value)

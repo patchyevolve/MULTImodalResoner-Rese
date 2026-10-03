@@ -57,7 +57,7 @@ _SEMANTIC_ALIASES = {
 }
 _ALLOWED_OVERRIDE_KEYS = frozenset(REQUIRED_SEMANTIC_FIELDS) | frozenset(
     _SEMANTIC_ALIASES
-) | {"finetune_strategy"}
+) | {"finetune_strategy", "pretrained", "windows_per_epoch"}
 
 #: Sentinel: "leave this field as the parent's" (None is a real value —
 #: val_dataset=None means "no validation set").

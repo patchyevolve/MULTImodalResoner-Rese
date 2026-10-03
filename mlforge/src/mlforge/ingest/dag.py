@@ -11,12 +11,14 @@
 Source forms (12 §10.2):
   * `name:split` — a registered dataset (split is SOURCE metadata; the
     dataset object key is `name`, identity comes from its registration)
-  * `{generated_from: <model>}` — output of another model (derived data)
+  * `{generated_from: <model>, dataset: <ID>}` — output of another model
+    (derived data): `generated_from` is provenance — the model must be
+    AVAILABLE in the registry — and `dataset` names the registered bytes
 
 Fail-closed rules: missing/unreadable `ingestion.yaml` (exit 3), unknown
 keys/transforms (exit 1), unregistered sources (exit 2), hash mismatch
 vs registration (exit 1), unmet `depends_on`/`generated_from` (exit 3 —
-trained models are not resolvable until the model registry lands).
+the upstream model must be AVAILABLE in the model registry, 13 §5.5).
 """
 
 from __future__ import annotations
@@ -48,7 +50,10 @@ class Source:
     @property
     def ref(self) -> str:
         if self.is_generated:
-            return f"generated_from:{self.generated_from}"
+            base = f"generated_from:{self.generated_from}"
+            # Include the backing dataset when declared: two outputs of the
+            # same model must not look like the same source in the doc.
+            return f"{base}@{self.dataset}" if self.dataset else base
         return f"{self.dataset}:{self.split}" if self.split else str(self.dataset)
 
     @classmethod
@@ -64,12 +69,20 @@ class Source:
                 raise PreconditionFailed(f"{where}: empty source")
             return cls(dataset=text, split=None)
         if isinstance(item, dict):
-            extra = set(item) - {"generated_from"}
-            if item.get("generated_from") and not extra:
-                return cls(generated_from=str(item["generated_from"]))
+            extra = set(item) - {"generated_from", "dataset"}
+            gen = item.get("generated_from")
+            if gen and not extra:
+                ds = item.get("dataset")
+                if ds is not None and (not isinstance(ds, str) or not ds.strip()):
+                    raise PreconditionFailed(
+                        f"{where}: dataset must be a non-empty name in {item!r}"
+                    )
+                return cls(dataset=str(ds).strip() if ds else None,
+                           generated_from=str(gen))
             raise PreconditionFailed(
                 f"{where}: unsupported source form {item!r} "
-                f"(expected 'name:split' or {{generated_from: model}})"
+                f"(expected 'name:split' or {{generated_from: model, "
+                f"dataset: <id>}})"
             )
         raise PreconditionFailed(f"{where}: unsupported source {item!r}")
 
@@ -86,11 +99,22 @@ class ModelPlan:
     def sources(self) -> tuple[Source, ...]:
         return self.train_sources + self.val_sources
 
+    @staticmethod
+    def _source_out(s: Source) -> Any:
+        # Generated sources must round-trip as their dict form — a bare
+        # `generated_from:m@dataset` string would re-parse as name:split.
+        if s.is_generated:
+            out: dict[str, Any] = {"generated_from": s.generated_from}
+            if s.dataset:
+                out["dataset"] = s.dataset
+            return out
+        return s.ref
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "transform": self.transform,
-            "train_sources": [s.ref for s in self.train_sources],
-            "val_sources": [s.ref for s in self.val_sources],
+            "train_sources": [self._source_out(s) for s in self.train_sources],
+            "val_sources": [self._source_out(s) for s in self.val_sources],
             "depends_on": list(self.depends_on),
         }
 
@@ -167,7 +191,9 @@ def resolve_order(plans: dict[str, ModelPlan], target: str) -> list[str]:
             raise NotFound(f"ingestion model {name!r} not found")
         for dep in plan.depends_on:
             if dep not in plans:
-                raise NotFound(f"ingestion model {name!r} depends on unknown {dep!r}")
+                # Registry-only dependency: nothing to order here — prepare
+                # checks availability against the model registry (12 §10.2).
+                continue
             visit(dep, chain + (name,))
         state[name] = 1
         order.append(name)

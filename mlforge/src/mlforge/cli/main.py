@@ -648,6 +648,8 @@ _INGESTION_TEMPLATE = """\
 #                  add types with mlforge.ingest.register_transform)
 #   train_sources: <dataset>:<split> — register with `mlforge dataset add`
 #                  and verify BEFORE `mlforge prepare`
+#                  derived data: {generated_from: <model>, dataset: <id>}
+#                  (the model must be AVAILABLE; dataset holds its output)
 #   depends_on:    upstream models that must be AVAILABLE first (registry)
 models:
   rf_detr_s:

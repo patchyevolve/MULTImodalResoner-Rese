@@ -14,7 +14,8 @@ Fail-closed mapping (13 §4.2 exit codes):
   unknown model / missing ingestion.yaml / unregistered source → 2/3
   identity mismatch at a source path                      → 1 (+reregister)
   unknown transform / empty output                        → 1
-  unmet depends_on / generated_from (model registry later) → 3
+  unmet depends_on / generated_from (upstream model not
+  AVAILABLE in the registry)                              → 3
 
 Idempotency (13 §4.4): the caller wraps `prepare()` in
 `execute_idempotent(command_id, "prepare", ...)` — a retry returns the
@@ -47,6 +48,38 @@ from mlforge.store import ContentStore
 #: Namespace of the cache index inside the workspace (derived data, NOT
 #: source registration — registration lives in datasets/<id>/).
 CACHE_INDEX = Path("artifacts") / "prepare_cache.json"
+
+#: Consumption states (13 §5.4) — same set the gate accepts as a
+#: fine-tune base (validation/gate.py); a model in any of these was
+#: AVAILABLE and remains usable as an upstream dependency.
+_PUBLISHED_STATES = frozenset({
+    "AVAILABLE", "EVALUATED", "EXPORTED", "DEPLOYED",
+    "USED_AS_FINE_TUNE_BASE",
+})
+
+
+def _require_model_available(workflow: Any, ref: str, *, why: str) -> None:
+    """Registry gate for `depends_on` / `generated_from` (12 §10.2).
+
+    Both are exit 3 (precondition), NOT exit 2 (not found): the ingestion
+    config named a model the registry cannot serve yet — train it first.
+    """
+    try:
+        entry = workflow.resolve_model(ref)
+    except NotFound:
+        raise PreconditionFailed(
+            f"upstream model {ref!r} is not in the model registry — {why}",
+            hint="train it first: models publish when a run COMPLETES "
+                 "(13 §5.5); `mlforge model list` shows what exists "
+                 "(check the spelling too)",
+        ) from None
+    state = str(entry.get("state") or "")
+    if state not in _PUBLISHED_STATES:
+        raise PreconditionFailed(
+            f"upstream model {ref} is {state or 'stateless'} — {why}",
+            hint="a model becomes AVAILABLE when its run COMPLETES "
+                 "(13 §5.5); `mlforge model list` shows current states",
+        )
 
 
 @dataclass(frozen=True)
@@ -115,11 +148,27 @@ def resolve_sources(
     resolved: list[ResolvedSource] = []
     for src in plan.sources:
         if src.is_generated:
-            raise PreconditionFailed(
-                f"source generated_from:{src.generated_from} — the model "
-                f"registry cannot resolve it yet",
-                hint="derived sources arrive with the model registry build step",
+            # Provenance first: the producing model must be consumable…
+            _require_model_available(
+                workflow, str(src.generated_from),
+                why=f"source {src.ref!r} records it as the producer "
+                    f"(12 §10.2)",
             )
+            if not src.dataset:
+                # …then the bytes must be LOCATED (verify, never scan: 13 §10).
+                raise PreconditionFailed(
+                    f"source {{generated_from: {src.generated_from}}} names "
+                    "no dataset — generated output must be registered, "
+                    "never scanned",
+                    hint=(
+                        "register the model's output, then name it:\n"
+                        "        mlforge dataset add <ID> <PATH>\n"
+                        "        mlforge dataset verify <ID>\n"
+                        "      then in ingestion.yaml:\n"
+                        "        train_sources: [{generated_from: "
+                        f"{src.generated_from}, dataset: <ID>}}]"
+                    ),
+                )
         if not src.dataset:
             raise PreconditionFailed(f"source {src.ref!r} has no dataset name")
         name = src.dataset
@@ -149,12 +198,16 @@ def resolve_sources(
                      f"<PATH> --force",
             )
         resolved.append(ResolvedSource(
+            # Dataset-derived ref keeps `source.split(":", 1)` consumers
+            # (e.g. the RF-DETR materializer) working; provenance rides
+            # the explicit field instead of the ref.
             ref=f"{name}:{src.split}" if src.split else name,
             split=src.split,
             dataset_id=name,
             path=Path(path),
             identity=identity,
             entries=tuple(manifest.files),
+            generated_from=str(src.generated_from) if src.is_generated else None,
         ))
     return resolved
 
@@ -248,17 +301,25 @@ def prepare(root: str | Path, model: str, *, workflow: Any) -> PreparedResult:
     # surfaces cycles as a BLOCK before any hashing work.
     order = resolve_order(plans, model)
     plan = plans[model]
-    if plan.depends_on:
-        raise PreconditionFailed(
-            f"model {model!r} depends on {', '.join(plan.depends_on)} — "
-            f"upstream models must be AVAILABLE before prepare",
-            hint="the model registry lands in a later build step",
+    # `depends_on: [m]` = upstream model AVAILABLE in the registry —
+    # deps outside this ingestion.yaml are legal (resolve_order skips
+    # them); the registry is the single availability authority.
+    for dep in plan.depends_on:
+        _require_model_available(
+            workflow, dep,
+            why=f"model {model!r} depends on it (12 §10.2)",
         )
 
     sources = resolve_sources(root, plan, workflow)
     t_ident = transform_identity(plan.transform)
     key = cache_key(
-        inputs=[{"ref": s.ref, "identity": s.identity} for s in sources],
+        # Provenance joins the key ONLY for generated sources — static
+        # cache keys stay byte-identical to earlier builds.
+        inputs=[
+            {**({"generated_from": s.generated_from} if s.generated_from else {}),
+             "ref": s.ref, "identity": s.identity}
+            for s in sources
+        ],
         transform_identity_data=t_ident,
         environment=env_fingerprint(),
     )
@@ -285,7 +346,9 @@ def prepare(root: str | Path, model: str, *, workflow: Any) -> PreparedResult:
             "cache_key": key,
             "order": order,
             "sources": [
-                {"ref": s.ref, "identity": s.identity, "files": s.file_count}
+                {**({"generated_from": s.generated_from}
+                    if s.generated_from else {}),
+                 "ref": s.ref, "identity": s.identity, "files": s.file_count}
                 for s in sources
             ],
             "record_count": len(out["records"]),
@@ -313,7 +376,11 @@ def prepare(root: str | Path, model: str, *, workflow: Any) -> PreparedResult:
         cache=cache_state,
         record_count=int(doc.get("record_count", 0)),
         cache_key=key,
-        sources=tuple(s.ref for s in sources),
+        sources=tuple(
+            f"{s.ref} (generated from {s.generated_from})"
+            if s.generated_from else s.ref
+            for s in sources
+        ),
     )
 
 

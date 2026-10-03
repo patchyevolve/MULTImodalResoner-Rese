@@ -6,3 +6,8 @@ build/
 dist/
 .pytest_cache/
 .venv/
+
+# weight artifacts (hundreds of MB; tracked via manifests, never bytes)
+*.pth
+*.ckpt
+*.safetensors
