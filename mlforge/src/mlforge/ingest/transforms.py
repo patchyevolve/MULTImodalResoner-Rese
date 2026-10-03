@@ -776,6 +776,181 @@ def tabular(sources: list[ResolvedSource]) -> dict[str, Any]:
     }
 
 
+#: The five confidence-decomposition components (06 §1 formula names) —
+#: a `components` object in a prediction record must be exactly this set.
+_CAL_COMPONENTS: tuple[str, ...] = (
+    "perception", "temporal", "motion", "cross_modal_agreement", "reasoning",
+)
+
+
+def calibration(sources: list[ResolvedSource]) -> dict[str, Any]:
+    """Prediction records → calibrator training rows (C5, 13 §Model 5).
+
+    Reads `.jsonl`/`.ndjson` (one prediction per line) or a `.json`
+    array, each row `{logits|probs, label}` plus optional `components`
+    (the five decomposition scores, 06 §1). `probs` must sum to ~1 and
+    are converted to log-probabilities (softmax-invariant — temperature
+    scaling on them is exact). Every file must agree on the class count:
+    one calibration pool is one label space, never a mix."""
+    import math
+
+    records: list[dict[str, Any]] = []
+    classes_seen: set[int] = set()
+    for src in sources:
+        for entry in src.entries:
+            suffix = Path(entry.relative_path).suffix.lower()
+            if suffix not in {".jsonl", ".ndjson", ".json"}:
+                continue
+            label = f"{src.ref}:{entry.relative_path}"
+            text = (src.path / entry.relative_path).read_text(
+                encoding="utf-8-sig", errors="replace")
+            if suffix == ".json":
+                try:
+                    rows = json.loads(text)
+                except json.JSONDecodeError as exc:
+                    raise ValidationBlock(
+                        f"{label}: not valid JSON: {exc}") from None
+                if not isinstance(rows, list):
+                    raise ValidationBlock(
+                        f"{label}: expected a JSON array of prediction "
+                        f"objects, got {type(rows).__name__} — one "
+                        "prediction per element",
+                    )
+                enumerated = list(enumerate(rows, 1))
+            else:
+                enumerated = []
+                for lineno, line in enumerate(text.splitlines(), 1):
+                    if not line.strip():
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except json.JSONDecodeError as exc:
+                        raise ValidationBlock(
+                            f"{label}: line {lineno} is not valid JSON: "
+                            f"{exc}") from None
+                    enumerated.append((lineno, obj))
+            for lineno, obj in enumerated:
+                where = f"{label}: {'line' if suffix != '.json' else 'element'} {lineno}"
+                if not isinstance(obj, dict):
+                    raise ValidationBlock(
+                        f"{where} must be a JSON object with `logits` "
+                        f"(or `probs`) and `label`, got "
+                        f"{type(obj).__name__}")
+                if "logits" in obj:
+                    raw = obj["logits"]
+                    if not isinstance(raw, list) or len(raw) < 2:
+                        raise ValidationBlock(
+                            f"{where}: `logits` must be a list of at "
+                            "least 2 numbers (a 1-class score has "
+                            "nothing to calibrate)")
+                    try:
+                        logits = [float(v) for v in raw]
+                    except (TypeError, ValueError) as exc:
+                        raise ValidationBlock(
+                            f"{where}: `logits` must be numbers: {exc}"
+                        ) from None
+                elif "probs" in obj:
+                    raw = obj["probs"]
+                    if not isinstance(raw, list) or len(raw) < 2:
+                        raise ValidationBlock(
+                            f"{where}: `probs` must be a list of at "
+                            "least 2 numbers")
+                    try:
+                        probs = [float(v) for v in raw]
+                    except (TypeError, ValueError) as exc:
+                        raise ValidationBlock(
+                            f"{where}: `probs` must be numbers: {exc}"
+                        ) from None
+                    if any(not math.isfinite(p) or p < 0 for p in probs):
+                        raise ValidationBlock(
+                            f"{where}: `probs` must be finite and >= 0")
+                    total = sum(probs)
+                    if abs(total - 1.0) > 1e-3:
+                        raise ValidationBlock(
+                            f"{where}: `probs` sum to {total!r}, not 1 — "
+                            "send a probability vector or raw `logits`",
+                        )
+                    # ln(p) with a floor for zeros — softmax-invariant.
+                    logits = [math.log(max(p, 1e-12)) for p in probs]
+                else:
+                    raise ValidationBlock(
+                        f"{where}: needs `logits` (preferred) or `probs` "
+                        "— a prediction without scores cannot calibrate "
+                        "confidence",
+                    )
+                if any(not math.isfinite(v) for v in logits):
+                    raise ValidationBlock(
+                        f"{where}: logits contain a non-finite value")
+                lab = obj.get("label")
+                if isinstance(lab, bool) or not isinstance(lab, (int, float)) \
+                        or int(lab) != lab:
+                    raise ValidationBlock(
+                        f"{where}: `label` must be an integer class index, "
+                        f"got {lab!r}")
+                lab = int(lab)
+                if not 0 <= lab < len(logits):
+                    raise ValidationBlock(
+                        f"{where}: label {lab} out of range for "
+                        f"{len(logits)} classes")
+                components = obj.get("components")
+                if components is not None:
+                    if not isinstance(components, dict):
+                        raise ValidationBlock(
+                            f"{where}: `components` must be an object "
+                            f"with exactly {', '.join(_CAL_COMPONENTS)}")
+                    missing = [c for c in _CAL_COMPONENTS
+                               if c not in components]
+                    extra = sorted(set(components) - set(_CAL_COMPONENTS))
+                    if missing or extra:
+                        raise ValidationBlock(
+                            f"{where}: `components` mismatch — missing "
+                            f"{missing or '[]'}, unknown {extra or '[]'} "
+                            f"(exactly: {', '.join(_CAL_COMPONENTS)})",
+                        )
+                    try:
+                        comp = {c: float(components[c])
+                                for c in _CAL_COMPONENTS}
+                    except (TypeError, ValueError) as exc:
+                        raise ValidationBlock(
+                            f"{where}: component scores must be numbers: "
+                            f"{exc}") from None
+                    if any(not math.isfinite(v) for v in comp.values()):
+                        raise ValidationBlock(
+                            f"{where}: component scores must be finite")
+                else:
+                    comp = None
+                classes_seen.add(len(logits))
+                rec: dict[str, Any] = {
+                    "source": src.ref,
+                    "split": src.split,
+                    "relative_path": entry.relative_path,
+                    "row": lineno,
+                    "logits": logits,
+                    "label": lab,
+                }
+                if comp is not None:
+                    rec["components"] = comp
+                records.append(rec)
+    if not records:
+        raise ValidationBlock(
+            "calibration: no prediction records — expected `.jsonl` lines "
+            "or a `.json` array of objects with `logits`|`probs` + "
+            "`label` (optionally `components`)",
+            hint="generate predictions on the held-out split with the "
+                 "eval step, then register them: "
+                 "`mlforge dataset add <ID> <PATH>` — derived data uses "
+                 "{generated_from: <model>, dataset: <ID>} (12 §10.2)",
+        )
+    if len(classes_seen) > 1:
+        raise ValidationBlock(
+            f"calibration: class count differs across files "
+            f"({sorted(classes_seen)}) — one calibration pool is one "
+            "label space; split the mixed predictions into separate "
+            "datasets",
+        )
+    return {"output_schema": "calibration.v1", "records": records}
+
+
 #: The user-facing catalog — what `mlforge dataset types` prints. Every
 #: `name` MUST be a registered transform (invariant covered by tests).
 DATASET_TYPES: tuple[dict[str, str], ...] = (
@@ -799,6 +974,10 @@ DATASET_TYPES: tuple[dict[str, str], ...] = (
      "title": "Tables",
      "inputs": ".csv .tsv .jsonl .xlsx",
      "produces": "strict row records (exports, logs, spreadsheets)"},
+    {"name": "calibration",
+     "title": "Model predictions",
+     "inputs": "prediction .jsonl/.json array {logits|probs, label}",
+     "produces": "calibrator rows — temperature + conformal (C5)"},
 )
 
 #: Honest gaps — named so users see them, never faked (fail-closed).
@@ -810,9 +989,10 @@ PLANNED_DATASET_TYPES: tuple[dict[str, str], ...] = (
      "reason": "AudioSet — needs feature extraction (later build step)"},
     {"name": "generated", "title": "Generated sources",
      "reason": "the {generated_from: <model>, dataset: <id>} source form "
-               "resolves against the model registry (12 §10.2); the "
-               "calibration transform itself (C5) arrives in a later "
-               "build step"},
+               "resolves against the model registry and the `calibration` "
+               "transform consumes prediction records today (12 §10.2); "
+               "PRODUCING those predictions is the eval/infer step "
+               "(later build step)"},
 )
 
 
@@ -828,8 +1008,8 @@ _EXT_TRANSFORMS: dict[str, tuple[str, ...]] = {
     ".rst": ("text_corpus",), ".pdf": ("text_corpus",),
     ".docx": ("text_corpus",),
     ".csv": ("mot_challenge", "tabular"),
-    ".tsv": ("tabular",), ".jsonl": ("tabular",),
-    ".ndjson": ("tabular",), ".xlsx": ("tabular",),
+    ".tsv": ("tabular",), ".jsonl": ("tabular", "calibration"),
+    ".ndjson": ("tabular", "calibration"), ".xlsx": ("tabular",),
 }
 _IMG_SUGGEST = frozenset({".jpg", ".jpeg", ".png"})
 
@@ -866,6 +1046,7 @@ _REGISTRY: dict[str, Callable[[list[ResolvedSource]], dict[str, Any]]] = {
     "mot_challenge": mot_challenge,
     "reid_crops": reid_crops,
     "tabular": tabular,
+    "calibration": calibration,
 }
 
 
@@ -986,6 +1167,7 @@ __all__ = [
     "PREPARED_SCHEMA",
     "ResolvedSource",
     "cache_key",
+    "calibration",
     "coco_detection",
     "dataset_types",
     "env_fingerprint",

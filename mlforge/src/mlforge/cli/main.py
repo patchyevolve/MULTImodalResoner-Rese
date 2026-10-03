@@ -661,6 +661,17 @@ models:
   # reasoner_s:
   #   transform: text_corpus          # pdf/docx/md/txt/zip → text chunks
   #   train_sources: [books:train]
+  # Calibrator (12 §10.2) — trains on the detector's GENERATED
+  # predictions (logits/labels, `{generated_from:}`), not raw images:
+  # calibrator:
+  #   transform: calibration          # prediction .jsonl/.json rows
+  #   train_sources: [{generated_from: rf_detr_s}]
+  #   depends_on: [rf_detr_s]         # detector must be AVAILABLE first
+  # Hypothesis ranker (03 Model 4) — LambdaMART over the labeled
+  # (event, hypothesis, relevance) triples as tabular rows:
+  # hypothesis_ranker:
+  #   transform: tabular              # label + group + feature columns
+  #   train_sources: [ranker_features:train]
 """
 
 

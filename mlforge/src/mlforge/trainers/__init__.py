@@ -35,7 +35,9 @@ from mlforge.errors import PreconditionFailed, ValidationBlock
 
 #: Real trainer modules in registry order. Each module is import-safe
 #: without its framework and exposes MODEL_REGISTRY + dependency_error().
-_TRAINER_MODULES: tuple[str, ...] = ("text_lm", "reid", "rfdetr")
+_TRAINER_MODULES: tuple[str, ...] = (
+    "text_lm", "reid", "rfdetr", "calibrator", "gbdt",
+)
 
 
 def _module(name: str):

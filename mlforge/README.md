@@ -138,7 +138,7 @@ mlforge/
 │   ├── commands/             # idempotency journal                ✅
 │   ├── supervisor.py         # crash detection + spawn queue daemon  ✅
 │   ├── runtime/              # checkpoints, worker, control, trainer resolution ✅
-│   ├── trainers/             # REAL learning loops — torch byte-LM (reasoner_s) ✅
+│   ├── trainers/             # REAL learning loops — text byte-LM, OSNet re-ID, RF-DETR, calibrator, LightGBM ranker ✅
 │   ├── status/               # L1/L2/L3, watch, events --follow   ✅
 │   └── planner/              # capability feasibility solver      ✅
 └── tests/                    # specs as executable tests
@@ -164,29 +164,39 @@ mlforge/
    export/package, watch/gui); `serve` alone stays honest exit 4 (no
    build step will ever deliver it — never fake success)
 5. ✅ Supervisor daemon + run leases + idempotency journal
-6. ⚠ Training runtime — **delivered for text models (REAL torch
-   learning loop); detection (RF-DETR) not integrated.** REAL: the
-   `reasoner_s` byte-level transformer trains with genuine
-   gradients/AdamW/cosine schedule on prepared text (`text_corpus`
-   transform) — loss falls from ≈5.55 (ln 256) into the 2s on books;
-   transactional checkpoints (12 §11 write protocol / newest-valid
-   predicate / verify / components) carry REAL model + optimizer +
-   scheduler + RNG + sampler state (12 §11.4, all 15
-   REQUIRED_COMPONENTS), so `resume` — including after SIGKILL →
-   INTERRUPTED → reconcile → `lease break` → `resume` — CONTINUES the
-   same run (LR schedule and weights intact), heartbeat writer,
-   deterministic reconciliation (`reconcile_from_disk`), worker process
-   (start contract, control-channel pause/stop, checkpoint loop,
-   completion checkpoint so the published model = final weights),
-   supervisor spawn queue + daemon (`state/pending/` → detached worker,
-   12 §12.4), `train`/`resume`/`pause`/`stop` CLI semantics (gate BLOCK
-   → FAILED[FORK_ONLY], `--command-id` dedupe).
-   Fail-closed everywhere else: model with no integrated trainer (e.g.
-   `rf_detr_s` — needs a GPU runtime), missing torch, non-fp32 plan
-   (no AMP), world_size > 1 (no distributed), or an unsupported
-   semantic loss/optimizer ⇒ refusal with the concrete reason — never a
-   substitute. `ScaffoldTrainer` remains system-test harness only
-   (explicit `runtime.trainer=harness-scaffold` / `MLFORGE_HARNESS=1`).
+6. ✅ Training runtime — **REAL learning loops for every file-11 weight
+   target.** text: the `reasoner_s` byte-level transformer trains with
+   genuine gradients/AdamW/cosine schedule on prepared text
+   (`text_corpus` transform) — loss falls from ≈5.55 (ln 256) into the
+   2s on books. re-ID: `osnet_x1_0` on prepared `reid_crops`
+   (cross-entropy over string id_map, exact resume with bitwise-equal
+   weights). detection: `rf_detr_s/l/seg_s` real Lightning epochs on
+   `coco_detection` (published base weights fetched into the RF_HOME
+   model cache, never the working directory). calibration: the
+   `calibrator` fits temperature (NLL search) + conformal thresholds
+   (+ optional decomposition weights) on `calibration` prediction rows —
+   closed-form, dependency-free. ranking: `hypothesis_ranker` grows
+   LambdaMART rounds one LightGBM boost at a time on grouped `tabular`
+   rows (spec params, min_data_in_leaf floor enforced). Transactional
+   checkpoints (12 §11 write protocol / newest-valid predicate /
+   verify / components) carry REAL model + optimizer + scheduler + RNG +
+   sampler state (12 §11.4, all 15 REQUIRED_COMPONENTS), so `resume` —
+   including after SIGKILL → INTERRUPTED → reconcile → `lease break` →
+   `resume` — CONTINUES the same run (LR schedule and weights intact),
+   heartbeat writer, deterministic reconciliation
+   (`reconcile_from_disk`), worker process (start contract,
+   control-channel pause/stop, checkpoint loop, completion checkpoint so
+   the published model = final weights), supervisor spawn queue +
+   daemon (`state/pending/` → detached worker, 12 §12.4),
+   `train`/`resume`/`pause`/`stop` CLI semantics (gate BLOCK →
+   FAILED[FORK_ONLY], `--command-id` dedupe).
+   Fail-closed everywhere else: model with no integrated trainer,
+   missing framework (torch / lightgbm — honest refusal naming the pip
+   command), non-fp32 plan (no AMP), world_size > 1 (no distributed),
+   or an unsupported semantic loss/optimizer ⇒ refusal with the
+   concrete reason — never a substitute. `ScaffoldTrainer` remains
+   system-test harness only (explicit
+   `runtime.trainer=harness-scaffold` / `MLFORGE_HARNESS=1`).
 7. ✅ Status layer — read-only L1/L2 (`status [RUN] [-v]` incl. stale-
    heartbeat WARNING + FAILED disposition + stage-aware block), L3
    `hardware` (diagnostic telemetry), `watch [RUN]` (viewer only — keys
@@ -198,10 +208,10 @@ mlforge/
    config subset (`yamlmini`), machine-local paths at `$MLFORGE_HOME`
    vs portable `datasets.yaml` (12 §6.3), `ingestion.yaml` DAG
    (sources/depends_on, cycle detection), GLOBALLY-OPEN but gated
-   transform registry (`register_transform` — only registered code
-   runs, unknown ⇒ BLOCK) with code-hash identity + four-field cache
-   key (12 §6.4), built-in transforms `coco_detection` and
-   `text_corpus` (PDF/DOCX/MD/TXT/zip → extract → paragraph-chunked
+    transform registry (`register_transform` — only registered code
+    runs, unknown ⇒ BLOCK) with code-hash identity + four-field cache
+    key (12 §6.4), built-in transforms `coco_detection`,
+    `text_corpus` (PDF/DOCX/MD/TXT/zip → extract → paragraph-chunked
    text records; a source yielding nothing BLOCKs, never fabricates),
    `dataset add|list|verify` (tamper → REJECTED, `--force`
    reregister), `prepare` (resolve → cache → transform → derived
