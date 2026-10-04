@@ -13,7 +13,9 @@ import json
 import math
 import os
 import shutil
+import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from PIL import Image
@@ -25,7 +27,7 @@ from mlforge.runtime.checkpoints import REQUIRED_COMPONENTS
 from mlforge.runtime.trainer import TrainState
 from mlforge.store import ContentStore
 from mlforge.trainers import rfdetr as rfdetr_mod
-from mlforge.trainers.rfdetr import MODEL_REGISTRY, RFDETRTrainer
+from mlforge.trainers.rfdetr import MODEL_REGISTRY, OUT_DIRNAME, RFDETRTrainer
 from mlforge.trainers.rfdetr_data import materialize
 
 # ---------------------------------------------------------------------------
@@ -389,3 +391,355 @@ def test_e2e_epoch_payload_and_resume(tmp_path, home):
     res2 = t2.step(TrainState(res.global_step, res.epoch))
     assert res2.epoch == 2 and res2.done is True
     assert res2.loss is not None and math.isfinite(res2.loss)
+
+
+# -- CPU-only adapter depth: dependency probes, init branches, state, step --
+#
+# The real-epoch smoke above stays gated; everything BELOW runs on CPU by
+# swapping the RF-DETR constructor for a recording fake and stubbing
+# rfdetr's build_trainer seam, so every adapter branch (init refusals,
+# resume/fine-tune/fresh, state plumbing, step orchestration, payload)
+# is exercised without downloading or building the published model.
+
+
+def test_dependency_error_names_each_missing_layer(monkeypatch):
+    """Each probe layer (package → training extra → model classes) gets
+    its own honest install instruction."""
+    _require_rfdetr()
+    real_pkg = sys.modules["rfdetr"]
+    real_training = sys.modules["rfdetr.training"]
+    saved_cache = list(rfdetr_mod._DEP_CACHE)
+    try:
+        rfdetr_mod._DEP_CACHE.clear()
+        monkeypatch.setitem(sys.modules, "rfdetr", None)  # import halted
+        err = rfdetr_mod.dependency_error()
+        assert err is not None and "pip install rfdetr" in err
+
+        rfdetr_mod._DEP_CACHE.clear()
+        monkeypatch.setitem(sys.modules, "rfdetr", real_pkg)
+        monkeypatch.setitem(sys.modules, "rfdetr.training", None)
+        err = rfdetr_mod.dependency_error()
+        assert err is not None and "rfdetr[train]" in err
+
+        rfdetr_mod._DEP_CACHE.clear()
+        monkeypatch.setitem(sys.modules, "rfdetr.training", real_training)
+        monkeypatch.setattr(
+            rfdetr_mod, "_MODEL_CLASSES",
+            {**rfdetr_mod._MODEL_CLASSES, "zz_ghost": "GhostClass"},
+        )
+        err = rfdetr_mod.dependency_error()
+        assert err is not None and "lacks GhostClass" in err
+    finally:
+        rfdetr_mod._DEP_CACHE[:] = saved_cache
+
+
+def test_pulse_callback_forwards_epoch_boundaries():
+    pytest.importorskip("pytorch_lightning")
+    seen: list[str] = []
+    pulse = rfdetr_mod._pulse_callback(seen.append)
+    pulse.on_train_batch_end()
+    pulse.on_train_epoch_start()
+    pulse.on_validation_batch_end()
+    pulse.on_validation_epoch_start()
+    assert seen == [
+        "train_batch_end", "train_epoch_start",
+        "validation_batch_end", "validation_epoch_start",
+    ]
+
+
+def _fake_rf_detr(monkeypatch, tmp_path, *, fit: str = "archive"):
+    """Install a recording RFDETRSmall + a stub Lightning build_trainer.
+    `fit` selects what the fake epoch writes: an epoch archive, only
+    last.ckpt, or nothing at all (the missing-checkpoint refusal)."""
+    import rfdetr as rfdetr_pkg
+    import rfdetr.assets.model_weights as mw
+    import rfdetr.training as rtrain
+
+    monkeypatch.setattr(mw, "get_model_cache_dir",
+                        lambda: str(tmp_path / "model-cache"))
+    monkeypatch.setattr(mw, "download_pretrain_weights", lambda target: None)
+    made: list[SimpleNamespace] = []
+
+    def fake_build(tc, mc, **kw):
+        tr = SimpleNamespace(
+            callbacks=[],
+            callback_metrics={
+                "train/loss": 0.5,
+                "val/loss": 0.25,
+                "val/mAR": 0.75,
+                "val/mAP": "not-a-number",
+                "train/lr": float("nan"),
+                "epoch": 3,  # wrong prefix: must be filtered out
+            },
+        )
+        made.append(tr)
+        return tr
+
+    monkeypatch.setattr(rtrain, "build_trainer", fake_build)
+
+    class _FakeRFDETR:
+        def __init__(self, **kw) -> None:
+            self.init_kwargs = kw
+            self.fit_configs: list[dict] = []
+
+        def train(self, **cfg) -> None:
+            self.fit_configs.append(cfg)
+            rtrain.build_trainer("tc", "mc")  # enter the installed seam
+            out = Path(cfg["output_dir"])
+            target = int(cfg["epochs"])
+            if fit == "archive":
+                (out / f"checkpoint_{target - 1}.ckpt").write_bytes(b"ckpt")
+            elif fit == "last":
+                (out / "last.ckpt").write_bytes(b"ckpt-last")
+
+    monkeypatch.setattr(rfdetr_pkg, "RFDETRSmall", _FakeRFDETR)
+    return made
+
+
+def test_fresh_init_scrubs_stale_and_honors_prime_batch(tmp_path, home,
+                                                        monkeypatch):
+    """Fresh construction: global_batch that no micro/accum split divides
+    (line: fall back to micro=global_batch), a dict precision_policy,
+    stale scratch files scrubbed, and a no-kwarg (scratch) model init."""
+    _require_rfdetr()
+    _fake_rf_detr(monkeypatch, tmp_path)
+    out_dir = tmp_path / "run" / OUT_DIRNAME
+    out_dir.mkdir(parents=True)
+    (out_dir / "stale.ckpt").write_bytes(b"stale")
+    (out_dir / "stale.pth").write_bytes(b"stale")
+    (out_dir / "_mlforge_resume.json").write_text("{}", encoding="utf-8")
+    tree = _coco_tree(tmp_path / "tree")
+    _prepared(tmp_path, tree)
+
+    t = build(tmp_path, run_dir=tmp_path / "run", datasets=("coco:v1",),
+              semantic=sem(global_batch=5,
+                           precision_policy={"preferred": "fp32",
+                                             "fallback": "bf16"}))
+    assert (t.micro, t.accum) == (5, 1)  # prime batch: no split works
+    assert t.amp is None                 # fp32 → no autocast
+    assert not (out_dir / "stale.ckpt").exists()
+    assert not (out_dir / "stale.pth").exists()
+    assert t.checkpointable is False
+    assert t._read_state() == {"path": None, "completed": 0}
+    # fresh ⇒ scratch model, no init weights, and the prefetch ran
+    # against the recording fake (no real download, no real build)
+    assert t._model.init_kwargs == {}
+
+
+def test_plan_world_one_flows_through(tmp_path, home, monkeypatch):
+    """A single-process plan is accepted (the world≠1 refusal is covered
+    above); micro×accum×world must still reproduce global_batch."""
+    _require_rfdetr()
+    _fake_rf_detr(monkeypatch, tmp_path)
+    tree = _coco_tree(tmp_path / "tree")
+    _prepared(tmp_path, tree)
+    t = build(tmp_path, run_dir=tmp_path / "run", datasets=("coco:v1",),
+              plan=_Plan(micro_batch=1, grad_accum=4, world_size=1))
+    assert (t.micro, t.accum) == (1, 4)
+
+
+def test_finetune_init_weights_path(tmp_path, home, monkeypatch):
+    """Fine-tune: the parent's committed weights are written to scratch,
+    loaded with trust=True, and the state starts clean."""
+    _require_rfdetr()
+    _fake_rf_detr(monkeypatch, tmp_path)
+    tree = _coco_tree(tmp_path / "tree")
+    _prepared(tmp_path, tree)
+    t = build(tmp_path, run_dir=tmp_path / "run", datasets=("coco:v1",),
+              init_weights=b"parent-weights")
+    init_path = t.out_dir / "init_weights.ckpt"
+    assert init_path.read_bytes() == b"parent-weights"
+    assert t._model.init_kwargs["pretrain_weights"] == str(init_path)
+    assert t._model.init_kwargs["trust_checkpoint"] is True
+    assert t._read_state() == {"path": None, "completed": 0}
+
+
+def test_payload_mutually_exclusive_incomplete_and_foreign(tmp_path, home,
+                                                           monkeypatch):
+    """Resume refusals fire in order: both sources at once, an incomplete
+    payload, and a corrupt dataloader_state (fail-closed, 12 §11.4)."""
+    _require_rfdetr()
+    _fake_rf_detr(monkeypatch, tmp_path)
+    tree = _coco_tree(tmp_path / "tree")
+    _prepared(tmp_path, tree)
+    base = {"runtime": {}, "datasets": ("coco:v1",)}
+
+    with pytest.raises(ValidationBlock, match="mutually exclusive"):
+        build(tmp_path, run_dir=tmp_path / "r1", init_weights=b"w",
+              payloads={c: b"x" for c in REQUIRED_COMPONENTS}, **base)
+    with pytest.raises(ValidationBlock, match="payload incomplete"):
+        build(tmp_path, run_dir=tmp_path / "r2",
+              payloads={"model": b"x"}, **base)
+    corrupt = {c: b"x" for c in REQUIRED_COMPONENTS}
+    corrupt["dataloader_state"] = b"{not-json"
+    with pytest.raises(ValidationBlock, match="not produced by trainer"):
+        build(tmp_path, run_dir=tmp_path / "r3", payloads=corrupt, **base)
+
+
+def test_resume_then_step_then_payload(tmp_path, home, monkeypatch):
+    """The full CPU seam: fresh step → payload extraction → resume from
+    that payload → second step (frame resume path, state rewrite, metric
+    extraction through the stubbed Lightning trainer)."""
+    _require_rfdetr()
+    made = _fake_rf_detr(monkeypatch, tmp_path, fit="archive")
+    progress: list[str] = []
+    tree = _coco_tree(tmp_path / "tree")
+    _prepared(tmp_path, tree)
+    cfg = {"epochs": 2, "global_batch": 2}
+
+    t1 = build(tmp_path, run_dir=tmp_path / "run1", datasets=("coco:v1",),
+               semantic=sem(**cfg), on_progress=progress.append)
+    res1 = t1.step(TrainState(0, 0))
+    assert res1.epoch == 1 and res1.done is False
+    assert res1.loss == 0.5 and res1.metrics["val/loss"] == 0.25
+    assert "epoch" not in res1.metrics  # prefix filter dropped it
+    assert t1.checkpointable is True
+    fit_cfg = t1._model.fit_configs[0]
+    assert fit_cfg["epochs"] == 1 and fit_cfg["device"] == "cpu"
+    assert len(made[0].callbacks) == 1  # the heartbeat pulse got installed
+    made[0].callbacks[0].on_train_epoch_start()
+    assert progress == ["train_epoch_start"]
+
+    payload = t1.checkpoint_payload(TrainState(res1.global_step, res1.epoch))
+    assert set(payload) == set(REQUIRED_COMPONENTS)
+    assert payload["model"] == b"ckpt"
+
+    t2 = build(tmp_path, run_dir=tmp_path / "run2", datasets=("coco:v1",),
+               payloads=payload, start_step=res1.global_step,
+               start_epoch=res1.epoch, semantic=sem(**cfg))
+    assert t2.checkpointable is True
+    assert t2._model.init_kwargs == {
+        "pretrain_weights": None, "trust_checkpoint": False,
+    }
+    # corrupt resume state is an honest refusal, never a silent restart
+    t2._state_path.write_text("{oops", encoding="utf-8")
+    with pytest.raises(ValidationBlock, match="resume state unreadable"):
+        t2._read_state()
+    t2._write_state({"path": str((t2.out_dir / "last.ckpt").resolve()),
+                     "completed": res1.epoch})
+    res2 = t2.step(TrainState(res1.global_step, res1.epoch))
+    assert res2.epoch == 2 and res2.done is True
+    assert t2._model.fit_configs[0]["resume"].endswith("last.ckpt")
+
+    # counters already done: cheap early-out before any framework call
+    done = t2.step(TrainState(res2.global_step, t2.epochs))
+    assert done.done is True and done.loss is None
+    # tampered state pointing nowhere is refused (12 §11.2)
+    t2._write_state({"path": str(tmp_path / "ghost.ckpt"), "completed": 1})
+    with pytest.raises(ValidationBlock, match="resume checkpoint missing"):
+        t2.step(TrainState(res2.global_step, 1))
+
+
+def test_step_checkpoint_finding_variants(tmp_path, home, monkeypatch):
+    """_newest_ckpt: prefer a fresh epoch archive, else a rewritten
+    last.ckpt (mtime moved), else refuse to chain an unprovable state."""
+    _require_rfdetr()
+    _fake_rf_detr(monkeypatch, tmp_path, fit="last")
+    tree = _coco_tree(tmp_path / "tree")
+    _prepared(tmp_path, tree)
+    t = build(tmp_path, run_dir=tmp_path / "run", datasets=("coco:v1",),
+              semantic=sem(epochs=1))
+    res = t.step(TrainState(0, 0))
+    assert res.epoch == 1
+    assert (t.out_dir / "last.ckpt").is_file()  # found via the mtime path
+
+    # now an epoch that writes NOTHING at all → refuse to chain
+    _fake_rf_detr(monkeypatch, tmp_path, fit="nothing")
+    t2 = build(tmp_path, run_dir=tmp_path / "run2", datasets=("coco:v1",),
+               semantic=sem(epochs=1))
+    with pytest.raises(PreconditionFailed, match="wrote no resumable"):
+        t2.step(TrainState(0, 0))
+
+
+def test_step_state_refusals_without_framework(tmp_path):
+    """Stubs: the done-early return, the tampered-resume refusal, the
+    no-checkpoint payload refusal, and the _extract_metrics(None) path —
+    all before any framework import."""
+    stub = RFDETRTrainer.__new__(RFDETRTrainer)
+    stub.out_dir = tmp_path
+    stub.epochs = 1
+    done = stub.step(TrainState(0, 1))
+    assert done.done is True and done.loss is None
+
+    stub.epochs = 99
+    stub._write_state({"path": str(tmp_path / "ghost.ckpt"), "completed": 0})
+    with pytest.raises(ValidationBlock, match="resume checkpoint missing"):
+        stub.step(TrainState(0, 0))
+
+    stub._state_path.unlink(missing_ok=True)
+    with pytest.raises(ValidationBlock, match="no framework checkpoint"):
+        stub.checkpoint_payload(TrainState(0, 0))
+
+    assert stub._extract_metrics(None) == ({}, None)
+    assert stub._extract_metrics(
+        SimpleNamespace(callback_metrics=None)) == ({}, None)
+
+
+def test_train_config_edges(tmp_path):
+    """Pure config dict: absent resume/device keys take the None branches
+    (the truthy branches run inside test_resume_then_step_then_payload)."""
+    stub = RFDETRTrainer.__new__(RFDETRTrainer)
+    stub.data = SimpleNamespace(dir=tmp_path / "data")
+    stub.out_dir = tmp_path / "out"
+    stub.micro, stub.accum = 4, 2
+    stub.learning_rate, stub.optimizer_name = 1e-4, "adamw"
+    stub.scheduler_name, stub.seed = "cosine", 42
+    stub.amp, stub.num_workers = None, 0
+    stub.eval_interval, stub.checkpoint_interval = 1, 10
+    stub.early_stopping, stub.device = False, None
+    cfg = stub._train_config(7, None)
+    assert cfg["epochs"] == 7
+    assert cfg["batch_size"] == 4 and cfg["grad_accum_steps"] == 2
+    assert "resume" not in cfg and "device" not in cfg
+
+
+def test_prefetch_refusal_edges(tmp_path, monkeypatch):
+    """The published-base prefetch's honest refusals: missing downloader,
+    variant without config/default (scratch is the point), a default with
+    a directory part (no cache rewrite), and a failed fetch."""
+    _require_rfdetr()
+    import rfdetr.assets.model_weights as mw
+    import rfdetr.config as rconfig
+
+    stub = RFDETRTrainer.__new__(RFDETRTrainer)
+    calls: list[str] = []
+    monkeypatch.setattr(mw, "download_pretrain_weights", calls.append)
+    real_weights_mod = sys.modules["rfdetr.assets.model_weights"]
+
+    monkeypatch.setitem(sys.modules, "rfdetr.assets.model_weights", None)
+    cls = type("RFDETRSmall", (), {})
+    with pytest.raises(PreconditionFailed, match="downloader is missing"):
+        stub._prefetch_published_base(cls)
+    monkeypatch.setitem(sys.modules, "rfdetr.assets.model_weights",
+                        real_weights_mod)
+
+    # no rfdetr.<Name>Config → return (a variant without a published base)
+    never = type("MlforgeNeverConfiged", (), {})
+    assert stub._prefetch_published_base(never) is None
+    assert calls == []
+
+    # config exists but its pretrain_weights default is falsy → return
+    field = type("Field", (), {"default": None})()
+    nodef = type("MlforgeNoDefaultConfig", (), {
+        "model_fields": {"pretrain_weights": field}})()
+    monkeypatch.setattr(rconfig, "MlforgeNoDefaultConfig", nodef,
+                        raising=False)
+    assert stub._prefetch_published_base(
+        type("MlforgeNoDefault", (), {})) is None
+    assert calls == []
+
+    # default with a directory part → used verbatim, no cache rewrite
+    field = type("Field", (), {"default": "sub/dir.pth"})()
+    withdir = type("MlforgeWithDirConfig", (), {
+        "model_fields": {"pretrain_weights": field}})()
+    monkeypatch.setattr(rconfig, "MlforgeWithDirConfig", withdir, raising=False)
+    stub._prefetch_published_base(type("MlforgeWithDir", (), {}))
+    assert calls == ["sub/dir.pth"]
+
+    # a failed fetch is a PreconditionFailed, never a silent random init
+    def _boom(target):
+        raise RuntimeError("network down")
+
+    monkeypatch.setattr(mw, "download_pretrain_weights", _boom)
+    with pytest.raises(PreconditionFailed, match="could not fetch"):
+        stub._prefetch_published_base(type("MlforgeWithDir", (), {}))
