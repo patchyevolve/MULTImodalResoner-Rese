@@ -1,9 +1,11 @@
 """Direct unit tests for ops/bundle.py — the packaging module.
 
 Workflow tests exercise the happy path of `mlforge package`; these target
-the refusal paths the mutation baseline scored weakest (bundle kill rate
-37.6%): write immutability, load_bundle's NotFound/corrupt/non-object
-triple, and list_bundles' absent-dir/skip-partial/corrupt/filter edges.
+the refusal paths the mutation baseline scored weakest for this file
+(bundle kill rate 50.6 % of tested mutants, 79/156 — an earlier draft
+misattributed exporting's 37.6 % here): write immutability,
+load_bundle's NotFound/corrupt/non-object triple, and list_bundles'
+absent-dir/skip-partial/corrupt/filter edges.
 """
 
 from __future__ import annotations

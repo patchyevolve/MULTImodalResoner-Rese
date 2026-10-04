@@ -19,10 +19,11 @@ are reproducible with the commands given.
 
 | Claim | Status | Evidence |
 |---|---|---|
-| Full unit/integration suite passes | **VERIFIED** | `python -m pytest -q` → exit 0, 777 tests before this ledger, 787 with the golden-metric tests, 808 with the device-placement tests (805 passed + 3 skipped — 92 s), **813 with the evaluate_calibration metric tests (810 passed + 3 skipped)** |
+| Full unit/integration suite passes | **VERIFIED** | `python -m pytest -q` → exit 0, 777 tests before this ledger, 787 with the golden-metric tests, 808 with the device-placement tests (805 passed + 3 skipped — 92 s), 813 with the evaluate_calibration metric tests (810 passed + 3 skipped), **849 with the coverage phases (846 passed + 3 skipped — 121 s)** |
 | Device placement contract (`runtime.device`) | **VERIFIED** | `tests/test_device_placement.py` → 19 passed + 2 CUDA-host skips: auto/cpu/cuda resolution, fail-closed refusals (no silent downgrade), preflight `device: cuda` ⇒ GPU probe, CPU-state portable checkpoint bytes |
-| Branch coverage of `src/mlforge` | **VERIFIED** | `python -m coverage run -m pytest` → **82 %** total (11 427 stmts, 1 709 missed, 3 712 branches, 670 partial) |
-| Coverage hot spots (honest low end) | **VERIFIED** | `ops/bundle.py` 49 %, `trainers/rfdetr.py` 48 %, `trainers/reid.py` 75 %, `engines/calibrator.py` 76 %; `machine.py` 100 %, `workflow.py` 90 % |
+| Branch coverage of `src/mlforge` | **VERIFIED** | `python -m coverage run -m pytest` → **85 %** total (11 528 stmts, 1 513 missed, 3 736 branches, 633 partial) |
+| Coverage hot spots (honest low end) | **VERIFIED** | `trainers/reid.py` 75 %, `ops/engines/calibrator.py` 78 %; closed since the original audit: `ops/bundle.py` 49 % → **100 %**, `trainers/rfdetr.py` 48 % → **100 %**, `trainers/rfdetr_data.py` → **98 %** (3 unreachable lines, documented); `machine.py` 100 %, `workflow.py` 91 % |
+| Lint contract | **VERIFIED** | `ruff check src/ tests/` → **0 findings** under the frozen 413-code policy in `mlforge/pyproject.toml` (codes pinned individually, `ruff==0.16.4` in dev extras; intentional blind catches carry line-level `# noqa` with reasons) |
 
 Reproduce:
 
@@ -55,29 +56,85 @@ Reproduce: `python -m pytest tests/test_metric_golden.py -q` (13 passed).
 
 Per-file mutation runs with a per-target test selection (fastest set of
 tests that covers the file). "no tests" = mutants on lines the selected
-tests never execute (not counted in the tested kill rate).
+tests never execute (not counted in the tested kill rate). Kill % is
+computed as `killed / (mutants − no tests)`; machine.py also reports
+timeouts counted as detected (the suite caught the mutant by hanging).
+
+### Baseline (before the lint + coverage phases)
 
 | Target | Mutants | Killed | Timeout | No tests | Survived | Kill % (of tested) |
 |---|---|---|---|---|---|---|
 | `machine.py` | 117 | 56 | 5 | 0 | 56 | 47.9 % strict, **52.1 % incl. timeouts** |
 | `leases/run_lease.py` | 297 | 175 | 0 | 0 | 122 | 58.9 % |
-| `runtime/checkpoints.py` | 432 | 280 | 0 | 10 | 142 | 65.7 % |
-| `ops/bundle.py` | 204 | 79 | 0 | 48 | 77 | 56.0 % |
+| `runtime/checkpoints.py` | 432 | 280 | 0 | 10 | 142 | 66.4 % |
+| `ops/bundle.py` | 204 | 79 | 0 | 48 | 77 | 50.6 % |
 | `ops/exporting.py` | 574 | 207 | 0 | 23 | 344 | 37.6 % |
 
-`machine.py` used the expanded selection
-(`test_machine + test_states + test_workflow + test_journey_reliability`);
-the earlier narrow selection (`test_machine + test_states`) gave 55 killed /
-62 survived — the extra tests converted 6 survivors into detections
-(1 kill + 5 `StateMachine.fire` timeouts, counted as detected because the
-suite caught the mutant by hanging). Survivor triage for `machine.py`:
-29 × `_guard_resume`, 9 × `_guard_intentional`, 8 ×
-`StateMachine.legal_actions`, 7 × `_guard_no_checkpoint`, 3 ×
-`StateMachine.__init__` — mostly guard predicates; no claim is made that
-all are real gaps (equivalent mutants exist).
+(Two cells in the original baseline table mixed percentages from earlier
+intermediate runs of the same targets — checkpoints and bundle are
+recomputed here from the counts shown, with the formula above. An earlier
+claim that bundle was "the weakest module at 37.6 %" misattributed
+exporting's number: baseline bundle was 50.6 %; the weakest baseline
+target was `exporting.py` at 37.6 %.)
 
-**Aggregate: 1 624 mutants — 797 killed, 5 timeout (detected), 81 no
-tests, 741 survived → 52.0 % detected of tested (802/1 543).**
+**Aggregate baseline: 1 624 mutants — 797 killed, 5 timeout (detected),
+81 no tests, 741 survived → 51.7 % strict, 52.0 % incl. timeouts of
+tested (802/1 543).**
+
+### Re-run after the lint + coverage phases (Phase C, 2026-10-04)
+
+Same five targets, same selections, bundle selection extended with the new
+`tests/test_bundle.py`; verdicts regenerated from scratch (`.meta` and
+`mutmut-stats.json` removed per target).
+
+| Target | Mutants | Killed | Timeout | No tests | Survived | Kill % (of tested) | Δ vs baseline |
+|---|---|---|---|---|---|---|---|
+| `machine.py` | 117 | 55 | 5 | 0 | 57 | 47.0 % strict, 51.3 % incl. | −0.9 pp (one flipped equivalent, below) |
+| `leases/run_lease.py` | 297 | 175 | 0 | 0 | 122 | 58.9 % | ±0 |
+| `runtime/checkpoints.py` | 432 | 280 | 0 | 10 | 142 | 66.4 % | ±0 |
+| `ops/bundle.py` | 204 | 124 | 0 | 0 | 80 | **60.8 %** | **+10.2 pp** |
+| `ops/exporting.py` | 571 | 205 | 0 | 23 | 343 | 37.4 % | −0.2 pp (population change, below) |
+
+**Aggregate re-run: 1 621 mutants — 839 killed, 5 timeout, 33 no tests,
+744 survived → 52.8 % strict, 53.1 % incl. timeouts of tested
+(844/1 588). The ≥ 52.0 % no-regression bar PASSES (+1.17 pp).**
+
+Delta explanations (both verified, neither is a lost test):
+
+* `exporting.py` 574 → 571 mutants: the lint autofix (UP012) dropped one
+  `encode("utf-8")` → `encode()`, removing that literal's 3 string
+  mutants (2 killed + 1 survived in baseline) — pure population change.
+* `machine.py` populations are byte-identical across runs (117 mutants,
+  per-function counts unchanged; the only edit to the file is a `# noqa`
+  comment). The one flipped verdict is `_guard_intentional__mutmut_13`,
+  which wraps the literal `"pause/stop/crash must be explicitly initiated"`
+  — no test references that text, so the mutation is undetectable by the
+  suite and the baseline kill was a transient failure; the re-run's
+  "survived" is the accurate verdict. All 5 timeouts are the same 5
+  mutants in both runs.
+
+`bundle.py` survivor triage (80 survivors; full per-mutant diffs in
+`/tmp/opencode/mutation_evidence/bundle_survivor_diffs.txt`, regenerated
+from source through mutmut's own mutation enumeration, id-verified 1:1
+against the run's `.meta`): clusters `_build_bundle` 56, `_write_bundle`
+12, `_load_bundle` 6, `_list_bundles` 4, `_component_integrity` 2. The
+dominant gap is structural: **no test parses what `build_bundle` writes**
+(the write test asserts only that `bundle.json` exists; load/list tests
+hand-seed fixtures), so every write-side manifest-key mutation survives —
+one build→load round-trip test asserting manifest contents is the
+highest-yield follow-up. The other classes seen by inspection of all 80:
+codec/platform equivalents (`"utf-8"`→`"UTF-8"`, `encoding=None`,
+`continue`→`break` on single-corrupt-entry layouts, `.get(None)` where the
+fixture lacks the key), formatting-only `json.dumps` indent/sort
+mutations, and hash-equality survivors. No claim is made that the
+remainder are all real gaps.
+
+`machine.py` baseline triage (unchanged): 29 × `_guard_resume`, 9 ×
+`_guard_intentional`, 8 × `StateMachine.legal_actions`, 7 ×
+`_guard_no_checkpoint`, 3 × `StateMachine.__init__` — mostly guard
+predicates; the expanded selection (`test_machine + test_states +
+test_workflow + test_journey_reliability`) converted 6 survivors of the
+earlier narrow selection into detections.
 
 Methodology notes (tooling gotchas that materially affect the numbers):
 
@@ -86,14 +143,17 @@ Methodology notes (tooling gotchas that materially affect the numbers):
   previous target's stats and marks **every** mutant "no tests". The run
   script deletes `mutants/mutmut-stats.json` per target to force a full
   recollection (verdicts live in `.meta` and survive).
-* Survivors are triaged by function (see the `machine.py` clusters above);
-  the expanded selection was used precisely to separate equivalent
-  mutants from test gaps.
+* Survivors are triaged by function (see the clusters above); the
+  expanded selection was used precisely to separate equivalent mutants
+  from test gaps.
 * Some survivors are equivalent mutants (mutation changes no observable
   behaviour); no claim is made that the survivor list is all real gaps.
 
-Reproduce: `/tmp/opencode/run_mutation.sh <target>` (config template and
-evidence under `/tmp/opencode/mutation_evidence/`).
+Reproduce: `/tmp/opencode/run_mutation.sh` (all five targets, ~10 min) or
+`/tmp/opencode/run_mutation.sh <tag> <src> <tests…>` for one target;
+evidence and the baseline-vs-re-run comparison under
+`/tmp/opencode/mutation_evidence/` (baseline copy in
+`/tmp/opencode/mutation_evidence_baseline/`).
 
 ## 4. Live end-to-end runs (real engines, `MLFORGE_HARNESS` absent)
 
