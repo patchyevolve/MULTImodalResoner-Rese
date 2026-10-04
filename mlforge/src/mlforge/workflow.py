@@ -1809,7 +1809,7 @@ class WorkflowAPI:
         weights = load_weights(self.root, entry)
         protocol = build_protocol(
             dict(protocol_overrides) if protocol_overrides else None,
-            metric_names=engine.metric_names(),
+            metric_names=engine.metric_names(weights=weights),
         )
         metrics = engine.compute_metrics(
             entry=entry,

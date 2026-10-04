@@ -13,10 +13,12 @@ export functions — the module is import-safe everywhere):
                  `{"probs": [...]}`) → temperature-scaled probabilities,
                  the predicted class, and the conformal prediction sets
                  at every fitted alpha;
-  * metrics    — `ece` + `nll` + `coverage` computed with the TRAINER's
-                 own formulas (`_ece`/`_nll`) at the fitted temperature,
-                 coverage = empirical coverage of the fitted conformal
-                 thresholds on the eval rows (mean over alphas);
+  * metrics    — `ece` + `nll` + `mce` + `brier` computed with the
+                 TRAINER's own formulas (`_ece`/`_nll`/`_mce`/`_brier`)
+                 at the fitted temperature, plus per-alpha coverage and
+                 average prediction-set size for EVERY fitted conformal
+                 alpha (`coverage_alpha_05`, `avg_set_size_alpha_10`, …
+                 — 06 §5's `evaluate_calibration`, spec targets :349-353);
   * export     — a genuine ONNX graph (Div by T → Softmax) round-tripped
                  against the python implementation; FAIL blocks export.
 """
@@ -53,8 +55,48 @@ def input_types() -> frozenset[str]:
     return frozenset({"structured"})
 
 
-def metric_names() -> tuple[str, ...]:
-    return ("ece", "nll", "coverage")
+def _alpha_key(alpha: float) -> str:
+    """Metric-key fragment for a conformal alpha — the spec's literal
+    naming (`06:351-353`: alpha 0.05 → `05`, 0.10 → `10`): the digits
+    after the decimal point, zero-padded to 2 (`0.20` → `20`, `0.50` →
+    `50`), never the raw concatenation `005`."""
+    return f"{float(alpha):.2f}".removeprefix("0.").replace(".", "")
+
+
+def _alpha_keys(alphas: Sequence[str]) -> list[str]:
+    """Key per fitted alpha label (same order), fail-closed on any key
+    collision — two alphas that round to the same 0.01 granularity can
+    never share one metric silently."""
+    keys: list[str] = []
+    for label in alphas:
+        key = _alpha_key(float(label))
+        if key in keys:
+            raise ValidationBlock(
+                f"conformal alpha {label!r} collides with another fitted "
+                f"alpha at metric-key precision ({key})",
+                hint="metric keys use 2 decimals (spec's alpha_05/alpha_10) "
+                     "— fit alphas distinct at 0.01 granularity")
+        keys.append(key)
+    return keys
+
+
+def metric_names(weights: bytes | None = None) -> tuple[str, ...]:
+    """Protocol `metric_definitions` for THIS model (12 §15.4): base
+    calibration quality + one coverage / average-set-size pair per
+    FITTED conformal alpha (06 §5 evaluate_calibration, targets
+    06:349-353). Without weights the spec defaults [0.05, 0.10] are
+    assumed; a custom `semantic.alphas` model gets ITS OWN keys
+    (`coverage_alpha_20`, …) so its evaluations stay honest instead of
+    being forced into metrics its thresholds cannot answer."""
+    state = _state(weights, {}) if weights is not None else None
+    labels = (["0.05", "0.10"] if state is None
+              else [str(label) for label, _ in _alphas(state)])
+    keys = _alpha_keys(labels)
+    return (
+        ("ece", "nll", "mce", "brier")
+        + tuple(f"coverage_alpha_{k}" for k in keys)
+        + tuple(f"avg_set_size_alpha_{k}" for k in keys)
+    )
 
 
 def _state(weights: bytes, entry: Mapping[str, Any]) -> dict[str, Any]:
@@ -294,16 +336,24 @@ def compute_metrics(
     protocol: Mapping[str, Any],
     semantic: Mapping[str, Any] | None = None,
 ) -> dict[str, float]:
-    """Real ECE / NLL / coverage over prepared `calibration` records —
-    the trainer's own formulas at the fitted temperature (13 §6.7)."""
-    from mlforge.trainers.calibrator import _ece, _nll
+    """Real ECE / NLL / MCE / Brier + per-alpha coverage and average
+    prediction-set size over prepared `calibration` records — the
+    trainer's own formulas at the fitted temperature (13 §6.7,
+    06:317-353). Returns EXACTLY `metric_names(weights)` (12 §15.4)."""
+    from mlforge.trainers.calibrator import (
+        _brier,
+        _ece,
+        _mce,
+        _nll,
+        _probs_at,
+    )
 
     transform = dataset.get("transform")
     if transform and str(transform) != "calibration":
         raise ValidationBlock(
             f"dataset {dataset.get('ref')} was prepared with transform "
-            f"{transform!r} — the calibrator measures ECE/NLL over "
-            "`calibration` prediction rows (logits + label)",
+            f"{transform!r} — the calibrator measures calibration quality "
+            "over `calibration` prediction rows (logits + label)",
             hint="mlforge prepare <MODEL> with the calibration "
                  "transform for the eval split (12 §7)",
         )
@@ -327,25 +377,35 @@ def compute_metrics(
                 f"(first N rows), got {subset!r}")
         rows = rows[:subset]
 
-    ece = _ece(rows, t)
-    nll = _nll(rows, t)
-    # empirical coverage of each fitted conformal threshold at T
-    from mlforge.trainers.calibrator import _probs_at
-
     probs = _probs_at([r["logits"] for r in rows], t)
-    alphas = _alphas(state)
-    coverages: list[float] = []
-    for _label, threshold in alphas:
+    alphas = _alphas(state)  # (label, threshold), sorted by alpha
+    keys = _alpha_keys([label for label, _ in alphas])
+    out: dict[str, float] = {
+        "ece": round(_ece(rows, t), 6),
+        "nll": round(_nll(rows, t), 6),
+        "mce": round(_mce(rows, t), 6),
+        "brier": round(_brier(rows, t), 6),
+    }
+    for (_label, threshold), key in zip(alphas, keys):
+        # empirical coverage of the fitted threshold at T: the TRUE
+        # class must fall inside the prediction set (06:351-352)
         in_set = sum(1 for i, r in enumerate(rows)
                      if 1.0 - probs[i][r["label"]] <= threshold)
-        coverages.append(in_set / len(rows))
-    coverage = (round(sum(coverages) / len(coverages), 6)
-                if coverages else 1.0)
-    return {
-        "ece": round(ece, 6),
-        "nll": round(nll, 6),
-        "coverage": coverage,
-    }
+        out[f"coverage_alpha_{key}"] = round(in_set / len(rows), 6)
+    for (_label, threshold), key in zip(alphas, keys):
+        # average prediction-set size at this alpha (06:353, target
+        # 1-3 at alpha=0.05): every class whose 1 - p clears the
+        # threshold is in the set; empty sets count 0, honestly.
+        # Emitted coverage-first, then set-size, so the key ORDER
+        # equals `metric_names(weights)` exactly (12 §15.4).
+        sizes = [
+            sum(1 for c in range(len(probs[i]))
+                if 1.0 - probs[i][c] <= threshold)
+            for i in range(len(rows))
+        ]
+        out[f"avg_set_size_alpha_{key}"] = round(
+            sum(sizes) / len(sizes), 6)
+    return out
 
 
 # -- export: logits → ONNX (Div by T → Softmax) ------------------------------

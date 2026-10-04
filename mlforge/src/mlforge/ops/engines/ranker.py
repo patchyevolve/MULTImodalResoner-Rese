@@ -62,7 +62,9 @@ def input_types() -> frozenset[str]:
     return frozenset({"structured"})
 
 
-def metric_names() -> tuple[str, ...]:
+def metric_names(weights: bytes | None = None) -> tuple[str, ...]:
+    """Fixed metric set — `weights` carries no metric information here
+    (engine contract: the calibrator derives per-model keys from it)."""
     return ("ndcg@3", "ndcg@5")
 
 

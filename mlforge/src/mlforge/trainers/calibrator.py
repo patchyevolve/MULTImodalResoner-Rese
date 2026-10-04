@@ -236,14 +236,16 @@ def _nll(rows: Sequence[Mapping[str, Any]], t: float) -> float:
     return total / len(rows)
 
 
-def _ece(rows: Sequence[Mapping[str, Any]], t: float, n_bins: int = 15) -> float:
-    """Expected Calibration Error — spec formula (13 §Model 5): equal
-    confidence bins (lo, hi], weighted |accuracy - confidence|."""
+def _bin_gaps(rows: Sequence[Mapping[str, Any]], t: float,
+              n_bins: int = 15):
+    """Per non-empty (lo, hi] confidence bin: (count, |acc - conf|).
+
+    The shared 15-bin partition behind BOTH `_ece` (weighted mean of the
+    gaps) and `_mce` (the worst gap) — one binning, two spec metrics
+    (06 §4: `compute_ece`/`compute_mce(..., n_bins=15)`)."""
     probs = _probs_at([r["logits"] for r in rows], t)
     confidences = [max(p) for p in probs]
     predictions = [max(range(len(p)), key=lambda k: p[k]) for p in probs]
-    n = len(rows)
-    ece = 0.0
     for i in range(n_bins):
         lo, hi = i / n_bins, (i + 1) / n_bins
         idx = [j for j, c in enumerate(confidences) if lo < c <= hi]
@@ -252,8 +254,36 @@ def _ece(rows: Sequence[Mapping[str, Any]], t: float, n_bins: int = 15) -> float
         conf = sum(confidences[j] for j in idx) / len(idx)
         acc = sum(1 for j in idx
                   if predictions[j] == rows[j]["label"]) / len(idx)
-        ece += (len(idx) / n) * abs(acc - conf)
-    return ece
+        yield len(idx), abs(acc - conf)
+
+
+def _ece(rows: Sequence[Mapping[str, Any]], t: float, n_bins: int = 15) -> float:
+    """Expected Calibration Error — spec formula (13 §Model 5, 06:348):
+    equal confidence bins (lo, hi], weighted |accuracy - confidence|."""
+    n = len(rows)
+    return sum((cnt / n) * gap for cnt, gap in _bin_gaps(rows, t, n_bins))
+
+
+def _mce(rows: Sequence[Mapping[str, Any]], t: float, n_bins: int = 15) -> float:
+    """Maximum Calibration Error — spec (06:317 formula, 06:349 target
+    < 0.10): the WORST bin's |accuracy - confidence| under the same
+    15-bin scheme as `_ece` (`compute_mce(confidences, labels, n_bins)`)."""
+    gaps = [gap for _cnt, gap in _bin_gaps(rows, t, n_bins)]
+    return max(gaps) if gaps else 0.0
+
+
+def _brier(rows: Sequence[Mapping[str, Any]], t: float) -> float:
+    """Brier score — spec (06:320 formula, 06:350 target < 0.15):
+    mean over rows of sum over classes of (p_c - 1[c == label])^2 at
+    the fitted temperature (the multiclass form; the spec pseudo-code
+    passes confidences only, the harness has the full vector)."""
+    probs = _probs_at([r["logits"] for r in rows], t)
+    total = 0.0
+    for p, rec in zip(probs, rows):
+        y = rec["label"]
+        total += sum((pk - (1.0 if k == y else 0.0)) ** 2
+                     for k, pk in enumerate(p))
+    return total / len(rows)
 
 
 def _fit_temperature(rows: Sequence[Mapping[str, Any]]) -> float:

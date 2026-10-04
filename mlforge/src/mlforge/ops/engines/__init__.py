@@ -27,7 +27,9 @@ Engine module contract (each module in `_ENGINE_MODULES` exposes):
     MODEL_NAMES       frozenset[str]
     dependency_error() -> str | None
     input_types() -> frozenset[str]        # contract input types it runs
-    metric_names() -> tuple[str, ...]      # protocol metric_definitions
+    metric_names(weights=None) -> tuple[str, ...]  # protocol metric_definitions
+                     # (weights: per-model keys — the calibrator derives its
+                     #  fitted-alpha set from the state; others ignore it)
     contract(entry, fmt, *, semantic, precision) -> dict  # model_spec doc
     supports_format(fmt) -> str | None     # None = convertible here
     execute(*, entry, contract_doc, checked, weights) -> dict  # result

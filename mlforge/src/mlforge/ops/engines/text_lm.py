@@ -100,10 +100,11 @@ def input_types() -> frozenset[str]:
     return frozenset({"text"})
 
 
-def metric_names() -> tuple[str, ...]:
+def metric_names(weights: bytes | None = None) -> tuple[str, ...]:
     """The trainer's own quality metric: `ppl` from byte cross-entropy
     (trainers/text_lm.py step(); 06_benchmarking_plan.md defines no
-    text metric set to override it)."""
+    text metric set to override it). `weights` is unused here (engine
+    contract — the calibrator derives per-model keys from it)."""
     return ("perplexity",)
 
 

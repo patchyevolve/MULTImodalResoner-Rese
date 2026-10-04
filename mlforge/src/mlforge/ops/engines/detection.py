@@ -146,8 +146,10 @@ def input_types() -> frozenset[str]:
     return frozenset({"image"})
 
 
-def metric_names() -> tuple[str, ...]:
-    """COCO bbox metrics (06 §4: mAP/AP50 from COCOeval.stats[0:2])."""
+def metric_names(weights: bytes | None = None) -> tuple[str, ...]:
+    """COCO bbox metrics (06 §4: mAP/AP50 from COCOeval.stats[0:2]).
+    `weights` is unused here (engine contract — the calibrator derives
+    per-model keys from it)."""
     return ("mAP", "AP50")
 
 

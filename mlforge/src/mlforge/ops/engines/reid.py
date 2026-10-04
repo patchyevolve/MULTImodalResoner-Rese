@@ -103,11 +103,13 @@ def input_types() -> frozenset[str]:
     return frozenset({"image"})
 
 
-def metric_names() -> tuple[str, ...]:
+def metric_names(weights: bytes | None = None) -> tuple[str, ...]:
     """The re-ID benchmark's metric keys — 06_benchmarking_plan.md
     §"Re-ID Accuracy" returns exactly `{"rank1", "rank5", "mAP"}` with
     targets Rank-1 > 95% / mAP > 85% (02 §5: "query + gallery → Rank-1,
-    Rank-5, mAP"; 03_training_pipeline.md: `--metrics rank1 rank5 mAP`)."""
+    Rank-5, mAP"; 03_training_pipeline.md: `--metrics rank1 rank5 mAP`).
+    `weights` is unused here (engine contract — the calibrator derives
+    per-model keys from it)."""
     return ("rank1", "rank5", "mAP")
 
 

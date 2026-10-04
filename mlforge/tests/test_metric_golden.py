@@ -31,11 +31,14 @@ from pathlib import Path
 
 import pytest
 
+from mlforge.ops.engines.calibrator import compute_metrics, metric_names
 from mlforge.ops.engines.detection import _run_cocoeval
 from mlforge.ops.engines.reid import _rank_metrics
 from mlforge.trainers.calibrator import (
+    _brier,
     _ece,
     _fit_conformal,
+    _mce,
     _nll,
     _probs_at,
     _quantile,
@@ -200,6 +203,121 @@ def test_nll_golden_temperature_actually_applies():
     # `_probs_at` output is a distribution (the NLL above depends on it)
     p = _probs_at([[2.0, 0.0]], 1.0)[0]
     assert sum(p) == pytest.approx(1.0, abs=1e-12)
+
+
+def test_mce_golden_shares_ece_binning():
+    # 06 §5 MCE < 0.10 (06:349), formula 06:317: worst-bin gap over the
+    # SAME 15 (lo, hi] bins ECE averages. Four rows from the ECE golden:
+    #   bin 13 (0.8667, 0.9333] holds r0+r1: acc 1.0,
+    #     conf 0.88079707795 -> gap |1 - conf| = 0.11920292205
+    #   bin 7  (0.4667, 0.5333] holds r2+r3: gap 0
+    #   MCE = max(0.11920292205, 0) = 0.11920292205  (= 1 - e^2/(e^2+1))
+    # ECE weights the same gaps by bin mass -> MCE >= ECE, always.
+    rows = [
+        {"logits": [2.0, 0.0], "label": 0},
+        {"logits": [0.0, 2.0], "label": 1},
+        {"logits": [0.0, 0.0], "label": 1},
+        {"logits": [0.0, 0.0], "label": 0},
+    ]
+    mce = _mce(rows, 1.0, n_bins=15)
+    ece = _ece(rows, 1.0, n_bins=15)
+    assert mce == pytest.approx(0.11920292202211769, rel=1e-9)
+    assert mce >= ece
+
+    # n_bins=2 boundary rows (from the (lo, hi] ECE test): the conf=0.5
+    # row's gap 0.5 is the worst bin; the conf=0.982 row's gap
+    # 0.0179862099620915 is not. MCE = 0.5 exactly — if the boundary
+    # row were dropped the answer would be 0.0179862099620915.
+    rows2 = [
+        {"logits": [0.0, 0.0], "label": 0},
+        {"logits": [4.0, 0.0], "label": 0},
+    ]
+    mce2 = _mce(rows2, 1.0, n_bins=2)
+    assert mce2 == pytest.approx(0.5, abs=1e-15)
+    assert mce2 >= _ece(rows2, 1.0, n_bins=2)
+
+    # no rows -> 0.0, never a max() crash
+    assert _mce([], 1.0) == 0.0
+
+
+def test_brier_golden_hand_worked_and_numpy_oracle():
+    np = pytest.importorskip("numpy")
+
+    # 06 §5 Brier < 0.15 (06:350), multiclass form 06:320:
+    #   Brier = mean_i SUM_c (p_ic - 1[y_i = c])^2   at the fitted T
+    # Same four rows at t = 1 (binary => two squared terms per row):
+    #   r0 [2, 0] label 0: (0.88079707795 - 1)^2 + 0.11920292205^2
+    #                    = 2 x 0.11920292205^2 = 0.02841867143
+    #   r1 [0, 2] label 1: symmetric, same 0.02841867143
+    #   r2 [0, 0] label 1: (0.5 - 0)^2 + (0.5 - 1)^2 = 0.5
+    #   r3 [0, 0] label 0: same 0.5
+    #   total 1.05683734286 / 4 = 0.26420933661861107
+    rows = [
+        {"logits": [2.0, 0.0], "label": 0},
+        {"logits": [0.0, 2.0], "label": 1},
+        {"logits": [0.0, 0.0], "label": 1},
+        {"logits": [0.0, 0.0], "label": 0},
+    ]
+    brier = _brier(rows, 1.0)
+    assert brier == pytest.approx(0.26420933661861107, rel=1e-9)
+
+    # external oracle: numpy one-hot form of the same expression
+    probs = np.asarray(_probs_at([r["logits"] for r in rows], 1.0))
+    onehot = np.eye(len(probs[0]))[np.asarray([r["label"] for r in rows])]
+    assert float(np.mean(((probs - onehot) ** 2).sum(axis=1))) == \
+        pytest.approx(brier, rel=1e-12)
+
+    # a perfectly certain, always-right predictor scores 0; a
+    # confidently-wrong one scores the full two terms
+    assert _brier([{"logits": [50.0, 0.0], "label": 0}], 1.0) == \
+        pytest.approx(0.0, abs=1e-12)
+    assert _brier([{"logits": [0.0, 50.0], "label": 0}], 1.0) == \
+        pytest.approx(2.0, abs=1e-6)
+
+
+def test_calibrator_eval_golden_per_alpha_coverage_and_avg_set_size():
+    # 06:351-353: coverage(alpha) = fraction of rows whose TRUE class
+    # falls inside the prediction set {c : 1 - p_c <= thr_alpha}, and
+    # avg set size = mean number of classes in that set (empty sets
+    # count 0, honestly). Five rows, T = 1, thresholds 0.05 -> 0.1,
+    # 0.10 -> 0.4 (fitted state, not the spec defaults' meaning):
+    #   r0 [2,0] l0: 1-p_true = 0.11920292205; sets: sizes (0, 1)
+    #   r1 [0,2] l1: 1-p_true = 0.11920292205; sizes (0, 1)
+    #   r2 [0,0] l1: 1-p_true = 0.5;           sizes (0, 0)
+    #   r3 [0,0] l0: 1-p_true = 0.5;           sizes (0, 0)
+    #   r4 [4,0] l0: 1-p_true = 0.017986209962; sizes (1, 1)
+    # coverage_05 = 1/5 (only r4), coverage_10 = 3/5 (r0, r1, r4)
+    # avg_set_size_05 = (0+0+0+0+1)/5 = 0.2, _10 = (1+1+0+0+1)/5 = 0.6
+    weights = json.dumps({
+        "temperature": 1.0, "classes": 2,
+        "thresholds": {"0.05": 0.1, "0.10": 0.4},
+    }).encode()
+    records = [
+        {"logits": [2.0, 0.0], "label": 0},
+        {"logits": [0.0, 2.0], "label": 1},
+        {"logits": [0.0, 0.0], "label": 1},
+        {"logits": [0.0, 0.0], "label": 0},
+        {"logits": [4.0, 0.0], "label": 0},
+    ]
+    out = compute_metrics(
+        entry={"name": "golden", "version": "v1"},
+        weights=weights,
+        dataset={"transform": "calibration", "records": records,
+                 "ref": "golden:v1"},
+        protocol={},
+    )
+    assert out["coverage_alpha_05"] == pytest.approx(0.2, abs=1e-9)
+    assert out["coverage_alpha_10"] == pytest.approx(0.6, abs=1e-9)
+    assert out["avg_set_size_alpha_05"] == pytest.approx(0.2, abs=1e-9)
+    assert out["avg_set_size_alpha_10"] == pytest.approx(0.6, abs=1e-9)
+    # the protocol declares exactly what the metrics deliver, in order
+    # (12 §15.4)
+    assert tuple(out) == metric_names(weights)
+    assert set(out) == {
+        "ece", "nll", "mce", "brier",
+        "coverage_alpha_05", "coverage_alpha_10",
+        "avg_set_size_alpha_05", "avg_set_size_alpha_10",
+    }
 
 
 def test_conformal_coverage_golden_fractions_and_numpy_oracle():

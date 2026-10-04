@@ -416,10 +416,67 @@ def test_evaluate_ranker_preview_equals_record(ws):
 
 def test_evaluate_calibrator_metric_family(ws):
     rec = _wf(ws.root).evaluate_model(ws.calib, "preds:v1")
-    assert set(rec["metrics"]) == {"ece", "nll", "coverage"}
+    assert set(rec["metrics"]) == {
+        "ece", "nll", "mce", "brier",
+        "coverage_alpha_05", "coverage_alpha_10",
+        "avg_set_size_alpha_05", "avg_set_size_alpha_10",
+    }
     assert rec["harness"] == "calibrator"
     ece = float(rec["metrics"]["ece"])
+    mce = float(rec["metrics"]["mce"])
     assert 0.0 <= ece <= 1.0
+    # worst bin >= weighted mean of bin gaps (bins partition every row);
+    # 2e-6 absorbs the round(...,6) on both sides
+    assert mce + 2e-6 >= ece
+    assert 0.0 <= float(rec["metrics"]["brier"]) <= 2.0
+    for key in ("coverage_alpha_05", "coverage_alpha_10"):
+        assert 0.0 <= float(rec["metrics"][key]) <= 1.0
+    for key in ("avg_set_size_alpha_05", "avg_set_size_alpha_10"):
+        assert float(rec["metrics"][key]) >= 0.0
+
+
+def _calib_state(thresholds: dict[str, float]) -> bytes:
+    return json.dumps({"temperature": 1.0, "classes": 2,
+                       "thresholds": thresholds}).encode()
+
+
+def test_calibrator_metric_names_follow_fitted_alphas():
+    """12 §15.4 — `metric_names(weights)` declares exactly the keys
+    `compute_metrics` will deliver: the spec defaults [0.05, 0.10]
+    without weights (and WITH a spec-alphabet state), a model's OWN
+    `semantic.alphas` when present, base-4 only when thresholds were
+    never fitted (06:351-353 key naming: 0.05 -> `05`, 0.20 -> `20`)."""
+    engine = build_engine("calibrator")
+    spec_keys = (
+        "ece", "nll", "mce", "brier",
+        "coverage_alpha_05", "coverage_alpha_10",
+        "avg_set_size_alpha_05", "avg_set_size_alpha_10",
+    )
+    assert engine.metric_names() == spec_keys
+    assert engine.metric_names(
+        weights=_calib_state({"0.05": 0.1, "0.10": 0.4})) == spec_keys
+    # a custom-alpha model declares ITS keys, never a key it cannot fill
+    custom = engine.metric_names(
+        weights=_calib_state({"0.05": 0.1, "0.20": 0.4}))
+    assert "coverage_alpha_20" in custom
+    assert "coverage_alpha_10" not in custom
+    assert custom[:4] == ("ece", "nll", "mce", "brier")
+    # conformal never fitted -> no per-alpha keys, and compute_metrics
+    # agrees (both derive from the same state)
+    bare = engine.metric_names(weights=_calib_state({}))
+    assert bare == ("ece", "nll", "mce", "brier")
+
+
+def test_calibrator_metric_names_alpha_key_collision_fails_closed():
+    """Two alphas that round to the same 0.01 metric-key precision
+    (0.051 and 0.052 both -> `05`) must BLOCK — never silently share
+    one metric name (06:351-353)."""
+    engine = build_engine("calibrator")
+    with pytest.raises(ValidationBlock) as ei:
+        engine.metric_names(weights=_calib_state(
+            {"0.051": 0.1, "0.052": 0.4}))
+    assert "collides" in ei.value.render()
+    assert "0.052" in ei.value.render()
 
 
 def test_evaluate_ranker_refuses_train_pool(ws):
