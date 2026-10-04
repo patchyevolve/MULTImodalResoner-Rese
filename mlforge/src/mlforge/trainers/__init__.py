@@ -24,6 +24,8 @@ Trainer construction channels (all trainers accept the same keywords):
   run_dir       — this run's directory (framework scratch/output dirs)
   on_progress   — liveness callback (worker heartbeat) for steps that
                   outlive the heartbeat interval (12 §23.2: 30s/120s)
+  device        — runtime.device placement knob (see resolve_device below;
+                  never hard-wired, never a silent downgrade)
 """
 
 from __future__ import annotations
@@ -119,6 +121,74 @@ def availability_error(model: str | None) -> str | None:
     return detail
 
 
+def resolve_device(runtime: Mapping[str, Any] | None = None) -> Any:
+    """Placement device for a torch trainer — runtime execution knob
+    (12 §13.3: execution knobs, never semantic).
+
+    `runtime["device"]` (train config), accepted verbatim:
+      absent / "" / "auto"  — cuda when THIS host has it, else cpu
+      "cpu"                 — force CPU (portable default)
+      "cuda" / "cuda:N"     — require CUDA; on a host without it (or with
+                              fewer devices than N) construction FAILS with
+                              PreconditionFailed naming the reason — MLForge
+                              never silently downgrades a requested device
+      anything else         — ValidationBlock listing what is accepted
+
+    `runtime["gpu"]` stays the PREFLIGHT expectation knob
+    (cli._gpu_required_for); this function only decides PLACEMENT.
+    Torch is imported lazily — this package stays stdlib-only at import.
+    """
+    import torch
+
+    raw = str((runtime or {}).get("device", "auto") or "auto").strip().lower()
+    if raw in ("", "auto"):
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    try:
+        dev = torch.device(raw)
+    except (RuntimeError, ValueError) as exc:
+        raise ValidationBlock(
+            f"runtime.device {raw!r} is not a device string",
+            hint="accepted: auto, cpu, cuda, cuda:N (e.g. cuda:0)",
+        ) from exc
+    if dev.type == "cpu":
+        return dev
+    if dev.type != "cuda":
+        raise ValidationBlock(
+            f"runtime.device {raw!r} addresses unsupported device type "
+            f"{dev.type!r}",
+            hint="accepted: auto, cpu, cuda, cuda:N (e.g. cuda:0)",
+        )
+    if not torch.cuda.is_available():
+        raise PreconditionFailed(
+            f"runtime.device {raw!r} requires CUDA but this host has none "
+            "(torch.cuda.is_available() is False)",
+            hint="train with device: cpu (or auto) in the train config, or "
+                 "run on a CUDA host — a requested device is never silently "
+                 "downgraded",
+        )
+    if dev.index is not None and dev.index >= torch.cuda.device_count():
+        raise PreconditionFailed(
+            f"runtime.device {raw!r} but this host exposes "
+            f"{torch.cuda.device_count()} CUDA device(s)",
+            hint=f"use cuda:0..{torch.cuda.device_count() - 1}, "
+                 "device: auto, or device: cpu",
+        )
+    return dev
+
+
+def cpu_tree(obj: Any) -> Any:
+    """Deep-copy every tensor in a state dict to CPU so checkpoint BYTES
+    are device-independent — a run folder saved on a CUDA host stays
+    loadable (map_location-free) on any other host."""
+    if isinstance(obj, dict):
+        return {k: cpu_tree(v) for k, v in obj.items()}
+    if type(obj) in (list, tuple):
+        return type(obj)(cpu_tree(v) for v in obj)
+    if hasattr(obj, "detach"):
+        return obj.detach().cpu()
+    return obj
+
+
 def build_trainer(
     model: str,
     *,
@@ -171,5 +241,7 @@ __all__ = [
     "availability_error",
     "available_models",
     "build_trainer",
+    "cpu_tree",
     "registered_models",
+    "resolve_device",
 ]

@@ -19,7 +19,8 @@ are reproducible with the commands given.
 
 | Claim | Status | Evidence |
 |---|---|---|
-| Full unit/integration suite passes | **VERIFIED** | `python -m pytest -q` → exit 0, 777 tests before this ledger, 787 with the golden-metric tests below (92 s) |
+| Full unit/integration suite passes | **VERIFIED** | `python -m pytest -q` → exit 0, 777 tests before this ledger, 787 with the golden-metric tests, **808 with the device-placement tests (805 passed + 3 skipped — 92 s)** |
+| Device placement contract (`runtime.device`) | **VERIFIED** | `tests/test_device_placement.py` → 19 passed + 2 CUDA-host skips: auto/cpu/cuda resolution, fail-closed refusals (no silent downgrade), preflight `device: cuda` ⇒ GPU probe, CPU-state portable checkpoint bytes |
 | Branch coverage of `src/mlforge` | **VERIFIED** | `python -m coverage run -m pytest` → **82 %** total (11 427 stmts, 1 709 missed, 3 712 branches, 670 partial) |
 | Coverage hot spots (honest low end) | **VERIFIED** | `ops/bundle.py` 49 %, `trainers/rfdetr.py` 48 %, `trainers/reid.py` 75 %, `engines/calibrator.py` 76 %; `machine.py` 100 %, `workflow.py` 90 % |
 
@@ -100,7 +101,7 @@ evidence under `/tmp/opencode/mutation_evidence/`).
 | Family E2E (re-ID) | `osnet_x1_0`: real OSNet training on a registered image tree → ONNX export (round-trip max_error 5.96e-08) → image infer (512-d unit embedding, deterministic) → rank1/rank5/mAP eval preview==recorded | included above |
 | Family E2E (refusals) | unknown export format → `ValidationBlock`; missing infer input → `NotFound` | included above |
 | RF-DETR smoke | `MLFORGE_RFDETR_SMOKE=1 pytest tests/test_rfdetr_trainer.py` — real Lightning epoch + base download + resume | **16 passed** (`/tmp/opencode/rfdetr_smoke.log`) |
-| Fault-injection journeys | 7 journeys in the suite: gate refusal, crash+resume, lease expiry, checkpoint corruption, package weights, finetune root, export commit-marker ordering | in `tests/test_journey_reliability.py` (part of the 787) |
+| Fault-injection journeys | 7 journeys in the suite: gate refusal, crash+resume, lease expiry, checkpoint corruption, package weights, finetune root, export commit-marker ordering | in `tests/test_journey_reliability.py` (part of the suite) |
 
 ## 5. Benchmarks vs. specification targets
 

@@ -35,6 +35,7 @@ from typing import Any, Mapping, Sequence
 from mlforge.errors import PreconditionFailed, ValidationBlock
 from mlforge.runtime.checkpoints import REQUIRED_COMPONENTS
 from mlforge.runtime.trainer import StepResult, TrainState
+from mlforge.trainers import cpu_tree, resolve_device
 
 try:
     import torch
@@ -236,6 +237,8 @@ class TorchTextTrainer:
                 hint="pip install torch --index-url "
                      "https://download.pytorch.org/whl/cpu (CPU wheels)",
             ) from _TORCH_IMPORT_ERROR
+        # -- placement (runtime.device; never hard-wired, fail-closed) ----
+        self.device = resolve_device(runtime)
         arch = MODEL_REGISTRY.get(model_name)
         if arch is None:
             raise PreconditionFailed(
@@ -336,9 +339,11 @@ class TorchTextTrainer:
             self.steps_per_epoch = min(self.steps_per_epoch, steps_cap)
 
         # -- model / optimizer / schedule ----------------------------------
+        # Weights init on CPU under the seeded RNG (bit-identical init on
+        # every host), then placed on the resolved device.
         torch.manual_seed(self.seed)
         random.seed(self.seed)
-        self.model = TinyGPT(arch)
+        self.model = TinyGPT(arch).to(self.device)
         params = self.model.parameters()
         if opt_name == "adamw":
             self.optimizer = torch.optim.AdamW(
@@ -473,9 +478,9 @@ class TorchTextTrainer:
         starts = windows * self.block
         offsets = torch.arange(self.block)
         idx = starts[:, None] + offsets[None, :]
-        x = self.corpus[idx]
+        x = self.corpus[idx]          # windows live on CPU (the corpus)
         y = self.corpus[idx + 1]
-        return x, y
+        return x.to(self.device), y.to(self.device)
 
     # -- protocol -----------------------------------------------------------
 
@@ -547,8 +552,8 @@ class TorchTextTrainer:
 
         pos = state.global_step - state.epoch * self.steps_per_epoch
         return {
-            "model": _save(self.model.state_dict()),
-            "optimizer": _save(self.optimizer.state_dict()),
+            "model": _save(cpu_tree(self.model.state_dict())),
+            "optimizer": _save(cpu_tree(self.optimizer.state_dict())),
             "lr_scheduler": _json({
                 "kind": self.scheduler_kind,
                 "last_epoch": int(self.scheduler.last_epoch),

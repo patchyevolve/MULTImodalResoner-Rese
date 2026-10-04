@@ -65,6 +65,7 @@ from typing import Any, Callable, Mapping, Sequence
 from mlforge.errors import PreconditionFailed, ValidationBlock
 from mlforge.runtime.checkpoints import REQUIRED_COMPONENTS
 from mlforge.runtime.trainer import StepResult, TrainState
+from mlforge.trainers import resolve_device
 
 #: Model name → rfdetr variant class (identity is the run_spec.model key).
 _MODEL_CLASSES: dict[str, str] = {
@@ -304,7 +305,10 @@ class RFDETRTrainer:
         cls = getattr(rfdetr, variant.class_name)
 
         # -- runtime execution knobs (12 §13.3 — never semantic) -----------
-        self.device = runtime.get("device")
+        # Resolved through the shared contract: auto → this host's best
+        # device, cuda requested on a GPU-less host refuses HERE (before
+        # any side effect) — never a silent downgrade.
+        self.device = resolve_device(runtime)
         self.num_workers = int(runtime.get("num_workers", 2))
         self.eval_interval = int(runtime.get("eval_interval", 1))
         self.checkpoint_interval = max(

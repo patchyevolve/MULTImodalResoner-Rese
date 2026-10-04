@@ -1322,25 +1322,37 @@ def _do_model(wf: WorkflowAPI, args) -> int:
 
 
 def _gpu_required_for(root: Path, run_id: str, runtime: dict | None = None) -> bool:
-    """`runtime["gpu"]` (train config) is the explicit override; otherwise
-    the validated execution plan decides — a plan measured on a GPU host
-    requires `nvidia-smi` at preflight, a CPU/PORTABLE plan does not
-    (12 §14: the plan already negotiated the device).
+    """`runtime["gpu"]` (train config) is the explicit override; then
+    `runtime["device"]` naming cuda demands the probe (the trainer would
+    refuse to place the run anywhere else); otherwise the validated
+    execution plan decides — a plan measured on a GPU host requires
+    `nvidia-smi` at preflight, a CPU/PORTABLE plan does not (12 §14).
 
     No plan yet (manual `preflight` before validation): fall back to live
     host detection — a CPU host never demands a GPU it cannot have; broken
     detection is a ValidationBlock ⇒ fail-closed True."""
-    if runtime is not None and "gpu" in runtime:
-        return bool(runtime["gpu"])
-    if runtime is None:  # resume path: read the stored runtime config
+
+    def _verdict(cfg: Any) -> bool | None:
+        if not isinstance(cfg, dict):
+            return None
+        if "gpu" in cfg:
+            return bool(cfg["gpu"])
+        if str(cfg.get("device") or "").strip().lower().startswith("cuda"):
+            return True
+        return None
+
+    verdict: bool | None = None
+    if runtime is not None:
+        verdict = _verdict(runtime)
+    else:  # resume path: read the stored runtime config
         p = root / "runs" / run_id / "state" / "runtime.json"
         if p.is_file():
             try:
-                data = json.loads(p.read_text(encoding="utf-8"))
-                if isinstance(data, dict) and "gpu" in data:
-                    return bool(data["gpu"])
+                verdict = _verdict(json.loads(p.read_text(encoding="utf-8")))
             except json.JSONDecodeError:
                 pass
+    if verdict is not None:
+        return verdict
     try:
         plan = ExecutionPlan.read(root / "runs" / run_id / PLAN_FILENAME)
         return int(plan.capabilities.get("gpu_count") or 0) > 0

@@ -86,6 +86,14 @@ host it runs on:
   actually found GPUs; explicit escape hatches:
   `runtime: {"gpu": false|true}` in the train config, or
   `mlforge preflight RUN --gpu/--no-gpu` for a one-off report.
+* **Device placement is a runtime knob, never hard-wired.** Every
+  trainer resolves `runtime.device`: `auto` (default) picks cuda when
+  THIS host has it, else cpu; explicit `cpu` / `cuda` / `cuda:N` is
+  honored literally — requesting `cuda` on a GPU-less host refuses at
+  trainer build with exactly that reason, never a silent downgrade.
+  Checkpoints serialize CPU-state bytes (a run folder saved on a GPU
+  host stays loadable anywhere), and `device: cuda` makes preflight
+  demand `nvidia-smi` (the `runtime.gpu` escape hatch still wins).
 * **Disk (12 §7.3) defaults are worst-case**: 2×4 GiB checkpoints +
   2 GiB logs + 2 GiB safety margin + dataset bytes. On a small disk,
   put your real numbers in the train config — gate step 16 and
