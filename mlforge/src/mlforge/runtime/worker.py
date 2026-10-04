@@ -231,8 +231,11 @@ class Worker:
                 raise PreconditionFailed(
                     f"parent checkpoint directory unreadable: {d.name}"
                 ) from exc
+            # CheckpointStore is rooted at the RUN dir (it appends
+            # `checkpoints/` itself) — passing the checkpoints dir would
+            # verify `checkpoints/checkpoints/…` and refuse every match.
             ok, reason = CheckpointStore(
-                parent_ckpt_root
+                self.root / "runs" / parent_run
             ).verify(ordinal)
             if not ok:
                 raise PreconditionFailed(

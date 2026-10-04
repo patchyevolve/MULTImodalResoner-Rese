@@ -280,10 +280,15 @@ def write_export(
     *,
     binary: bytes | None = None,
 ) -> Path:
-    """Write the export artifact (immutable). Real exports pass the
-    format binary as raw bytes — written FIRST (under the record's own
-    `file_name`), so a failure never leaves a record claiming bytes that
-    do not exist (13 §6.9)."""
+    """Write the export artifact (immutable), commit-marker LAST. Real
+    exports pass the format binary as raw bytes — written FIRST (under
+    the record's own `file_name`), then the contract sidecar, then
+    `export.json` — the record readers trust (`list_exports`,
+    `latest_export`, `contract_source_dir`) — only once every payload it
+    describes is on disk. A crash between writes therefore leaves a
+    directory NO reader can see as an export (no phantom record, no
+    contract without bytes); the retry starts a fresh export and heals
+    the journey (13 §6.9 no partial export, §7)."""
     d = export_dir(root, str(record["export_id"]))
     d.mkdir(parents=True, exist_ok=True)
     if binary is not None:
@@ -296,8 +301,8 @@ def write_export(
         tmp.write_bytes(binary)
         tmp.replace(bp)
     for filename, payload in (
-        ("export.json", record),
         ("model_spec.json", record["model_spec"]),
+        ("export.json", record),
     ):
         p = d / filename
         if p.exists():

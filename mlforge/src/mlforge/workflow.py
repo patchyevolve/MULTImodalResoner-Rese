@@ -2078,12 +2078,18 @@ class WorkflowAPI:
             integrity=integrity,
         )
         record["created_ts"] = time.time()
+        # The weights go INTO the bundle (12 §15.3 package file family):
+        # `model import` refuses a package without `model.safetensors`,
+        # so load them BEFORE anything is written — a model whose
+        # weights cannot be read never produces a partial bundle.
+        weights_bytes = load_weights(self.root, entry)
         write_bundle(
             self.root,
             record=record,
             model_spec=model_spec,
             provenance=provenance,
             integrity=integrity,
+            weights=weights_bytes,
         )
         # packaging consumes no lifecycle state (13 §5.4 has no BUNDLED
         # state) — journal-only, artifacts carry the record.

@@ -52,12 +52,29 @@ def _spec() -> RunSpec:
 
 
 def _publish(wf: WorkflowAPI) -> dict:
-    """Drive a run to COMPLETED → its model gets published AVAILABLE."""
+    """Drive a run to COMPLETED → its model gets published AVAILABLE.
+
+    The run trains through a REAL worker session (scaffold trainer under
+    `MLFORGE_HARNESS`): completed runs therefore carry committed
+    checkpoint weights, which package/export/infer load (12 §15.3 — a
+    model whose weights never existed is never packaged).
+    """
+    from mlforge.leases import RunLeaseManager
+    from mlforge.runtime.worker import Worker
+
     h = wf.create_run(_spec())
     wf.begin_validation(h.run_id)
     wf.validation_pass(h.run_id)
-    wf.preflight_pass(h.run_id)
-    wf.complete(h.run_id)
+    root = Path(wf.root)
+    info = RunLeaseManager(root).acquire(h.run_id)
+    rc = Worker(
+        root,
+        h.run_id,
+        info.session_token,
+        heartbeat_interval=60.0,
+        poll_interval=0.0,
+    ).run()
+    assert rc == 0, f"worker exited {rc} — training never wedges mid-publish"
     entry = [m for m in wf.list_models() if m.get("run_id") == h.run_id]
     assert entry, "completion must publish a model"
     return entry[0]
@@ -500,12 +517,20 @@ def test_package_happy_path_bundle_files(wf):
     wf.export_model(ref, "onnx")
     rec = wf.package_model(ref)
     base = Path(wf.root, "bundles", rec["bundle_id"])
-    for name in ("bundle.json", "model_spec.json", "provenance.json",
-                 "integrity.json"):
+    for name in ("model.safetensors", "bundle.json", "model_spec.json",
+                 "provenance.json", "integrity.json"):
         assert (base / name).is_file(), name
+    assert (base / "model.safetensors").stat().st_size > 0
     assert set(rec["integrity"]) >= {"model_spec", "provenance"}
     spec = json.loads((base / "model_spec.json").read_text())
     assert "inference_contract" in spec
+    # the bundle must be IMPORTABLE — read_package hashes the weights
+    # file the bundle actually carries (13 §4.1 `model import`)
+    from mlforge.ops.importing import read_package
+
+    pkg_spec, weights = read_package(base)
+    assert pkg_spec["inference_contract"] == spec["inference_contract"]
+    assert weights["bytes"] == (base / "model.safetensors").stat().st_size
 
 
 def test_package_blocks_on_planted_secret(wf):

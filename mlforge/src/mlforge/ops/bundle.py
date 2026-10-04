@@ -9,11 +9,12 @@ Design:
   * packaging REQUIRES a contract (from a prior export or an import) —
     absent ⇒ BLOCK with the exact next command (`export ... --format`);
   * the bundle is an immutable artifact under `bundles/<bdl_...>/` with
-    `bundle.json` (identity) + `model_spec.json` (contract) +
-    `provenance.json` (lineage) + `integrity.json` (component hashes) —
-    the file family of 12 §15.3 minus the real weights file, which the
-    exporter writes at integration (weights are referenced by hash, never
-    faked);
+    `model.safetensors` (the real weights — 12 §15.3 package file
+    family) + `bundle.json` (identity) + `model_spec.json` (contract) +
+    `provenance.json` (lineage) + `integrity.json` (component hashes);
+    the weights are the WHOLE POINT of the family: `model import`
+    (`read_package`) refuses a package without them, so a bundle that
+    carried only hashes could never be imported;
   * a secrets scan runs over the bundle's SOURCE directories before
     anything is written — findings BLOCK the whole package (13 §7, no
     partial execution).
@@ -53,8 +54,8 @@ def build_bundle(
         "model_hash": model_hash,
         "contract_hash": content_hash(contract),
         "artifact_hash": model_entry.get("artifact_hash"),
-        "files": ["bundle.json", "model_spec.json", "provenance.json",
-                  "integrity.json"],
+        "files": ["model.safetensors", "bundle.json", "model_spec.json",
+                  "provenance.json", "integrity.json"],
         "integrity": integrity,
         "provenance": provenance,
         "harness": model_spec.get("harness", "scaffold"),
@@ -77,24 +78,38 @@ def write_bundle(
     model_spec: dict[str, Any],
     provenance: dict[str, Any],
     integrity: dict[str, str],
+    weights: bytes,
 ) -> Path:
+    """Write the bundle atomically, weights FIRST.
+
+    `model.safetensors` lands before any JSON so a crash mid-write can
+    never leave a complete-looking bundle that is missing (or lying
+    about) its weights — `model import` hashes the file it finds
+    (`read_package`), and an interrupted package is retried, never
+    imported half-written.
+    """
     d = Path(root) / BUNDLES_DIR / str(record["bundle_id"])
     d.mkdir(parents=True, exist_ok=True)
-    payloads = {
-        "bundle.json": record,
-        "model_spec.json": model_spec,
-        "provenance.json": provenance,
-        "integrity.json": integrity,
-    }
-    for filename, payload in payloads.items():
-        p = d / filename
+
+    def _write_bytes(p: Path, payload: bytes) -> None:
         if p.exists():
             raise ValidationBlock(
                 f"bundle file already exists: {p} — bundles are immutable")
         tmp = p.with_suffix(p.suffix + ".tmp")
-        tmp.write_text(json.dumps(payload, indent=2, sort_keys=True),
-                       encoding="utf-8")
+        tmp.write_bytes(payload)
         tmp.replace(p)
+
+    def _write_json(p: Path, payload: dict[str, Any]) -> None:
+        _write_bytes(p, json.dumps(payload, indent=2, sort_keys=True)
+                     .encode("utf-8"))
+
+    from mlforge.ops.importing import WEIGHTS_FILE
+
+    _write_bytes(d / WEIGHTS_FILE, weights)
+    _write_json(d / "bundle.json", record)
+    _write_json(d / "model_spec.json", model_spec)
+    _write_json(d / "provenance.json", provenance)
+    _write_json(d / "integrity.json", integrity)
     return d
 
 
