@@ -243,11 +243,10 @@ mlforge/
     `--set`/`--config` overrides (typo ⇒ BLOCK), `--command-id` dedupe, `inspect <run>` carries lineage,
     monotonic ULIDs (same-ms ids sort by creation — retrain source is
     deterministic)
-11. ⚠ Evaluate/compare/infer/export/package + `model import` —
-    **CORRECTED (was wrongly checked ✅ while the engines underneath
-    were scaffolds).** REAL and delivered: five-component evaluation
-    identity (model+dataset+code+environment+protocol, 12 §15.4) with
-    SHOW PROTOCOL preview that equals the recorded artifact, write-once
+11. ✅ Evaluate/compare/infer/export/package + `model import` —
+    REAL end to end: five-component evaluation identity
+    (model+dataset+code+environment+protocol, 12 §15.4) with SHOW
+    PROTOCOL preview that equals the recorded artifact, write-once
     evaluation/export/bundle artifacts, first-consumption model state
     marker, operator/format validation (unknown format or unsupported
     operator ⇒ BLOCK with the closed registry, never a partial export),
@@ -257,14 +256,29 @@ mlforge/
     `compare` (NOT_COMPARABLE = different protocol, shown never
     averaged, never a winner), `--command-id` dedupe (original result,
     never recomputed), `model import` (declared identity, hashed
-    weights, duplicate `name:vN` BLOCKs, origin `import`),
-    `validate <RUN|MODEL>`, `serve` honest exit 4.
-    **NOT delivered: the engines.** Metric computation
-    (`scaffold_metrics`), inference execution (`execute_scaffold`), and
-    exported model bytes are labeled scaffolds (`harness: scaffold` in
-    every output — they never claim otherwise); the real model runtime
-    replaces them at integration. Outputs are honestly labeled; they
-    are not ✅.
+    weights copied into the registry with the artifact hash verified,
+    duplicate `name:vN` BLOCKs, origin `import`), `validate
+    <RUN|MODEL>`, `serve` honest exit 4. **Engines are REAL by
+    default** — one `ops/engines` registry behind the SAME
+    `MLFORGE_HARNESS=1` gate as `ScaffoldTrainer` (12 §12.4) with five
+    family engines (text `reasoner_s` → perplexity; reid `osnet_x1_0`
+    → rank1/rank5/mAP; detection `rf_detr_{s,l,seg_s}` → mAP/AP50 via
+    COCOeval; calibrator → ece/nll/coverage; `hypothesis_ranker` →
+    ndcg@3/ndcg@5 reusing the trainer's own metric): evaluate computes
+    the family's metrics over store-backed prepared records with split
+    discipline (train/holdout rows are never eval rows, 12 §15.4) and
+    transform guards; infer executes one-shot text|image|structured
+    inputs over the model's committed weights (newest VALID checkpoint
+    COMMIT marker cross-checked against the registry's artifact_hash —
+    never random init, 12 §15.3) with identity bound to contract+input
+    +model hash; export writes genuine ONNX bytes (ir_version 8,
+    opset 17, domain-correct ai.onnx.ml trees for the ranker) gated on
+    `onnx.checker` + an onnxruntime numerical round-trip PASS or
+    ValidationBlock — no partial export ever (13 §6.9/§7); every
+    artifact carries its family harness label, and unknown
+    family/unsupported format/missing weights refuse honestly naming
+    what is missing; the labeled scaffold survives only behind
+    `MLFORGE_HARNESS=1` (12 §12.4).
 12. ✅ TUI/GUI over the same Workflow API — `watch` without RUN is the
     multi-screen Live dashboard (overview → run §9.6 frame → events
     §9.7 feed → help; j/k/Enter/e/b/p/s/c/q keys), `watch RUN` keeps the

@@ -290,4 +290,4 @@ def test_dataset_types_json(capsys):
     names = {t["name"] for t in catalog["supported"]}
     assert {"text_corpus", "coco_detection", "mot_challenge",
             "reid_crops", "tabular"} <= names
-    assert any(p["name"] == "video" for p in catalog["planned"])
+    assert any(p["name"] == "audio" for p in catalog["planned"])

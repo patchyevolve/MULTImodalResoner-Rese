@@ -16,19 +16,22 @@ Design:
     sample_subset, seed, harness_code_hash) — `mlforge compare` gates
     comparability on it (13 §6.10);
   * the metric HARNESS is pluggable like the Trainer (12 §12.4): the
-    default `scaffold_metrics` is a deterministic, dependency-free
-    stand-in derived from the identity hashes — it exercises the full
-    reproducibility contract (same five inputs ⇒ same numbers) and
-    explicitly does NOT claim to measure a model. A real harness plugs
-    in by replacing the harness functions and the code hash follows.
+    REAL engine runs by default (mlforge.ops.engines — family metrics
+    over the prepared dataset); the deterministic `scaffold_metrics`
+    stands behind `MLFORGE_HARNESS=1` (system tests) — derived from the
+    identity hashes so the reproducibility contract stays real. Either
+    way `harness_code_hash` covers the harness implementation (scaffold
+    source + the engine package), so swapping engines changes
+    comparability exactly as it should.
 """
 
 from __future__ import annotations
 
+import hashlib
 import inspect
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 from mlforge.errors import ValidationBlock
 from mlforge.hashing import content_hash, content_hash_bytes
@@ -37,7 +40,8 @@ EVALUATIONS_DIR = "evaluations"
 EVALUATION_SCHEMA = 1
 
 #: Metric names the scaffold harness emits (the protocol's
-#: `metric_definitions` hash covers exactly this definition set).
+#: `metric_definitions` hashes whatever `metric_names` the selected
+#: harness declares — the default is this scaffold set).
 DEFAULT_METRIC_NAMES = ("mAP", "AP50")
 
 #: Default evaluation protocol (12 §15.4). `split` is never "train".
@@ -61,9 +65,20 @@ DERIVED_PROTOCOL_FIELDS = frozenset({"metric_definitions", "harness_code_hash"})
 
 def harness_code_hash() -> str:
     """Code identity of THIS harness (12 §15.4 `harness_code_hash`) —
-    real: sha256 of the scaffold implementation source."""
-    source = inspect.getsource(scaffold_metrics)
-    return content_hash_bytes(source.encode("utf-8"))
+    real: sha256 over the scaffold implementation source PLUS every
+    engine module under `mlforge.ops.engines` (the metric engines ARE
+    the harness; swapping one changes comparability)."""
+    import mlforge.ops.engines as engines_pkg
+
+    h = hashlib.sha256()
+    h.update(inspect.getsource(scaffold_metrics).encode("utf-8"))
+    h.update(b"\0")
+    pkg = Path(engines_pkg.__file__).parent
+    for p in sorted(pkg.rglob("*.py")):
+        h.update(str(p.relative_to(pkg)).encode("utf-8"))
+        h.update(b"\0")
+        h.update(p.read_bytes())
+    return content_hash_bytes(h.digest())
 
 
 def source_tree_hash() -> str:
@@ -84,8 +99,22 @@ def source_tree_hash() -> str:
     return content_hash_bytes(h.digest())
 
 
-def build_protocol(overrides: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Complete protocol document + derived metric/harness hashes."""
+def build_protocol(
+    overrides: dict[str, Any] | None = None,
+    *,
+    metric_names: Sequence[str] = DEFAULT_METRIC_NAMES,
+) -> dict[str, Any]:
+    """Complete protocol document + derived metric/harness hashes.
+
+    `metric_names` is what the SELECTED harness measures (the real
+    engines pass their family metrics; the scaffold path passes
+    `DEFAULT_METRIC_NAMES`) — it feeds the derived `metric_definitions`
+    hash, so a different metric set is a different protocol (12 §15.4).
+    """
+    if not metric_names:
+        raise ValidationBlock(
+            "metric_names must be non-empty — a protocol measures "
+            "something (12 §15.4)")
     protocol = json.loads(json.dumps(DEFAULT_PROTOCOL))  # deep copy
     if overrides:
         unknown = set(overrides) - set(DEFAULT_PROTOCOL)
@@ -105,7 +134,7 @@ def build_protocol(overrides: dict[str, Any] | None = None) -> dict[str, Any]:
             )
         protocol.update(overrides)
     protocol["metric_definitions"] = content_hash(
-        {"metrics": list(DEFAULT_METRIC_NAMES)}
+        {"metrics": list(metric_names)}
     )
     protocol["harness_code_hash"] = harness_code_hash()
     return protocol
@@ -157,11 +186,30 @@ def build_evaluation(
     code_hash: str,
     environment_hash: str,
     protocol: dict[str, Any],
+    metrics: dict[str, float] | None = None,
+    harness: str = "scaffold",
+    note: str | None = None,
 ) -> dict[str, Any]:
-    """Full five-component evaluation record (12 §15.4)."""
+    """Full five-component evaluation record (12 §15.4).
+
+    `metrics=None` ⇒ the deterministic scaffold harness (honest stand-in
+    — identity, protocol, comparability are real, measurement is not);
+    a real engine passes its measured numbers + its own `harness` label.
+    """
     ph = protocol_hash(protocol)
     mh = model_entry_hash(model_entry)
-    metrics = scaffold_metrics(mh, dataset_hash, ph)
+    if metrics is None:
+        metrics = scaffold_metrics(mh, dataset_hash, ph)
+        note = note or (
+            "deterministic stand-in metrics (scaffold harness) — "
+            "identity, protocol, and comparability are real; the "
+            "measurement engine plugs in at integration"
+        )
+    else:
+        note = note or (
+            f"measured by the real {harness} engine over the "
+            "evaluation dataset (12 §12.4)"
+        )
     return {
         "schema_version": EVALUATION_SCHEMA,
         "eval_id": eval_id,
@@ -185,11 +233,9 @@ def build_evaluation(
                 "evaluation_protocol_hash": ph,
             }
         ),
-        "metrics": metrics,
-        "harness": "scaffold",
-        "note": "deterministic stand-in metrics (scaffold harness) — "
-                "identity, protocol, and comparability are real; the "
-                "measurement engine plugs in at integration",
+        "metrics": {k: metrics[k] for k in metrics},
+        "harness": harness,
+        "note": note,
     }
 
 

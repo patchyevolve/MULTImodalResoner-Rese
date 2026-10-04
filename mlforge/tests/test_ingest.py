@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import io
 import json
+import shutil
+import subprocess
 import zipfile
 from pathlib import Path
 
@@ -39,9 +41,11 @@ from mlforge.ingest.transforms import (
     reid_crops,
     registry_names,
     run_transform,
+    soccernet_events,
     suggest_transforms,
     tabular,
     transform_identity,
+    video_clips,
 )
 from mlforge.validation import RESUME_GATE_STEPS, provide_pass
 from mlforge.workflow import WorkflowAPI
@@ -1090,6 +1094,192 @@ def test_calibration_json_must_be_array(tmp_path):
         calibration([src])
 
 
+# -- video_clips (02 §11 custom clips, §8 Celeb-DF++, §9 FaceForensics++;
+#    §15 "All clips play without errors" / "Annotations in COCO format") ---
+
+def _ffmpeg_clip(tmp_path: Path) -> bytes:
+    """A REAL 64x64 @ 8 fps, 1 s clip — ffmpeg's `testsrc` is the simplest
+    deterministic video source (no numpy). Skips if ffmpeg is absent."""
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        pytest.skip("ffmpeg not installed — cannot build a real video fixture")
+    out = tmp_path / "clip-fixture.mp4"
+    subprocess.run(
+        [ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+         "-f", "lavfi", "-i", "testsrc=duration=1:size=64x64:rate=8",
+         "-pix_fmt", "yuv420p", str(out)],
+        check=True,
+    )
+    return out.read_bytes()
+
+
+def test_video_clips_probes_real_mp4(tmp_path):
+    src = _src(tmp_path, "clips", {"clip.mp4": _ffmpeg_clip(tmp_path)})
+    out = get_transform("video_clips")([src])  # registered, not raw-called
+    assert out["output_schema"] == "video_clips.v1"
+    (rec,) = out["records"]
+    assert rec["source"] == src.ref and rec["split"] == "train"
+    assert rec["relative_path"] == "clip.mp4"
+    assert rec["sha256"].startswith("sha256:") and rec["size"] > 0
+    video = rec["video"]
+    assert (video["width"], video["height"]) == (64, 64)
+    assert video["fps"] > 0 and video["duration_s"] > 0
+    assert video["decoder"] in {"av", "cv2"}
+    assert video["codec"]                      # h264 for the testsrc clip
+    assert video["frames"] is None or video["frames"] >= 1
+    # bounded decode really happened — the probe proves the clip PLAYS
+    try:
+        import av  # noqa: F401
+    except ImportError:
+        pass
+    else:
+        assert video["decoder"] == "av"        # PyAV is primary (01 §75)
+
+
+def test_video_clips_coco_sidecar_rehashes(tmp_path):
+    annotation = {"images": [{"id": 1, "file_name": "a.jpg"}],
+                  "annotations": [{"id": 1, "image_id": 1,
+                                   "bbox": [0, 0, 10, 10],
+                                   "category_id": 1}]}
+    src = _src(tmp_path, "clipann",
+               {"annotations.json": json.dumps(annotation).encode(),
+                "readme.txt": b"clip notes"})          # stray file: ignored
+    out = get_transform("video_clips")([src])
+    # a sidecar-only source still yields records (run_transform coverage)
+    (rec,) = out["records"]
+    assert rec["relative_path"] == "annotations.json"
+    assert rec["source"] == src.ref
+    (ann,) = out["annotations"]
+    from mlforge.hashing import content_hash
+    assert ann["canonical_sha256"] == content_hash(annotation)
+
+
+def test_video_clips_corrupt_sidecar_blocks(tmp_path):
+    src = _src(tmp_path, "badclipann", {"annotations.json": b"{not json"})
+    with pytest.raises(ValidationBlock, match="does not parse"):
+        video_clips([src])
+
+
+def test_video_clips_coco_shape_blocks(tmp_path):
+    src = _src(tmp_path, "badshape", {"annotations.json": json.dumps(
+        {"images": {"id": 1}, "annotations": {"bad": True}}).encode()})
+    with pytest.raises(ValidationBlock, match="must both be lists"):
+        video_clips([src])
+
+
+def test_video_clips_no_videos_blocks_with_extensions_hint(tmp_path):
+    src = _src(tmp_path, "noclips",
+               {"readme.txt": b"see 02_dataset_preparation section 11"})
+    with pytest.raises(ValidationBlock, match="no video files") as ei:
+        video_clips([src])
+    hint = ei.value.hint or ""
+    assert ".mp4" in hint and ".mkv" in hint and ".webm" in hint
+    assert "COCO annotation .json" in hint
+    assert "mlforge dataset types" in hint
+
+
+def test_video_clips_undecodable_file_blocks(tmp_path):
+    # a "video" that is really just bytes must never pass as playable
+    src = _src(tmp_path, "brokenclip",
+               {"broken.mp4": b"this is definitely not a video file\n" * 8})
+    with pytest.raises(ValidationBlock, match="play") as ei:
+        video_clips([src])
+    assert "02_dataset_preparation §15" in (ei.value.hint or "")
+
+
+# -- soccernet_events (02 §7 SoccerNet v2 layout, §15 "Labels-v2.json
+#    parseable for all 500 games") ------------------------------------------
+
+#: league/season/game prefix straight from the §7 directory tree.
+_SN_GAME = "england_epl/2016-2017/2017-02-04 - 12-30 Chelsea 1 - 1 Liverpool"
+
+
+def _soccernet_files() -> dict[str, bytes]:
+    labels = {"annotations": [
+        {"gameTime": "1 - 00:12:00", "position": 12000, "label": "Goal"},
+        {"position": 45000.5, "label": "Throw-in"},
+        {"position": 90000, "label": "Foul"},
+    ]}
+    return {
+        f"{_SN_GAME}/Labels-v2.json": json.dumps(labels).encode(),
+        f"{_SN_GAME}/video.ini": (
+            b"[First Half]\nstart=00:00:00.000\nduration=00:47:30.000\n"
+            b"[Second Half]\nstart=00:47:30.000\nduration=00:47:30.000\n"),
+        f"{_SN_GAME}/Labels-cameras.json": json.dumps(
+            {"annotations": [{"position": 0, "type": 1},
+                             {"position": 240, "type": 2}]}).encode(),
+        f"{_SN_GAME}/1_720p.mkv": b"mkv-bytes-never-decoded",
+        f"{_SN_GAME}/1_ResNET_TF2_PCA512.npy": b"npy-bytes-never-loaded",
+    }
+
+
+def test_soccernet_events_full_layout(tmp_path):
+    src = _src(tmp_path, "soccernet", _soccernet_files())
+    out = get_transform("soccernet_events")([src])
+    assert out["output_schema"] == "soccernet_events.v1"
+    records = out["records"]
+    assert all(r["source"] == src.ref and r["split"] == "train"
+               for r in records)
+    kinds = [r["kind"] for r in records]
+    assert kinds.count("action_spot") == 3
+    spots = [r for r in records if r["kind"] == "action_spot"]
+    assert [s["label"] for s in spots] == ["Goal", "Throw-in", "Foul"]
+    assert [s["position_ms"] for s in spots] == [12000.0, 45000.5, 90000.0]
+    assert all(s["game"] == _SN_GAME for s in spots)
+    (game,) = [r for r in records if r["kind"] == "game"]
+    assert (game["events"], game["classes"]) == (
+        3, ["Foul", "Goal", "Throw-in"])
+    assert game["sha256"].startswith("sha256:")
+    (ini,) = [r for r in records if r["kind"] == "video_ini"]
+    assert ini["sections"]["First Half"]["start"] == "00:00:00.000"
+    assert ini["sections"]["Second Half"]["duration"] == "00:47:30.000"
+    (cam,) = [r for r in records if r["kind"] == "camera_labels"]
+    assert cam["canonical_sha256"].startswith("sha256:")
+    assert cam["annotations_count"] == 2
+    # videos + features are provenance only — no decode, no numpy import
+    (vid,) = [r for r in records if r["kind"] == "video_file"]
+    assert vid["relative_path"].endswith("1_720p.mkv")
+    (feat,) = [r for r in records if r["kind"] == "features"]
+    assert feat["relative_path"].endswith(".npy")
+
+
+def test_soccernet_events_unknown_label_blocks(tmp_path):
+    src = _src(tmp_path, "snbadlabel", {f"{_SN_GAME}/Labels-v2.json":
+               json.dumps({"annotations": [
+                   {"position": 1000, "label": "Goal celebration"}]}).encode()})
+    with pytest.raises(ValidationBlock, match="Yellow→red card") as ei:
+        soccernet_events([src])
+    # the offending label is named, not swallowed
+    assert "Goal celebration" in str(ei.value)
+    assert "17 SoccerNet classes" in str(ei.value)
+
+
+def test_soccernet_events_unparseable_labels_block(tmp_path):
+    src = _src(tmp_path, "snbadjson",
+               {f"{_SN_GAME}/Labels-v2.json": b'{"annotations": ['})
+    with pytest.raises(ValidationBlock, match="does not parse") as ei:
+        soccernet_events([src])
+    assert "§15" in (ei.value.hint or "")
+
+
+def test_soccernet_events_annotations_shape_blocks(tmp_path):
+    src = _src(tmp_path, "snshape", {f"{_SN_GAME}/Labels-v2.json":
+               json.dumps({"nope": 1}).encode()})
+    with pytest.raises(ValidationBlock, match="`annotations` list"):
+        soccernet_events([src])
+
+
+def test_soccernet_events_no_artifacts_blocks(tmp_path):
+    src = _src(tmp_path, "sngarbage",
+               {"readme.txt": b"not a SoccerNet tree",
+                "stats.csv": b"a,b\n1,2\n"})
+    with pytest.raises(ValidationBlock, match="Labels-v2.json") as ei:
+        soccernet_events([src])
+    hint = ei.value.hint or ""
+    assert "02_dataset_preparation §7" in hint
+    assert "Labels-cameras.json" in hint and "video.ini" in hint
+
+
 # -- catalog invariant + post-add suggestions ------------------------------
 
 def test_dataset_types_catalog_matches_registry():
@@ -1101,7 +1291,23 @@ def test_dataset_types_catalog_matches_registry():
     assert len(names) == len(set(names))
     for name in names:
         assert name in registered, f"catalog advertises unregistered {name!r}"
-    assert {p["name"] for p in catalog["planned"]} >= {"video", "audio"}
+    assert {p["name"] for p in catalog["planned"]} >= {"audio"}
+
+
+def test_dataset_types_video_transforms_registered():
+    """Video is supported now, not planned: both transforms are cataloged
+    AND registered, and the honest-gap list keeps what is still missing
+    (audio) — the gap list never shrinks by faking support."""
+    catalog = dataset_types()
+    supported = {t["name"] for t in catalog["supported"]}
+    assert {"video_clips", "soccernet_events"} <= supported
+    registered = set(registry_names())
+    for name in supported:
+        assert name in registered, f"catalog advertises unregistered {name!r}"
+    assert {"video_clips", "soccernet_events"} <= registered
+    planned = {p["name"] for p in catalog["planned"]}
+    assert "video" not in planned
+    assert "audio" in planned
 
 
 def test_suggest_transforms_priority_and_hints():
@@ -1113,6 +1319,17 @@ def test_suggest_transforms_priority_and_hints():
     assert suggest_transforms(["imgs/0001_c1s1_000001_01.jpg"]) == ["reid_crops"]
     assert suggest_transforms(["annotations.json", "imgs/a.jpg"]) == ["coco_detection"]
     assert suggest_transforms(["raw.zip"]) == []   # ambiguous — no bad advice
+
+
+def test_suggest_transforms_video_files():
+    """Video extensions must route to the video transforms (.mkv feeds
+    both SoccerNet and the generic clip probe — the user picks)."""
+    assert suggest_transforms(["clips/match.mp4"]) == ["video_clips"]
+    assert suggest_transforms(["clip.avi"]) == ["video_clips"]
+    assert suggest_transforms(["clip.mov", "clip.webm"]) == ["video_clips"]
+    assert suggest_transforms(["league/game/1_720p.mkv"]) == [
+        "video_clips", "soccernet_events"]
+    assert suggest_transforms(["league/game/video.ini"]) == ["soccernet_events"]
 
 
 # -- discovery surfaces point at the catalog -------------------------------

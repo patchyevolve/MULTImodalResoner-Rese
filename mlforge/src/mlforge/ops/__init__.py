@@ -1,13 +1,13 @@
 """Downstream model operations — evaluate / export / package / infer /
 model import (build step 11; 13 §11, §6.7–§6.10, 12 §15.3–§15.4).
 
-All five are pluggable-harness surfaces: the identity, contract,
-comparability, and fail-closed machinery is real; the measurement /
-execution / format-binary engines are deterministic scaffolds labeled
-`harness: scaffold` in every output. Like `ScaffoldTrainer`, they are
-harness code — never deliverables (the trainer's fail-closed default in
-`mlforge.runtime.trainer` is the rule, not the exception) — and they
-replace wholesale at integration.
+All five are pluggable-harness surfaces (12 §12.4): the identity,
+contract, comparability, and fail-closed machinery is real; the
+measurement / execution / format-binary ENGINES are real by default
+(`mlforge.ops.engines` — family engines over the model's own weights).
+The deterministic scaffolds remain behind the same `MLFORGE_HARNESS=1`
+opt-in as `ScaffoldTrainer` — honest harness code for system tests,
+labeled `harness: scaffold`, never deliverables.
 """
 
 from mlforge.ops.bundle import (
@@ -18,6 +18,13 @@ from mlforge.ops.bundle import (
     list_bundles,
     load_bundle,
     write_bundle,
+)
+from mlforge.ops.engines import (
+    availability_error as engine_availability_error,
+    build_engine,
+    harness_active,
+    load_weights,
+    registered_models as registered_engine_models,
 )
 from mlforge.ops.evaluation import (
     DEFAULT_METRIC_NAMES,
@@ -62,6 +69,7 @@ from mlforge.ops.infer import (
     OUTPUTS_DIR,
     OUTPUT_SCHEMA,
     check_input,
+    execute_engine,
     execute_scaffold,
     load_output,
     output_dir,
@@ -85,6 +93,7 @@ __all__ = [
     "SPEC_FILE",
     "WEIGHTS_FILE",
     "build_bundle",
+    "build_engine",
     "build_evaluation",
     "build_export",
     "build_protocol",
@@ -92,9 +101,12 @@ __all__ = [
     "comparability_groups",
     "component_integrity",
     "contract_source_dir",
+    "engine_availability_error",
     "evaluation_dir",
+    "execute_engine",
     "execute_scaffold",
     "export_dir",
+    "harness_active",
     "harness_code_hash",
     "latest_evaluation",
     "latest_export",
@@ -106,11 +118,13 @@ __all__ = [
     "load_export",
     "load_model_spec",
     "load_output",
+    "load_weights",
     "model_entry_hash",
     "numerical_validation",
     "output_dir",
     "protocol_hash",
     "read_package",
+    "registered_engine_models",
     "required_operators",
     "scaffold_contract",
     "scaffold_metrics",

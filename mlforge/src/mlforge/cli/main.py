@@ -1824,7 +1824,8 @@ def _print_eval_preview(model_ref: str, rec: dict) -> None:
     print(f"  Environment   {_short_hash(rec['environment_hash'])}")
     print("  Protocol")
     print(f"    split        {proto['split']}")
-    print(f"    metrics      {', '.join(DEFAULT_METRIC_NAMES)} "
+    metric_names = ", ".join(rec.get("metrics") or DEFAULT_METRIC_NAMES)
+    print(f"    metrics      {metric_names} "
           f"(definitions {_short_hash(proto['metric_definitions'])})")
     print(f"    aggregation  {proto['aggregation']}")
     print(f"    thresholds   iou={thr['iou']} conf={thr['conf']}")
@@ -1900,7 +1901,15 @@ def _print_comparison(data: dict) -> None:
         ev = col.get("evaluation")
         return pick(ev) if ev is not None else missing
 
-    ordered: list[str] = list(DEFAULT_METRIC_NAMES)
+    # Metric rows: the protocols' own metric names (a real engine's
+    # family metrics show up here; scaffold columns keep mAP/AP50 first).
+    ordered: list[str] = [
+        name for name in DEFAULT_METRIC_NAMES
+        if any(name in (c["evaluation"] or {}).get("metrics", {})
+               for c in cols if c.get("evaluation"))
+    ]
+    if not ordered and not any(c.get("evaluation") for c in cols):
+        ordered = list(DEFAULT_METRIC_NAMES)  # no evaluations yet
     for col in cols:
         for name in (col.get("evaluation") or {}).get("metrics", {}):
             if name not in ordered:

@@ -43,7 +43,7 @@ from mlforge.errors import (
     RunAlreadyExecuting,
     ValidationBlock,
 )
-from mlforge.hashing import content_hash
+from mlforge.hashing import content_hash, content_hash_bytes
 from mlforge.ids import (
     new_bundle_id,
     new_eval_id,
@@ -84,6 +84,7 @@ from mlforge.ops import (
     comparability_groups as _comparability_groups,
     component_integrity,
     contract_source_dir,
+    execute_engine,
     execute_scaffold,
     latest_evaluation,
     latest_export as _latest_export,
@@ -102,6 +103,7 @@ from mlforge.ops import (
     write_export,
     write_output,
 )
+from mlforge.ops.engines import build_engine, harness_active, load_weights
 from mlforge.planner import (
     PLAN_FILENAME,
     Capabilities,
@@ -1649,9 +1651,18 @@ class WorkflowAPI:
 
     def _resolve_eval_dataset(self, ref: str) -> dict[str, Any]:
         """Registered + re-hashed dataset for evaluation (13 §7: not
-        resolved → exit 2; content changed since registration → BLOCK)."""
+        resolved → exit 2; content changed since registration → BLOCK).
+
+        Two source forms, both verified against the registered identity:
+          * prepared store artifacts (`mlforge prepare` output) — the
+            store's verified bytes provide the RECORDS the metric
+            engine runs over; no machine path is needed;
+          * path-registered datasets (`mlforge dataset add`) — the tree
+            is re-hashed on disk (content drift ⇒ BLOCK, 13 §5.2).
+        """
         from mlforge.ingest import config as ingest_config
         from mlforge.ingest.identity import full_ref, parse_ref, recompute_identity
+        from mlforge.store import ContentStore
 
         name, version = parse_ref(ref)
         reg_path = self.root / "datasets" / name / "identity.json"
@@ -1671,22 +1682,50 @@ class WorkflowAPI:
                 f"{ref}: registered version {reg_version!r} != {version!r} "
                 "(versions are identity, never reinterpreted)",
             )
+        identity = str(reg.get("identity") or "")
+        store = ContentStore(self.root / "store")
+        if identity and store.contains(identity):
+            # Prepared artifact: verified store bytes → records (the
+            # engine runs over THESE — never over an unresolved path).
+            try:
+                doc = json.loads(store.get_bytes(identity, verify=True)
+                                 .decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise ValidationBlock(
+                    f"{ref}: prepared store artifact is unreadable "
+                    f"({exc})") from exc
+            if not isinstance(doc, dict):
+                raise ValidationBlock(
+                    f"{ref}: prepared store artifact must be a JSON object")
+            transform = (doc.get("transform") or {}).get("name")
+            return {
+                "name": name,
+                "version": version,
+                "ref": full_ref(name, version),
+                "identity": identity,
+                "path": ingest_config.load_paths(self.root).get(name),
+                "records": doc.get("records") or [],
+                "transform": str(transform) if transform else None,
+            }
         paths = ingest_config.load_paths(self.root)
         path = paths.get(name)
         if not path:
             raise ValidationBlock(
-                f"{name}: no machine-local path configured",
-                hint=f"mlforge dataset add {name} <PATH> (paths are explicit, "
-                     "never discovered — 12 §6.3)",
+                f"{name}: neither a prepared store artifact (identity "
+                f"{identity or '<unset>'} not in the store) nor a "
+                "machine-local path is configured",
+                hint=f"mlforge prepare <MODEL> (store-backed prepared "
+                     f"artifact) or mlforge dataset add {name} <PATH> — "
+                     "paths are explicit, never discovered (12 §6.3)",
             )
-        identity, _manifest = recompute_identity(
+        identity_disk, _manifest = recompute_identity(
             path, name, version, schema=reg.get("schema")
         )
         registered = reg.get("identity")
-        if registered and identity != registered:
+        if registered and identity_disk != registered:
             raise ValidationBlock(
                 f"{name}: dataset content changed since registration "
-                f"(registered {registered}, found {identity})",
+                f"(registered {registered}, found {identity_disk})",
                 hint="re-register explicitly with `mlforge dataset add "
                      "--force` — never silently reinterpret identity (13 §5.2)",
             )
@@ -1694,8 +1733,10 @@ class WorkflowAPI:
             "name": name,
             "version": version,
             "ref": full_ref(name, version),
-            "identity": identity,
+            "identity": identity_disk,
             "path": path,
+            "records": None,
+            "transform": None,
         }
 
     def _scan_model_sources(self, entry: dict[str, Any]) -> list[str]:
@@ -1720,6 +1761,19 @@ class WorkflowAPI:
             findings.extend(scan_for_secrets(d))
         return findings
 
+    def _semantic_for(self, entry: dict[str, Any]) -> dict[str, Any] | None:
+        """The run's semantic identity for engine contract/metrics —
+        None when the model has no run (import-origin) or its run spec
+        is gone from this workspace (engines fall back to spec
+        defaults)."""
+        run_id = entry.get("run_id")
+        if not run_id:
+            return None
+        try:
+            return dict(self._run_spec(str(run_id)).semantic)
+        except MlforgeError:
+            return None
+
     def _prepare_evaluation(
         self,
         model_ref: str,
@@ -1727,13 +1781,42 @@ class WorkflowAPI:
         protocol_overrides: Mapping[str, Any] | None,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         """Resolve + build the record WITHOUT writing (deterministic —
-        the previewed numbers are exactly what gets recorded)."""
+        the previewed numbers are exactly what gets recorded).
+
+        Real engines (default): the family engine loads the model's
+        weights and measures ITS metric set over the resolved dataset.
+        `MLFORGE_HARNESS=1`: the deterministic scaffold harness (12
+        §12.4) — same five-component identity, stand-in numbers."""
         from mlforge.ingest.transforms import env_fingerprint
 
         entry = self._model_for_ops(model_ref)
         dataset = self._resolve_eval_dataset(dataset_ref)
+        if harness_active():
+            protocol = build_protocol(
+                dict(protocol_overrides) if protocol_overrides else None
+            )
+            record = build_evaluation(
+                eval_id="",
+                model_entry=entry,
+                dataset_hash=dataset["identity"],
+                dataset_ref=dataset["ref"],
+                code_hash=source_tree_hash(),
+                environment_hash=env_fingerprint(),
+                protocol=protocol,
+            )
+            return entry, record
+        engine = build_engine(str(entry.get("name")))
+        weights = load_weights(self.root, entry)
         protocol = build_protocol(
-            dict(protocol_overrides) if protocol_overrides else None
+            dict(protocol_overrides) if protocol_overrides else None,
+            metric_names=engine.metric_names(),
+        )
+        metrics = engine.compute_metrics(
+            entry=entry,
+            weights=weights,
+            dataset=dataset,
+            protocol=protocol,
+            semantic=self._semantic_for(entry),
         )
         record = build_evaluation(
             eval_id="",
@@ -1743,6 +1826,8 @@ class WorkflowAPI:
             code_hash=source_tree_hash(),
             environment_hash=env_fingerprint(),
             protocol=protocol,
+            metrics=metrics,
+            harness=engine.FAMILY,
         )
         return entry, record
 
@@ -1846,7 +1931,10 @@ class WorkflowAPI:
 
     def export_model(self, model_ref: str, fmt: str) -> dict[str, Any]:
         """EXPORT (13 §6.9): contract → operator validation → immutable
-        export artifact with its own identity."""
+        export artifact with its own identity. Real engines (default)
+        produce genuine format bytes + a real numerical round-trip;
+        `MLFORGE_HARNESS=1` keeps the honest scaffold (identity +
+        contract, never a fake binary — 12 §12.4)."""
         entry = self._model_for_ops(model_ref)
         if fmt not in EXPORT_FORMATS:
             # Guard BEFORE any contract work: an unknown format must give
@@ -1862,8 +1950,26 @@ class WorkflowAPI:
                 hint="BLOCK export (13 §7) — remove the secret material and "
                      "re-register; secrets never enter artifacts (12 §16)",
             )
+        engine = None
+        weights: bytes | None = None
+        if not harness_active():
+            # Real path: capable engine first (unknown family / missing
+            # toolchain ⇒ honest refusal naming it), then real weights —
+            # never random init, never partial bytes (13 §7).
+            engine = build_engine(str(entry.get("name")))
+            weights = load_weights(self.root, entry)
+            err = engine.supports_format(fmt)
+            if err:
+                raise PreconditionFailed(
+                    f"cannot export {entry.get('name')}:"
+                    f"{entry.get('version')} to {fmt} — {err}",
+                    hint="exports are gated on a real converter (13 §6.9); "
+                         "no partial export exists (13 §7)",
+                )
         # contract: reuse the existing one (operators/schema are the
-        # model's), retarget the runtime; else build the scaffold contract
+        # model's), retarget the runtime; else build it for the first
+        # export (scaffold contract under harness, family-real contract
+        # otherwise — 12 §15.3).
         existing_dir = contract_source_dir(self.root, entry)
         if existing_dir is not None:
             model_spec = load_model_spec(self.root, entry)
@@ -1875,9 +1981,41 @@ class WorkflowAPI:
             }
             model_spec = {**model_spec, "inference_contract": contract}
             _required_operators(model_spec)  # fail-closed: list must exist
+        elif engine is not None:
+            model_spec = engine.contract(
+                entry, fmt, semantic=self._semantic_for(entry)
+            )
         else:
             model_spec = scaffold_contract(entry, fmt)
         validations = validate_export(model_spec, fmt)  # BLOCKs unknown fmt/ops
+        payload: dict[str, Any] | None = None
+        binary: tuple[str, bytes] | None = None
+        if engine is None:
+            numerical = numerical_validation(
+                model_spec, model_entry_hash(entry), fmt
+            )
+        else:
+            assert weights is not None
+            binary, numerical = engine.export_bytes(
+                entry=entry, weights=weights, fmt=fmt
+            )
+            if numerical.get("result") != "PASS":
+                raise ValidationBlock(
+                    f"numerical validation FAILED for {fmt}: max_error "
+                    f"{numerical.get('max_error')} >= tolerance "
+                    f"{numerical.get('tolerance')} — the graph and the "
+                    "model disagree beyond tolerance",
+                    hint="no partial export (13 §7) — the binary is "
+                         "written only after a passing round-trip "
+                         "(13 §6.9)",
+                )
+            payload = {
+                "artifact_hash": entry.get("artifact_hash"),
+                "binary_bytes": len(binary),
+                "binary_hash": content_hash_bytes(binary),
+                "note": f"{fmt} binary written by the real "
+                        f"{engine.FAMILY} exporter",
+            }
         record = build_export(
             export_id=new_export_id(),
             model_entry=entry,
@@ -1885,12 +2023,12 @@ class WorkflowAPI:
             model_spec=model_spec,
             fmt=fmt,
             validations=validations,
-            numerical=numerical_validation(
-                model_spec, model_entry_hash(entry), fmt
-            ),
+            numerical=numerical,
+            harness=engine.FAMILY if engine is not None else "scaffold",
+            payload=payload,
         )
         record["created_ts"] = time.time()
-        write_export(self.root, record)
+        write_export(self.root, record, binary=binary)
         self._record_consumption(
             str(entry["model_id"]),
             "record_export",
@@ -1959,16 +2097,37 @@ class WorkflowAPI:
 
     def infer_model(self, model_ref: str, input_path: str) -> dict[str, Any]:
         """ONE-SHOT INFER (13 §6.8): contract check → input schema check
-        → scaffold execution → output artifact with its own identity."""
+        → execution → output artifact with its own identity. Real
+        engines run by default (contract → family execution over the
+        model's own weights); `MLFORGE_HARNESS=1` selects the honest
+        scaffold (12 §12.4)."""
         entry = self._model_for_ops(model_ref)
         model_spec = load_model_spec(self.root, entry)  # no contract ⇒ BLOCK
         checked = check_input(model_spec, input_path)  # violations ⇒ BLOCK
-        record = execute_scaffold(
-            output_id=new_output_id(),
-            model_entry=entry,
-            contract_doc=model_spec,
-            checked=checked,
-        )
+        if harness_active():
+            record = execute_scaffold(
+                output_id=new_output_id(),
+                model_entry=entry,
+                contract_doc=model_spec,
+                checked=checked,
+            )
+        else:
+            engine = build_engine(str(entry.get("name")))
+            weights = load_weights(self.root, entry)
+            result = engine.execute(
+                entry=entry,
+                contract_doc=model_spec,
+                checked=checked,
+                weights=weights,
+            )
+            record = execute_engine(
+                output_id=new_output_id(),
+                model_entry=entry,
+                contract_doc=model_spec,
+                checked=checked,
+                result=result,
+                harness=engine.FAMILY,
+            )
         record["created_ts"] = time.time()
         write_output(self.root, record)
         self._journal("model", str(entry["model_id"])).append(
@@ -2005,6 +2164,24 @@ class WorkflowAPI:
         tmp = spec_path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(spec, indent=2, sort_keys=True), encoding="utf-8")
         tmp.replace(spec_path)
+        # The registry stores the weights it hashes — infer/export load
+        # them from here (12 §15.3 package file family; a model whose
+        # weights are only at some external path is not verifiable).
+        from mlforge.ops.importing import WEIGHTS_FILE
+        from mlforge.hashing import file_hash as _file_hash
+
+        src = Path(path) / WEIGHTS_FILE
+        dest = d / WEIGHTS_FILE
+        dest_tmp = dest.with_name(dest.name + ".tmp")
+        dest_tmp.write_bytes(src.read_bytes())
+        dest_tmp.replace(dest)
+        if _file_hash(str(dest)) != str(weights["artifact_hash"]):
+            raise ValidationBlock(
+                f"imported weights copy does not match the hashed "
+                f"package weights ({WEIGHTS_FILE})",
+                hint="the registry re-verifies every weight it stores "
+                     "(12 §15.3) — re-import the package",
+            )
         self._journal("model", model_id).append(
             "model_imported",
             action="import",

@@ -25,10 +25,12 @@ is there".
 
 from __future__ import annotations
 
+import configparser
 import csv
 import inspect
 import io
 import json
+import math
 import platform
 import re
 import sys
@@ -951,6 +953,428 @@ def calibration(sources: list[ResolvedSource]) -> dict[str, Any]:
     return {"output_schema": "calibration.v1", "records": records}
 
 
+# ---------------------------------------------------------------------------
+# video_clips — bounded decode probe for video files + canonical re-hash of
+# COCO sidecars (02_dataset_preparation §11 custom clips, §8 Celeb-DF++,
+# §9 FaceForensics++; §15 quality checks: "All clips play without errors",
+# "Annotations in COCO format")
+# ---------------------------------------------------------------------------
+
+#: Container suffixes that carry video (02 §11 clip collections; §8/§9
+#: datasets ship .mp4/.mkv mixes). Module scope so the probe, the
+#: validation hint and the suggestion table can never disagree.
+_VIDEO_SUFFIXES = frozenset({".mp4", ".mkv", ".avi", ".mov", ".webm",
+                             ".mpeg", ".mpg"})
+#: Bounded decode sample: enough frames to prove the file actually plays,
+#: never a full decode (a 2-hour broadcast must not dominate `prepare`).
+_PROBE_VIDEO_FRAMES = 8
+#: One reason every decode failure blocks — 02 §15, verbatim.
+_CLIP_PLAY_HINT = ("clips must play without errors "
+                   "(02_dataset_preparation §15) — re-encode the file or "
+                   "drop it from the source")
+
+
+def _probe_video_av(path: Path, label: str) -> dict[str, Any]:
+    """PyAV probe: container metadata + a bounded decode sample.
+
+    PyAV is the sanctioned decoder (01_pre_training_preparation §2.2,
+    line 75: `pip install av`); opencv-python-headless is the fallback."""
+    import av
+
+    try:
+        with av.open(str(path)) as container:
+            stream = next(
+                (s for s in container.streams if s.type == "video"), None)
+            if stream is None:
+                raise ValidationBlock(
+                    f"video_clips: {label} has no video stream",
+                    hint=_CLIP_PLAY_HINT,
+                )
+            meta = {
+                "codec": (stream.codec_context.name
+                          if stream.codec_context is not None else None),
+                "width": int(stream.width or 0),
+                "height": int(stream.height or 0),
+                "fps": (round(float(stream.average_rate), 3)
+                        if stream.average_rate else None),
+                "duration_s": (round(container.duration / av.time_base, 3)
+                               if container.duration else None),
+                "frames": int(stream.frames) if stream.frames else None,
+                "decoder": "av",
+            }
+            decoded = 0
+            # `streams=` takes absolute stream indices (never type hints)
+            for _frame in container.decode(streams=[stream.index]):
+                decoded += 1
+                if decoded >= _PROBE_VIDEO_FRAMES:
+                    break
+    except (av.FFmpegError, OSError) as exc:  # corrupt/undecodable ⇒ block
+        raise ValidationBlock(
+            f"video_clips: {label} does not play — {exc}",
+            hint=_CLIP_PLAY_HINT,
+        ) from exc
+    if decoded == 0:
+        raise ValidationBlock(
+            f"video_clips: {label} decoded 0 frames — nothing to train on",
+            hint=_CLIP_PLAY_HINT,
+        )
+    return meta
+
+
+def _probe_video_cv2(path: Path, label: str) -> dict[str, Any]:
+    """OpenCV fallback probe — used only when PyAV is not importable
+    (01 §2.2: opencv-python-headless is the sanctioned video I/O dep)."""
+    import cv2
+
+    cap = cv2.VideoCapture(str(path))
+    try:
+        if not cap.isOpened():
+            raise ValidationBlock(
+                f"video_clips: {label} does not play — cv2 cannot open it",
+                hint=_CLIP_PLAY_HINT,
+            )
+        fps_raw = cap.get(cv2.CAP_PROP_FPS)
+        fourcc = int(cap.get(cv2.CAP_PROP_FOURCC) or 0)
+        codec = "".join(chr((fourcc >> (8 * i)) & 0xFF)
+                        for i in range(4)).strip() or None
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        meta = {
+            "codec": codec,
+            "width": int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0),
+            "height": int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0),
+            "fps": round(float(fps_raw), 3) if fps_raw else None,
+            # cv2 exposes no container duration — never invented
+            "duration_s": None,
+            "frames": total or None,
+            "decoder": "cv2",
+        }
+        decoded = 0
+        while decoded < _PROBE_VIDEO_FRAMES:
+            ok, _frame = cap.read()
+            if not ok:
+                break
+            decoded += 1
+    except ValidationBlock:
+        raise
+    except Exception as exc:  # cv2.error / OS failures ⇒ fail-closed
+        raise ValidationBlock(
+            f"video_clips: {label} does not play — {exc}",
+            hint=_CLIP_PLAY_HINT,
+        ) from exc
+    finally:
+        cap.release()
+    if decoded == 0:
+        raise ValidationBlock(
+            f"video_clips: {label} decoded 0 frames — nothing to train on",
+            hint=_CLIP_PLAY_HINT,
+        )
+    return meta
+
+
+def _video_probe(path: Path, label: str) -> dict[str, Any]:
+    """Probe with PyAV first; opencv only if PyAV is NOT importable;
+    neither ⇒ PreconditionFailed naming the sanctioned install (01 §75)."""
+    try:
+        import av  # noqa: F401  — availability check only
+    except ImportError:
+        pass
+    else:
+        return _probe_video_av(path, label)
+    try:
+        import cv2  # noqa: F401
+    except ImportError as exc:
+        raise PreconditionFailed(
+            "video_clips needs a video decoder — neither PyAV nor opencv "
+            "is importable",
+            hint="pip install av — video decoding dependency "
+                 "(01_pre_training_preparation §2.2, line 75)",
+        ) from exc
+    return _probe_video_cv2(path, label)
+
+
+def video_clips(sources: list[ResolvedSource]) -> dict[str, Any]:
+    """Videos → decode-proved clip probes; COCO `.json` sidecars →
+    canonical re-hash (02_dataset_preparation §11 custom clips, §8
+    Celeb-DF++, §9 FaceForensics++; §15: "All clips play without errors",
+    "Annotations in COCO format").
+
+    Every candidate video is probed for container metadata and a BOUNDED
+    sample (≤8 frames) is really decoded — a file that opens but does not
+    play BLOCKs with a named reason (never a silent skip). `.json`
+    sidecars must parse (and, when they look like COCO, carry list-valued
+    `images`/`annotations`) — parsing is proven by the canonical re-hash,
+    exactly like `coco_detection`; referenced image files need not exist
+    yet (materialization resolves them later). The split comes from the
+    source ref — a clip tree never invents one. A source with neither a
+    video nor a sidecar BLOCKs with the accepted extensions, so an empty
+    or mispointed path can never pass as a prepared dataset."""
+    records: list[dict[str, Any]] = []
+    annotations: list[dict[str, Any]] = []
+    for src in sources:
+        videos = 0
+        sidecars = 0
+        for entry in src.entries:
+            suffix = Path(entry.relative_path).suffix.lower()
+            label = f"{src.ref}:{entry.relative_path}"
+            base: dict[str, Any] = {
+                "source": src.ref,
+                "split": src.split,
+                "relative_path": entry.relative_path,
+                "sha256": entry.sha256,
+                "size": entry.size,
+            }
+            if suffix in _VIDEO_SUFFIXES:
+                videos += 1
+                records.append({
+                    **base,
+                    "video": _video_probe(
+                        src.path / entry.relative_path, label),
+                })
+            elif suffix == ".json":
+                sidecars += 1
+                raw = (src.path / entry.relative_path).read_text(
+                    encoding="utf-8")
+                try:
+                    parsed = json.loads(raw)
+                except json.JSONDecodeError as exc:
+                    raise ValidationBlock(
+                        f"annotation does not parse as JSON: {label}: {exc}",
+                        hint="annotations must be COCO-format JSON "
+                             "(02_dataset_preparation §11, §15)",
+                    ) from exc
+                if (isinstance(parsed, dict) and "images" in parsed
+                        and "annotations" in parsed):
+                    if (not isinstance(parsed["images"], list)
+                            or not isinstance(parsed["annotations"], list)):
+                        raise ValidationBlock(
+                            f"{label}: COCO annotation shape invalid — "
+                            "`images` and `annotations` must both be lists",
+                            hint="annotations in COCO format "
+                                 "(02_dataset_preparation §11, §15)",
+                        )
+                records.append(base)
+                annotations.append({
+                    "source": src.ref,
+                    "relative_path": entry.relative_path,
+                    "canonical_sha256": content_hash(parsed),
+                })
+        if videos == 0 and sidecars == 0:
+            raise ValidationBlock(
+                f"video_clips: no video files and no COCO annotation .json "
+                f"in {src.ref}",
+                hint=f"accepted video extensions: "
+                     f"{', '.join(sorted(_VIDEO_SUFFIXES))}, or COCO "
+                     "annotation .json — `mlforge dataset types` lists the "
+                     "other transforms",
+            )
+    return {
+        "output_schema": "video_clips.v1",
+        "records": records,
+        "annotations": annotations,
+    }
+
+
+# ---------------------------------------------------------------------------
+# soccernet_events — SoccerNet v2 action spotting (02_dataset_preparation
+# §7: league/season/game layout with Labels-v2.json, video.ini,
+# Labels-cameras.json; §15: "Labels-v2.json parseable for all 500 games")
+# ---------------------------------------------------------------------------
+
+#: The 17 action classes, verbatim from 02_dataset_preparation §7 —
+#: a label outside this set is a spec violation, never silently dropped.
+_SOCCERNET_CLASSES: tuple[str, ...] = (
+    "Penalty", "Kick-off", "Goal", "Substitution", "Offside",
+    "Shots on target", "Shots off target", "Clearance",
+    "Ball out of play", "Throw-in", "Foul", "Indirect free-kick",
+    "Direct free-kick", "Corner", "Yellow card", "Red card",
+    "Yellow→red card",
+)
+_SOCCERNET_LABELS = "Labels-v2.json"
+_SOCCERNET_CAMERAS = "Labels-cameras.json"
+_SOCCERNET_INI = "video.ini"
+#: The three artifacts that identify a SoccerNet tree (02 §7) — a source
+#: holding none of them is not SoccerNet data and must not be "prepared".
+_SOCCERNET_ARTIFACTS = frozenset(
+    {_SOCCERNET_LABELS, _SOCCERNET_CAMERAS, _SOCCERNET_INI})
+
+
+def _parse_labels_v2(raw: str, label: str) -> list[Any]:
+    """Strict parse of one Labels-v2.json → its annotation objects
+    (02 §15: parseable for all 500 games; §7 for the expected shape)."""
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValidationBlock(
+            f"{label}: Labels-v2.json does not parse as JSON: {exc}",
+            hint="02_dataset_preparation §15 — Labels-v2.json must be "
+                 "parseable for all 500 games",
+        ) from exc
+    if not isinstance(parsed, dict) or not isinstance(
+            parsed.get("annotations"), list):
+        raise ValidationBlock(
+            f"{label}: expected an object with an `annotations` list of "
+            f'{{"position": <ms>, "label": <class>}} entries, got '
+            f"{type(parsed).__name__}",
+            hint='SoccerNet Labels-v2.json shape: {"annotations": '
+                 '[{"position": <number ms>, "label": <class str>}, ...]} '
+                 "(02_dataset_preparation §7)",
+        )
+    return parsed["annotations"]
+
+
+def _validate_action(
+    index: int, action: Any, label: str,
+) -> tuple[float, str]:
+    """One annotation → (position_ms, label) or a named ValidationBlock."""
+    where = f"{label}: annotation {index}"
+    if not isinstance(action, dict):
+        raise ValidationBlock(
+            f"{where} must be a JSON object, got {type(action).__name__}")
+    position = action.get("position")
+    if isinstance(position, bool) or not isinstance(position, (int, float)):
+        raise ValidationBlock(
+            f"{where}: `position` must be a number of milliseconds, "
+            f"got {position!r}",
+            hint="02_dataset_preparation §7 — action spots are "
+                 "`position` timestamps in ms",
+        )
+    if not math.isfinite(position):
+        raise ValidationBlock(
+            f"{where}: `position` must be finite, got {position!r}")
+    name = action.get("label")
+    if not isinstance(name, str):
+        raise ValidationBlock(
+            f"{where}: `label` must be a string, got {name!r}")
+    if name not in _SOCCERNET_CLASSES:
+        raise ValidationBlock(
+            f"{label}: unknown action label {name!r} — the 17 SoccerNet "
+            f"classes are: {', '.join(_SOCCERNET_CLASSES)}",
+            hint="02_dataset_preparation §7 lists the exact class set — "
+                 "unknown labels never pass (fail-closed)",
+        )
+    return float(position), name
+
+
+def _parse_video_ini(raw: str, label: str) -> dict[str, dict[str, str]]:
+    """video.ini → {section: {key: value}} with raw string values
+    (02 §7: start/duration per half must be readable)."""
+    parser = configparser.ConfigParser(interpolation=None)
+    parser.optionxform = str  # keys stay raw — no case folding
+    try:
+        parser.read_string(raw)
+    except configparser.Error as exc:
+        raise ValidationBlock(
+            f"{label}: video.ini does not parse: {exc}",
+            hint="02_dataset_preparation §7 — video.ini carries "
+                 "start/duration per half and must be readable",
+        ) from exc
+    return {name: dict(parser[name]) for name in parser.sections()}
+
+
+def soccernet_events(sources: list[ResolvedSource]) -> dict[str, Any]:
+    """SoccerNet v2 → action-spot events + one per-game summary record
+    (02_dataset_preparation §7 directory layout, Labels-v2.json,
+    video.ini, Labels-cameras.json; §15 "Labels-v2.json parseable for
+    all 500 games").
+
+    Only the three named artifacts are parsed: the 17-class check is
+    exact (§7 — unknown labels BLOCK, never dropped), positions must be
+    finite numbers of milliseconds, and video.ini must be readable.
+    Labels-cameras.json is strictly parsed and canonically re-hashed but
+    its INTERNAL camera schema is not validated — the spec names no
+    schema for the 13 transition types (§7 table), so guessing one would
+    be a guess. Videos and `.npy` features ride along as byte-provenance
+    records only: decoding belongs to `video_clips`, and SoccerNet ships
+    as "features + labels" (§13 budget) with videos behind an NDA — no
+    numpy import here (stdlib only). A source with no recognized
+    artifact at all BLOCKs with the §7 layout instead of silently
+    "preparing" an unrelated tree."""
+    records: list[dict[str, Any]] = []
+    for src in sources:
+        recognized = 0
+        for entry in src.entries:
+            relative = entry.relative_path
+            name = Path(relative).name
+            suffix = Path(relative).suffix.lower()
+            base: dict[str, Any] = {
+                "source": src.ref,
+                "split": src.split,
+                "relative_path": relative,
+                "sha256": entry.sha256,
+                "size": entry.size,
+            }
+            if name in _SOCCERNET_ARTIFACTS:
+                recognized += 1
+            if name == _SOCCERNET_LABELS:
+                label = f"{src.ref}:{relative}"
+                actions = _parse_labels_v2(
+                    (src.path / relative).read_text(encoding="utf-8"), label)
+                validated = [
+                    _validate_action(i, action, label)
+                    for i, action in enumerate(actions)
+                ]
+                game = relative[: -len(_SOCCERNET_LABELS)].rstrip("/")
+                for position, action_label in validated:
+                    records.append({
+                        **base,
+                        "kind": "action_spot",
+                        "game": game,
+                        "position_ms": position,
+                        "label": action_label,
+                    })
+                records.append({
+                    **base,
+                    "kind": "game",
+                    "game": game,
+                    "events": len(validated),
+                    "classes": sorted({a for _, a in validated}),
+                })
+            elif name == _SOCCERNET_INI:
+                records.append({
+                    **base,
+                    "kind": "video_ini",
+                    "sections": _parse_video_ini(
+                        (src.path / relative).read_text(encoding="utf-8"),
+                        f"{src.ref}:{relative}"),
+                })
+            elif name == _SOCCERNET_CAMERAS:
+                label = f"{src.ref}:{relative}"
+                raw = (src.path / relative).read_text(encoding="utf-8")
+                try:
+                    parsed = json.loads(raw)
+                except json.JSONDecodeError as exc:
+                    raise ValidationBlock(
+                        f"camera labels do not parse as JSON: {label}: {exc}",
+                        hint="02_dataset_preparation §7 — "
+                             "Labels-cameras.json ships with every game",
+                    ) from exc
+                camera: dict[str, Any] = {
+                    **base,
+                    "kind": "camera_labels",
+                    "canonical_sha256": content_hash(parsed),
+                }
+                if (isinstance(parsed, dict)
+                        and isinstance(parsed.get("annotations"), list)):
+                    camera["annotations_count"] = len(parsed["annotations"])
+                records.append(camera)
+            elif suffix in _VIDEO_SUFFIXES:
+                records.append({**base, "kind": "video_file"})
+            elif suffix == ".npy":
+                records.append({**base, "kind": "features"})
+            else:
+                records.append({**base, "kind": "file"})
+        if recognized == 0:
+            raise ValidationBlock(
+                f"soccernet_events: no recognized SoccerNet artifact in "
+                f"{src.ref} — no Labels-v2.json, video.ini or "
+                "Labels-cameras.json found",
+                hint="expected SoccerNet layout per 02_dataset_preparation "
+                     "§7: <league>/<season>/<game>/Labels-v2.json "
+                     "(+ video.ini, Labels-cameras.json, *_720p.mkv)",
+            )
+    return {"output_schema": "soccernet_events.v1", "records": records}
+
+
 #: The user-facing catalog — what `mlforge dataset types` prints. Every
 #: `name` MUST be a registered transform (invariant covered by tests).
 DATASET_TYPES: tuple[dict[str, str], ...] = (
@@ -978,13 +1402,19 @@ DATASET_TYPES: tuple[dict[str, str], ...] = (
      "title": "Model predictions",
      "inputs": "prediction .jsonl/.json array {logits|probs, label}",
      "produces": "calibrator rows — temperature + conformal (C5)"},
+    {"name": "video_clips",
+     "title": "Video clips",
+     "inputs": ".mp4 .mkv .avi .mov .webm + COCO .json",
+     "produces": "decoded/validated clip probes + re-hashed COCO sidecars "
+                 "(Celeb-DF++, FF++, custom clips)"},
+    {"name": "soccernet_events",
+     "title": "SoccerNet action spotting",
+     "inputs": "SoccerNet Labels-v2.json / video.ini / videos",
+     "produces": "17-class action-spot event records (SoccerNet v2)"},
 )
 
 #: Honest gaps — named so users see them, never faked (fail-closed).
 PLANNED_DATASET_TYPES: tuple[dict[str, str], ...] = (
-    {"name": "video", "title": "Video datasets",
-     "reason": "Celeb-DF++, FaceForensics++, SoccerNet, custom clips — "
-               "needs a frame/decode reader (later build step)"},
     {"name": "audio", "title": "Audio datasets",
      "reason": "AudioSet — needs feature extraction (later build step)"},
     {"name": "generated", "title": "Generated sources",
@@ -1010,6 +1440,9 @@ _EXT_TRANSFORMS: dict[str, tuple[str, ...]] = {
     ".csv": ("mot_challenge", "tabular"),
     ".tsv": ("tabular",), ".jsonl": ("tabular", "calibration"),
     ".ndjson": ("tabular", "calibration"), ".xlsx": ("tabular",),
+    ".mp4": ("video_clips",), ".mkv": ("video_clips", "soccernet_events"),
+    ".avi": ("video_clips",), ".mov": ("video_clips",),
+    ".webm": ("video_clips",), ".ini": ("soccernet_events",),
 }
 _IMG_SUGGEST = frozenset({".jpg", ".jpeg", ".png"})
 
@@ -1047,6 +1480,8 @@ _REGISTRY: dict[str, Callable[[list[ResolvedSource]], dict[str, Any]]] = {
     "reid_crops": reid_crops,
     "tabular": tabular,
     "calibration": calibration,
+    "video_clips": video_clips,
+    "soccernet_events": soccernet_events,
 }
 
 
@@ -1177,8 +1612,10 @@ __all__ = [
     "register_transform",
     "registry_names",
     "run_transform",
+    "soccernet_events",
     "suggest_transforms",
     "tabular",
     "text_corpus",
     "transform_identity",
+    "video_clips",
 ]

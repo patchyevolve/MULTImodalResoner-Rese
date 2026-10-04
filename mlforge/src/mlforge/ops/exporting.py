@@ -7,19 +7,24 @@ contract), 13_product_specification §6.9 (EXPORT sequence), §4.1
 specific operator list, no partial export; secrets → BLOCK).
 
 Design:
-  * the format list and per-format operator sets are CLOSED registries —
-    an unknown format or an operator the target cannot host BLOCKs with
-    the exact names (fail-closed, 13 §7);
+  * the format list is a CLOSED registry (an unknown format BLOCKs with
+    the exact names, 13 §7); operator portability is checked against the
+    per-format hosted set — except `onnx`, whose truth is the ONNX
+    opset itself: required operators are verified against the installed
+    onnx schemas when available (and the real exporter refuses honestly
+    when onnx is missing);
   * the first export of a model BUILDS its inference contract
     (12 §15.3 "The Exported Model Declares How It Must Be Called"); later
     exports reuse the existing contract's operator list so re-exporting
     another format cannot silently change what the graph requires;
   * the export artifact owns its identity (`exports/<exp_...>/` with
     `export.json` + `model_spec.json`) — 13 §6.9 "own artifact identity";
-  * the format BINARY (the real .onnx etc.) is written by the real
-    exporter at integration; this scaffold writes identity, contract,
-    validation results, and a weights reference — honest content, never
-    a fake binary file (like `ScaffoldTrainer`, 12 §12.4).
+  * harness split (12 §12.4): `MLFORGE_HARNESS=1` keeps the honest
+    scaffold (identity + contract + weight reference, NEVER a fake
+    binary, deterministic numerical check labeled `harness: scaffold`);
+    the default path runs the real engine (`mlforge.ops.engines`) which
+    produces genuine format bytes, a family-real contract, and a real
+    numerical round-trip — a FAIL blocks the export (13 §6.9, §7).
 """
 
 from __future__ import annotations
@@ -43,9 +48,13 @@ SCAFFOLD_GRAPH_OPS = frozenset(
 #: Closed export-format registry: opset + hosted operators (13 §4.1
 #: "ONNX / TensorRT / etc."). `tflite` intentionally does NOT host
 #: `non_max_suppression` — the spec's BLOCK row needs a real gap.
+#: `full_opset` formats host every operator their spec defines; their
+#: operator check runs against the installed spec schemas (see
+#: `validate_export`).
 FORMATS: dict[str, dict[str, Any]] = {
     "onnx": {"opset": 17,
-             "ops": frozenset(SCAFFOLD_GRAPH_OPS | {"concat", "slice"})},
+             "ops": frozenset(SCAFFOLD_GRAPH_OPS | {"concat", "slice"}),
+             "full_opset": True},
     "openvino": {"opset": 17,
                  "ops": frozenset(SCAFFOLD_GRAPH_OPS | {"concat"})},
     "tensorrt": {"opset": 17,
@@ -55,6 +64,28 @@ FORMATS: dict[str, dict[str, Any]] = {
     "tflite": {"opset": 17,
                "ops": frozenset(SCAFFOLD_GRAPH_OPS - {"non_max_suppression"})},
 }
+
+
+def _op_key(op: str) -> str:
+    """Operator-name normalization for schema comparison (`Conv` vs the
+    contract's `conv`, `NonMaxSuppression` vs `non_max_suppression`)."""
+    return op.lower().replace("_", "")
+
+
+def _full_opset_ops(fmt: str) -> frozenset[str] | None:
+    """Hosted operator keys for a `full_opset` format — None when the
+    installed spec cannot enumerate them (the exporter itself refuses
+    honestly if the toolchain is missing)."""
+    if not FORMATS[fmt].get("full_opset"):
+        return None
+    try:
+        import onnx.defs  # noqa: F401
+
+        return frozenset(
+            _op_key(s.name) for s in onnx.defs.get_all_schemas()
+        )
+    except Exception:
+        return None
 
 
 def scaffold_contract(
@@ -126,6 +157,9 @@ def validate_export(model_spec: dict[str, Any], fmt: str) -> dict[str, str]:
 
     Unknown format → BLOCK listing the closed registry; unsupported
     operators → BLOCK naming them, never a partial export (13 §7).
+    `full_opset` formats (onnx) check against the installed spec
+    schemas; when the spec is not installed, the check cannot DISPROVE
+    portability and defers to the exporter, which refuses honestly.
     """
     if fmt not in FORMATS:
         raise ValidationBlock(
@@ -133,6 +167,21 @@ def validate_export(model_spec: dict[str, Any], fmt: str) -> dict[str, str]:
             hint=f"formats: {', '.join(sorted(FORMATS))} (13 §4.1)",
         )
     required = required_operators(model_spec)
+    full = _full_opset_ops(fmt)
+    if full is not None:
+        unsupported = sorted(
+            op for op in required if _op_key(op) not in full
+        )
+        if unsupported:
+            raise ValidationBlock(
+                f"operator(s) unknown to the {fmt} spec: "
+                f"{', '.join(unsupported)}",
+                hint="no partial export (13 §7) — the installed onnx "
+                     "schemas are the authority for what ONNX hosts "
+                     "(13 §4.1)",
+            )
+        return {"architecture": "PASS", "operators": "PASS",
+                "dynamic_shapes": "PASS"}
     unsupported = sorted(required - FORMATS[fmt]["ops"])
     if unsupported:
         capable = sorted(
@@ -150,11 +199,11 @@ def validate_export(model_spec: dict[str, Any], fmt: str) -> dict[str, str]:
 
 def numerical_validation(model_spec: dict[str, Any],
                          model_hash: str, fmt: str) -> dict[str, Any]:
-    """Deterministic stand-in for the numerical round-trip check
-    (13 §6.9 "max error ... tolerance ... PASS"). Honest scaffold: the
-    error is derived from the identity hashes and is always within the
-    contract's tolerance; the real exporter's numerical validation
-    replaces this wholesale at integration."""
+    """Scaffold-harness numerical check (`MLFORGE_HARNESS=1`, 12 §12.4)
+    — deterministic stand-in derived from the identity hashes, always
+    within tolerance. The default path runs the real engine's
+    onnxruntime/python round-trip instead (13 §6.9); this function is
+    never called outside the harness branch."""
     import hashlib
 
     contract = model_spec["inference_contract"]
@@ -178,10 +227,22 @@ def build_export(
     fmt: str,
     validations: dict[str, str],
     numerical: dict[str, Any],
+    harness: str = "scaffold",
+    payload: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    """Export record (13 §6.9). Default = honest scaffold payload
+    (weights reference, never a fake binary); the real engines pass the
+    binary's hash + their `harness` label."""
     contract = model_spec["inference_contract"]
     name = model_entry.get("name") or "model"
     version = model_entry.get("version") or "v1"
+    if payload is None:
+        payload = {
+            "artifact_hash": model_entry.get("artifact_hash"),
+            "note": "weights reference — the format binary is written by "
+                    "the real exporter at integration (scaffold writes "
+                    "identity + contract, never a fake binary)",
+        }
     record = {
         "schema_version": EXPORT_SCHEMA,
         "export_id": export_id,
@@ -195,13 +256,8 @@ def build_export(
         "contract_hash": content_hash(contract),
         "validations": validations,
         "numerical_validation": numerical,
-        "payload": {
-            "artifact_hash": model_entry.get("artifact_hash"),
-            "note": "weights reference — the format binary is written by "
-                    "the real exporter at integration (scaffold writes "
-                    "identity + contract, never a fake binary)",
-        },
-        "harness": "scaffold",
+        "payload": payload,
+        "harness": harness,
     }
     record["identity"] = content_hash(
         {
@@ -218,9 +274,27 @@ def export_dir(root: Path, export_id: str) -> Path:
     return Path(root) / EXPORTS_DIR / export_id
 
 
-def write_export(root: Path, record: dict[str, Any]) -> Path:
+def write_export(
+    root: Path,
+    record: dict[str, Any],
+    *,
+    binary: bytes | None = None,
+) -> Path:
+    """Write the export artifact (immutable). Real exports pass the
+    format binary as raw bytes — written FIRST (under the record's own
+    `file_name`), so a failure never leaves a record claiming bytes that
+    do not exist (13 §6.9)."""
     d = export_dir(root, str(record["export_id"]))
     d.mkdir(parents=True, exist_ok=True)
+    if binary is not None:
+        bp = d / str(record["file_name"])
+        if bp.exists():
+            raise ValidationBlock(
+                f"export artifact already exists: {bp} — exports are "
+                "immutable")
+        tmp = bp.with_name(bp.name + ".tmp")
+        tmp.write_bytes(binary)
+        tmp.replace(bp)
     for filename, payload in (
         ("export.json", record),
         ("model_spec.json", record["model_spec"]),
