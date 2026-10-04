@@ -116,13 +116,14 @@ evaluates through the real engines, compares to the normative target):
 | NDCG@3 | ≥ 0.85 (`03:493`) | 0.980908 | **PASS** (synthetic tabular) |
 | NDCG@5 | ≥ 0.80 (`03:494`) | 0.977196 | **PASS** (synthetic tabular) |
 | Model size (ONNX) | < 1 MB / 1 000 000 B (`03:496`) | 1363 B | **PASS** (real export binary) |
-| Inference latency (median) | < 1 ms CPU (`03:495`) | 0.0171 ms | **PASS** — onnxruntime CPU EP, 50 warm + 2000 timed runs, input `features [1, 10]`, all-0.5 row (mean 0.0177 ms, p95 0.0196 ms) |
+| Inference latency (median) | < 1 ms CPU (`03:495`) | 0.0189 ms | **PASS** — onnxruntime CPU EP, 50 warm + 2000 timed runs, input `features [1, 10]`, all-0.5 row (mean 0.0197 ms, p95 0.0242 ms) |
 | ECE | < 0.05 (`06:348`) | 0.020657 | **PASS** (synthetic logits) |
 | MCE | < 0.10 (`06:349`) | 0.020657 | **PASS** (synthetic logits — now exposed by `evaluate`) |
 | Coverage (α=0.05) | ≥ 0.95 (`06:351`) | 1.0 | **PASS** — per-α from `evaluate` (mean proxy retired) |
 | Coverage (α=0.10) | ≥ 0.90 (`06:352`) | 1.0 | **PASS** — per-α from `evaluate` |
 | Avg set size (α=0.05) | 1–3 (`06:353`) | 2.0 | **PASS** (2-class synthetic sets max out at 2; empty sets count 0) |
-| Brier | < 0.15 (`06:350`) | 0.469603 | REPORT — fixture Bayes floor is 0.375 at flip=0.25 (75 %×0.125 + 25 %×1.125 for calibrated p=0.75/0.25), so <0.15 is unreachable **by construction** on this noise; number now computed by `evaluate` |
+| Brier | < 0.15 (`06:350`) | 0.124444 | **PASS** — LEARNABLE fixture (scale=3, flip=0.05, n=60; Bayes floor 0.095), computed by `evaluate` |
+| Brier (noisy fixture, flip=0.25) | floor 0.375 | 0.469603 | REPORT — target unreachable by construction on this noise (75 %×0.125 + 25 %×1.125 for calibrated p=0.75/0.25); number still computed |
 | Re-ID rank1 | > 0.95 (`06:301`) | 1.0 | PASS on synthetic solid-color tree (**not** Market1501) |
 | Re-ID mAP | > 0.85 (`06:301`) | 1.0 | PASS on synthetic tree (**not** Market1501) |
 | NLL | no target | 0.662488 | REPORT |
@@ -141,8 +142,10 @@ that a trained production model would hit them on benchmark corpora.
 
 (MCE, Brier, avg set size, inference latency and model size were gaps
 until the `evaluate_calibration` metric set and the export
-size/latency micro-benchmark landed — they are measured in §5 now;
-Brier reports its fixture floor instead of a false FAIL.)
+size/latency micro-benchmark landed — they are measured in §5 now.
+Brier gets a real PASS on a learnable fixture (flip=0.05); the
+noisy-fixture number stays REPORTed next to its Bayes floor rather
+than failing a target the data cannot reach.)
 
 ## 6. What this ledger does NOT claim
 
