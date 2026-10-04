@@ -19,7 +19,7 @@ are reproducible with the commands given.
 
 | Claim | Status | Evidence |
 |---|---|---|
-| Full unit/integration suite passes | **VERIFIED** | `python -m pytest -q` → exit 0, 777 tests before this ledger, 787 with the golden-metric tests, **808 with the device-placement tests (805 passed + 3 skipped — 92 s)** |
+| Full unit/integration suite passes | **VERIFIED** | `python -m pytest -q` → exit 0, 777 tests before this ledger, 787 with the golden-metric tests, 808 with the device-placement tests (805 passed + 3 skipped — 92 s), **813 with the evaluate_calibration metric tests (810 passed + 3 skipped)** |
 | Device placement contract (`runtime.device`) | **VERIFIED** | `tests/test_device_placement.py` → 19 passed + 2 CUDA-host skips: auto/cpu/cuda resolution, fail-closed refusals (no silent downgrade), preflight `device: cuda` ⇒ GPU probe, CPU-state portable checkpoint bytes |
 | Branch coverage of `src/mlforge` | **VERIFIED** | `python -m coverage run -m pytest` → **82 %** total (11 427 stmts, 1 709 missed, 3 712 branches, 670 partial) |
 | Coverage hot spots (honest low end) | **VERIFIED** | `ops/bundle.py` 49 %, `trainers/rfdetr.py` 48 %, `trainers/reid.py` 75 %, `engines/calibrator.py` 76 %; `machine.py` 100 %, `workflow.py` 90 % |
@@ -33,7 +33,7 @@ python -m coverage report -m
 
 ## 2. Golden-value metric tests (`tests/test_metric_golden.py`)
 
-Ten tests that pin each metric implementation to (a) hand-worked
+Thirteen tests that pin each metric implementation to (a) hand-worked
 arithmetic quoted from the specification and (b) an external oracle
 where one exists.
 
@@ -41,12 +41,15 @@ where one exists.
 |---|---|---|
 | NDCG@3/@5 | `10_training_plan/03_training_pipeline.md:493-494` | hand-worked two-group example (0.946767…, 0.630929…, mean 0.788848…) **and exact agreement with LightGBM's `ndcg@k`** (0.9733838380633502 on a third dataset) |
 | ECE (15 bins) | `06_benchmarking_plan.md:348`, §5 | 0.05960146101105884 vs. hand-computed binning; 2-bin boundary case 0.2589931049810458 |
+| MCE (15 bins) | `06:317`, `06:349` | worst-bin gap 0.11920292202211769 on the ECE rows; 0.5 exact at `n_bins=2` (boundary row present); `mce ≥ ece` invariant |
+| Brier (multiclass) | `06:320`, `06:350` | 0.26420933661861107 hand-worked + numpy one-hot oracle; certain-right → 0.0, certain-wrong → 2.0 |
+| Per-α coverage / avg set size | `06:351-353` | 5 hand-derived rows → 0.2/0.6 coverage and 0.2/0.6 set size at α=0.05/0.10; delivered keys == `metric_names(weights)` in order |
 | NLL | `06:349` (no target) | formula pinned: t=1 → 0.41003759580145893, t=2 → 0.5032044340390841 |
 | Conformal coverage | `06:351-352` | n=99: 95/99 and 90/99 at α=0.05/0.10; n=9 clamps to 1.0 |
 | Re-ID rank metrics | `06:301` | golden rank1=0.5, rank5=1.0, mAP=0.75 incl. same-cam exclusion and junk (`0000`) removal |
 | COCO mAP / AP50 | `06:251`, `06:150` | perfect boxes → 1.0/1.0; IoU 0.57 → mAP 0.2, AP50 1.0 |
 
-Reproduce: `python -m pytest tests/test_metric_golden.py -q` (10 passed).
+Reproduce: `python -m pytest tests/test_metric_golden.py -q` (13 passed).
 
 ## 3. Mutation testing (mutmut 3.8)
 
@@ -112,8 +115,14 @@ evaluates through the real engines, compares to the normative target):
 |---|---|---|---|
 | NDCG@3 | ≥ 0.85 (`03:493`) | 0.980908 | **PASS** (synthetic tabular) |
 | NDCG@5 | ≥ 0.80 (`03:494`) | 0.977196 | **PASS** (synthetic tabular) |
+| Model size (ONNX) | < 1 MB / 1 000 000 B (`03:496`) | 1363 B | **PASS** (real export binary) |
+| Inference latency (median) | < 1 ms CPU (`03:495`) | 0.0171 ms | **PASS** — onnxruntime CPU EP, 50 warm + 2000 timed runs, input `features [1, 10]`, all-0.5 row (mean 0.0177 ms, p95 0.0196 ms) |
 | ECE | < 0.05 (`06:348`) | 0.020657 | **PASS** (synthetic logits) |
-| Coverage (mean α=0.05/0.10) | ≥ 0.925 proxy for ≥95 %/≥90 % (`06:351-352`) | 1.0 | **PASS** — engine reports the mean, not per-α |
+| MCE | < 0.10 (`06:349`) | 0.020657 | **PASS** (synthetic logits — now exposed by `evaluate`) |
+| Coverage (α=0.05) | ≥ 0.95 (`06:351`) | 1.0 | **PASS** — per-α from `evaluate` (mean proxy retired) |
+| Coverage (α=0.10) | ≥ 0.90 (`06:352`) | 1.0 | **PASS** — per-α from `evaluate` |
+| Avg set size (α=0.05) | 1–3 (`06:353`) | 2.0 | **PASS** (2-class synthetic sets max out at 2; empty sets count 0) |
+| Brier | < 0.15 (`06:350`) | 0.469603 | REPORT — fixture Bayes floor is 0.375 at flip=0.25 (75 %×0.125 + 25 %×1.125 for calibrated p=0.75/0.25), so <0.15 is unreachable **by construction** on this noise; number now computed by `evaluate` |
 | Re-ID rank1 | > 0.95 (`06:301`) | 1.0 | PASS on synthetic solid-color tree (**not** Market1501) |
 | Re-ID mAP | > 0.85 (`06:301`) | 1.0 | PASS on synthetic tree (**not** Market1501) |
 | NLL | no target | 0.662488 | REPORT |
@@ -128,11 +137,12 @@ that a trained production model would hit them on benchmark corpora.
 | Metric | Target | Why |
 |---|---|---|
 | Detection mAP | ≥ 53.0 (`06:251`) | needs COCO val + GPU; verification box has neither. Evidence instead: RF-DETR smoke test + golden COCO mAP test |
-| MCE | < 0.10 (`06:349`) | `evaluate` returns `ece/nll/coverage` only — not exposed by the harness |
-| Brier | < 0.15 (`06:350`) | not exposed by the harness |
-| Avg set size (α=0.05) | 1–3 (`06:353`) | not exposed by the harness |
-| Inference latency / model size | < 1 ms / < 1 MB (`03:495-496`) | no micro-benchmark harness built |
 | Real Market1501 / COCO leaderboard numbers | `06:251`, `06:301` | datasets not present on this host; requires GPU |
+
+(MCE, Brier, avg set size, inference latency and model size were gaps
+until the `evaluate_calibration` metric set and the export
+size/latency micro-benchmark landed — they are measured in §5 now;
+Brier reports its fixture floor instead of a false FAIL.)
 
 ## 6. What this ledger does NOT claim
 

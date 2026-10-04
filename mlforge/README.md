@@ -271,7 +271,9 @@ mlforge/
     `MLFORGE_HARNESS=1` gate as `ScaffoldTrainer` (12 §12.4) with five
     family engines (text `reasoner_s` → perplexity; reid `osnet_x1_0`
     → rank1/rank5/mAP; detection `rf_detr_{s,l,seg_s}` → mAP/AP50 via
-    COCOeval; calibrator → ece/nll/coverage; `hypothesis_ranker` →
+    COCOeval; calibrator → ece/nll/mce/brier + per-α coverage and
+    average set size (`coverage_alpha_05`, `avg_set_size_alpha_10`, … —
+    one pair per fitted conformal alpha, 06 §5); `hypothesis_ranker` →
     ndcg@3/ndcg@5 reusing the trainer's own metric): evaluate computes
     the family's metrics over store-backed prepared records with split
     discipline (train/holdout rows are never eval rows, 12 §15.4) and
