@@ -322,8 +322,8 @@ def _quantile(sorted_values: Sequence[float], q: float) -> float:
     if n == 1:
         return float(sorted_values[0])
     idx = q * (n - 1)
-    lo = int(math.floor(idx))
-    hi = int(math.ceil(idx))
+    lo = math.floor(idx)
+    hi = math.ceil(idx)
     frac = idx - lo
     return float(sorted_values[lo] * (1.0 - frac) + sorted_values[hi] * frac)
 

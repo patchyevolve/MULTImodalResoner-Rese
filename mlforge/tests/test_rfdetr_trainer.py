@@ -342,7 +342,7 @@ def test_materialize_wrong_transform_blocks(tmp_path, home):
 
 
 def test_materialize_unregistered_blocks(tmp_path, home):
-    tree = _coco_tree(tmp_path / "tree")
+    _coco_tree(tmp_path / "tree")
     with pytest.raises(PreconditionFailed, match="not registered"):
         materialize(tmp_path, tmp_path / "run", ("coco:v1",))
 
@@ -365,7 +365,7 @@ def test_materialize_single_dataset_only(tmp_path, home):
 def test_e2e_epoch_payload_and_resume(tmp_path, home):
     tree = _coco_tree(tmp_path / "tree")
     _prepared(tmp_path, tree)
-    cfg = dict(epochs=2, global_batch=2)
+    cfg = {"epochs": 2, "global_batch": 2}
     t = build(tmp_path, run_dir=tmp_path / "run", datasets=("coco:v1",),
               semantic=sem(**cfg))
     assert t.checkpointable is False  # fresh run: nothing serializable yet

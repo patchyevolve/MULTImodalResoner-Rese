@@ -245,9 +245,9 @@ def _ensure_prepared(
 
     Returns "registered" | "reregistered" | "verified" | "prepared" |
     "unchanged" — the machine (13 §5.2) decides each step's legality."""
-    meta: dict[str, Any] = dict(
-        version=version, file_count=file_count, total_bytes=total_bytes
-    )
+    meta: dict[str, Any] = {
+        "version": version, "file_count": file_count, "total_bytes": total_bytes
+    }
     d = root / "datasets" / dataset_id
     if not d.is_dir():
         workflow.register_dataset(dataset_id, identity, **meta)

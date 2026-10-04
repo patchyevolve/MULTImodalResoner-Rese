@@ -121,7 +121,7 @@ def test_status_stage_aware_block(tmp_path, capsys):
 # -- L2 verbose ----------------------------------------------------------------
 
 def test_status_verbose_shows_training_detail(tmp_path, capsys):
-    wf, run_id, _token = make_ready(tmp_path, runtime={"max_steps": 10})
+    _wf, run_id, _token = make_ready(tmp_path, runtime={"max_steps": 10})
     assert main(["--root", str(tmp_path), "status", run_id, "-v"]) == 0
     out = capsys.readouterr().out
     assert "— verbose —" in out
@@ -132,7 +132,7 @@ def test_status_verbose_shows_training_detail(tmp_path, capsys):
 
 
 def test_status_verbose_checkpoint_after_training(tmp_path, capsys):
-    wf, run_id, token = make_ready(tmp_path)
+    _wf, run_id, token = make_ready(tmp_path)
     code = _worker(tmp_path, run_id, token,
                    ScaffoldTrainer(max_steps=4, steps_per_epoch=2),
                    checkpoint_interval=2).run()

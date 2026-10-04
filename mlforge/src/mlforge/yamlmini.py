@@ -75,7 +75,7 @@ def _scalar(tok: str) -> Any:
         return float(tok)
     except ValueError:
         pass
-    if tok.startswith("[") or tok.startswith("{"):
+    if tok.startswith(("[", "{")):
         raise YamlError(f"unbalanced flow collection: {tok!r}")
     if any(tok.startswith(p) for p in ("&", "*", "!", "|", ">")):
         raise YamlError(f"unsupported YAML construct: {tok!r}")
@@ -213,7 +213,7 @@ def _split_key_value(line: str) -> tuple[str, Any] | None:
             if key[0] in "'\"":
                 key = str(_scalar(key))
             rest = line[i + 1 :].strip()
-            if rest.startswith(("|", ">")) or rest.startswith("&") or rest.startswith("*"):
+            if rest.startswith(("|", ">", "&", "*")):
                 raise YamlError(f"unsupported YAML construct: {line!r}")
             return key, (_parse_flow(rest) if rest.startswith(("[", "{")) else _scalar(rest))
     return None
@@ -244,7 +244,7 @@ def loads(text: str) -> Any:
 
 
 def _parse_block(lines: list[tuple[int, str]], i: int, indent: int) -> tuple[Any, int]:
-    n, ln = lines[i]
+    _n, ln = lines[i]
     body = ln[indent:] if len(ln) >= indent else ln.lstrip()
     if body.startswith("- ") or body == "-":
         return _parse_seq(lines, i, indent)
@@ -302,7 +302,7 @@ def _parse_map(lines: list[tuple[int, str]], i: int, indent: int) -> tuple[dict[
             raise YamlError(f"line {n}: duplicate key {key!r}")
         i += 1
         if value is None and i < len(lines):
-            nxt_n, nxt = lines[i]
+            _nxt_n, nxt = lines[i]
             nxt_indent = len(nxt) - len(nxt.lstrip())
             if nxt_indent > indent:
                 value, i = _parse_block(lines, i, nxt_indent)
@@ -372,7 +372,8 @@ def _dump_scalar(v: Any) -> str:
 
 def load_file(path) -> Any:
     try:
-        text = open(path, encoding="utf-8").read()
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
     except OSError as exc:
         raise YamlError(f"cannot read {path}: {exc}") from exc
     return loads(text)

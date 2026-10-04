@@ -91,7 +91,7 @@ class Supervisor:
 
         try:
             runs = self.wf.list_runs()
-        except Exception as exc:  # one broken workspace must be reported, not fatal
+        except Exception as exc:  # noqa: BLE001 - one broken workspace must be reported, not fatal
             return {
                 "checked": [], "crashed": [],
                 "errors": [{"workspace": str(self.root),
@@ -124,7 +124,7 @@ class Supervisor:
                             f"heartbeat missing and no journal activity "
                             f"for {silence:.0f}s (live state is dead)",
                         )
-            except Exception as exc:  # a broken run must not kill the scan
+            except Exception as exc:  # noqa: BLE001 - a broken run must not kill the scan
                 errors.append(
                     {"run_id": run_id, "error": f"{type(exc).__name__}: {exc}"}
                 )
@@ -144,8 +144,8 @@ class Supervisor:
         aggregate: dict[str, Any] = {"checked": [], "crashed": [], "errors": []}
         while max_scans is None or scans < max_scans:
             report = self.scan_once()
-            for key in aggregate:
-                aggregate[key].extend(report[key])
+            for key, bucket in aggregate.items():
+                bucket.extend(report[key])
             scans += 1
             if max_scans is not None and scans >= max_scans:
                 break
@@ -267,7 +267,7 @@ def drain_pending(root: str | Path, *, spawner: Any = None) -> list[dict[str, An
             continue
         try:
             pid = spawner(root, run_id, token)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - spawn failure is logged and retried, never fatal to the scan
             _log(root, f"spawn failed for {run_id} (will retry): {exc}")
             continue
         p.unlink(missing_ok=True)

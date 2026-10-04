@@ -252,7 +252,7 @@ class ValidationGate:
             # A provider that refuses via the validation contract becomes a
             # FAIL at its step (the gate's own block semantics).
             return Check(step.number, step.id, step.label, FAIL, exc.message)
-        except Exception as exc:  # a throwing check is a failed check
+        except Exception as exc:  # noqa: BLE001 - a throwing check is a failed check
             return Check(step.number, step.id, step.label, FAIL,
                          f"check raised: {type(exc).__name__}: {exc}")
         if result is None:
@@ -684,7 +684,7 @@ def provide_transform(root: str | Path) -> Provider:
                 return Check(0, "", "", FAIL,
                              f"{name}: transform artifact failed integrity "
                              f"verification — {exc.message}")
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - an unreadable artifact is a failed check, not a crash
                 return Check(0, "", "", FAIL,
                              f"{name}: transform artifact unreadable: {exc}")
             transform = doc.get("transform")

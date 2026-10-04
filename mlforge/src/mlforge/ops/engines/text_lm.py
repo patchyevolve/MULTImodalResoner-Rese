@@ -263,7 +263,7 @@ def supports_format(fmt: str) -> str | None:
             import onnx  # noqa: F401
             import onnxruntime  # noqa: F401
             import onnxscript  # noqa: F401  # dynamo exporter (torch 2.14)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - availability probe: import failure becomes an honest pip-install message
             return (f"onnx export needs the onnx + onnxruntime + "
                     f"onnxscript packages ({type(exc).__name__}: {exc}) "
                     "— pip install onnx onnxruntime onnxscript")
@@ -518,7 +518,7 @@ def _build_onnx(model, entry: Mapping[str, Any]) -> bytes:
         if program is not None:
             try:
                 program.release()
-            except Exception:  # pragma: no cover — cleanup best-effort
+            except Exception:  # noqa: BLE001, S110 - pragma: no cover — cleanup best-effort
                 pass
 
 

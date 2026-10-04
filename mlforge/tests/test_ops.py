@@ -193,7 +193,7 @@ def test_evaluate_first_consumption_then_state_stable(wf):
     ref = _ref(entry)
     ds = _register_dataset(wf)
     assert wf.resolve_model(ref)["state"] == "AVAILABLE"
-    first = wf.evaluate_model(ref, ds)
+    wf.evaluate_model(ref, ds)
     assert wf.resolve_model(ref)["state"] == "EVALUATED"
     # second evaluation (different protocol) — artifact yes, state no flip
     wf.evaluate_model(ref, ds, protocol_overrides={"seed": 999})
@@ -719,7 +719,7 @@ def test_cli_validate_model_report(monkeypatch, capsys, tmp_path):
 
 
 def test_serve_is_honest_not_implemented(monkeypatch, capsys, tmp_path):
-    out, err = _cli(monkeypatch, capsys, tmp_path, "serve", expect=4)
+    _out, err = _cli(monkeypatch, capsys, tmp_path, "serve", expect=4)
     assert "[NOT_IMPLEMENTED]" in err
     assert "no build step yet" in err
     assert "infer" in err  # points at today's real path

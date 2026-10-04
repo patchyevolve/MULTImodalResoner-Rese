@@ -286,7 +286,7 @@ def test_handle_key_stack_back_and_help():
 
 
 def test_handle_key_quit_from_every_screen():
-    st = _state(run_ids=("run_a",), screen="overview")
+    _state(run_ids=("run_a",), screen="overview")
     for screen in ("overview", "run", "events", "help"):
         cur = _state(run_ids=("run_a",), screen=screen, run_id="run_a")
         _, outcome = handle_key(None, cur, "q")
@@ -411,7 +411,7 @@ def test_route_run_page_embeds_watch_frame_events_and_buttons(wf):
 
 
 def test_route_unknown_run_404(wf):
-    status, ctype, body = route("GET", "/run/run_MISSING", wf)
+    status, _ctype, body = route("GET", "/run/run_MISSING", wf)
     assert status == 404 and "not found" in body
     status, _, _ = route("POST", "/run/run_MISSING/intent?action=pause", wf)
     assert status == 404

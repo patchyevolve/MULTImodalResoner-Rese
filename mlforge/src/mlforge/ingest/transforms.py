@@ -186,7 +186,7 @@ def _archive_text(data: bytes, label: str, depth: int) -> str:
                     continue
                 try:
                     member = zf.read(info.filename)
-                except Exception:  # a torn member must not kill the source
+                except Exception:  # noqa: BLE001, S112 - a torn member must not kill the source
                     continue
                 text = _extract_unit(info.filename, member, depth + 1)
                 if text.strip():
@@ -1143,16 +1143,16 @@ def video_clips(sources: list[ResolvedSource]) -> dict[str, Any]:
                         hint="annotations must be COCO-format JSON "
                              "(02_dataset_preparation §11, §15)",
                     ) from exc
-                if (isinstance(parsed, dict) and "images" in parsed
-                        and "annotations" in parsed):
-                    if (not isinstance(parsed["images"], list)
-                            or not isinstance(parsed["annotations"], list)):
-                        raise ValidationBlock(
-                            f"{label}: COCO annotation shape invalid — "
-                            "`images` and `annotations` must both be lists",
-                            hint="annotations in COCO format "
-                                 "(02_dataset_preparation §11, §15)",
-                        )
+                if ((isinstance(parsed, dict) and "images" in parsed
+                        and "annotations" in parsed)
+                        and (not isinstance(parsed["images"], list)
+                             or not isinstance(parsed["annotations"], list))):
+                    raise ValidationBlock(
+                        f"{label}: COCO annotation shape invalid — "
+                        "`images` and `annotations` must both be lists",
+                        hint="annotations in COCO format "
+                             "(02_dataset_preparation §11, §15)",
+                    )
                 records.append(base)
                 annotations.append({
                     "source": src.ref,

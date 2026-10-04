@@ -90,8 +90,8 @@ def test_text_corpus_reads_pdf(tmp_path):
     objs = [
         b"<< /Type /Catalog /Pages 2 0 R >>",
         b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
-        b"<< /Type /Page /Parent 2 0 R /Contents 4 0 R "
-        b"/Resources << /Font << /F1 5 0 R >> >> >>",
+        (b"<< /Type /Page /Parent 2 0 R /Contents 4 0 R "
+        b"/Resources << /Font << /F1 5 0 R >> >> >>"),
         b"<< /Length " + str(len(stream)).encode() + b" >>\nstream\n"
         + stream + b"\nendstream",
         b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",

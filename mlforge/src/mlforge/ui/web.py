@@ -137,7 +137,8 @@ def render_run_html(run_id: str, detail: dict[str, Any],
     for ev in events:
         ts = ev.get("ts")
         stamp = (
-            _dt.datetime.fromtimestamp(ts).strftime("%H:%M:%S")
+            _dt.datetime.fromtimestamp(
+                ts, tz=_dt.UTC).astimezone().strftime("%H:%M:%S")
             if isinstance(ts, (int, float)) else "—"
         )
         extras = " ".join(

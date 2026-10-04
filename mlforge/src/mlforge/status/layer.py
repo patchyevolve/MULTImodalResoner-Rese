@@ -95,8 +95,8 @@ def gpu_telemetry() -> dict[str, Any] | None:
         return None
     try:
         out = subprocess.run(
-            [exe, "--query-gpu=name,utilization.gpu,memory.used,memory.total,"
-                  "temperature.gpu,power.draw",
+            [exe, ("--query-gpu=name,utilization.gpu,memory.used,memory.total,"
+                  "temperature.gpu,power.draw"),
              "--format=csv,noheader,nounits"],
             capture_output=True, text=True, timeout=5, check=True,
         ).stdout.strip().splitlines()
@@ -158,7 +158,7 @@ def collect_run(
     if spec_path.is_file():
         try:
             spec = RunSpec.from_dict(json.loads(spec_path.read_text(encoding="utf-8"))).to_dict()
-        except Exception:  # a malformed spec must not break status
+        except Exception:  # noqa: BLE001 - a malformed spec must not break status
             spec = {}
 
     events = wf.get_run_events(run_id)
@@ -217,7 +217,7 @@ def collect_run(
     try:
         lease = RunLeaseManager(root).status(run_id)
         lease_info = lease.to_dict() if hasattr(lease, "to_dict") else dict(vars(lease))
-    except Exception:
+    except Exception:  # noqa: BLE001 - a broken lease must not break the status layer
         lease_info = None
 
     detail: dict[str, Any] = {
@@ -315,8 +315,8 @@ def render_l1(detail: dict[str, Any]) -> list[str]:
             f"WARNING — no heartbeat for {age:.0f}s."
             if age is not None else "WARNING — heartbeat missing.",
             "Possible: stalled process / hung kernel / machine unreachable / crash.",
-            "Run will be INTERRUPTED (not failed) on reconciliation — "
-            f"awaiting `mlforge resume {detail['run_id']}` (12 §12.3).",
+            ("Run will be INTERRUPTED (not failed) on reconciliation — "
+            f"awaiting `mlforge resume {detail['run_id']}` (12 §12.3)."),
         ]
 
     head = f"Run {detail['run_id']}"

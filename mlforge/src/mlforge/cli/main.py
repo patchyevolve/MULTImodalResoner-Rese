@@ -1367,11 +1367,11 @@ def _gpu_required_for(root: Path, run_id: str, runtime: dict | None = None) -> b
     try:
         plan = ExecutionPlan.read(root / "runs" / run_id / PLAN_FILENAME)
         return int(plan.capabilities.get("gpu_count") or 0) > 0
-    except Exception:
+    except Exception:  # noqa: BLE001, S110 - progressive GPU-detection fallback: fall through to the next probe
         pass
     try:
         return detect_capabilities().gpu_count > 0
-    except Exception:
+    except Exception:  # noqa: BLE001 - GPU-detection failure is fail-closed True (12 §13.1)
         return True  # detection itself failed ⇒ fail-closed (12 §13.1)
 
 
@@ -2201,7 +2201,7 @@ def _do_hello(args) -> int:
             print("  mlforge dataset add <ID> /path/to/data --yes  "
                   "# add more data any time")
         print("  mlforge --help                     # every command")
-    except Exception:
+    except Exception:  # noqa: BLE001 - a broken workspace must never break the landing screen
         # A broken workspace must never break the landing screen —
         # point at the diagnostic that owns the detail instead.
         print("(workspace partially unreadable — run `mlforge status` "

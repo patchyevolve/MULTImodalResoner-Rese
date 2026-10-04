@@ -57,7 +57,7 @@ def _all_modules() -> tuple[list[Any], dict[str, str]]:
     for name in _TRAINER_MODULES:
         try:
             mods.append(_module(name))
-        except Exception as exc:  # pragma: no cover — broken installation
+        except Exception as exc:  # noqa: BLE001 - pragma: no cover — broken installation
             broken[name] = f"{type(exc).__name__}: {exc}"
     return mods, broken
 

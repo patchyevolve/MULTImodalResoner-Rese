@@ -109,9 +109,9 @@ def test_worker_refuses_wrong_token(tmp_path):
 
 
 def test_worker_refuses_non_ready_state(tmp_path):
-    wf, run_id, token = make_ready(tmp_path)
+    _wf, run_id, token = make_ready(tmp_path)
     # rewind to CREATED (as if validation never happened)
-    wf2 = WorkflowAPI(tmp_path)
+    WorkflowAPI(tmp_path)
     from mlforge.states import RunState as RS
     # a run can only rewind via projection tampering — simulate directly
     status = tmp_path / "runs" / run_id / "status.json"

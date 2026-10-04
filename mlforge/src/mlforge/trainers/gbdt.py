@@ -68,7 +68,7 @@ try:
     import numpy as np
 
     _LGB_IMPORT_ERROR: Exception | None = None
-except Exception as exc:  # ImportError (or broken wheel) — honest refusal
+except Exception as exc:  # noqa: BLE001 - ImportError (or broken wheel) — honest refusal
     lgb = None  # type: ignore[assignment]
     np = None  # type: ignore[assignment]
     _LGB_IMPORT_ERROR = exc
@@ -218,8 +218,8 @@ def load_ranker_rows(
                     "(spec FEATURE_NAMES, 03 Model 4); regenerate the "
                     "tabular source or set semantic.feature_columns",
                 )
-            pool.append((data, f"{ref}:{rec.get('relative_path', '?')}"
-                               f"#{rec.get('row', '?')}"))
+            pool.append((data, (f"{ref}:{rec.get('relative_path', '?')}"
+                               f"#{rec.get('row', '?')}")))
     if not train_raw:
         raise ValidationBlock(
             "prepared dataset(s) contain no train-split rows — the "

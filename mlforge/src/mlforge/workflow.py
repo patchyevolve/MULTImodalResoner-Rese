@@ -326,7 +326,7 @@ class WorkflowAPI:
         data: dict[str, Any] | None = None,
     ) -> str:
         """Single write path: machine → journal (authority) → projection."""
-        _, initial, machine = _KINDS[kind]
+        _, _initial, machine = _KINDS[kind]
         state = self._load_projection(kind, obj_id)["state"]
         ctx: dict[str, Any] = {
             f"{kind}_id": obj_id,

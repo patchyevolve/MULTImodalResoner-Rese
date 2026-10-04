@@ -214,7 +214,7 @@ def _detect_interconnect() -> str:
         return "none"
     try:
         out = subprocess.run([exe, "nvlink", "-s"], capture_output=True,
-                             text=True, timeout=3).stdout
+                             text=True, timeout=3, check=False).stdout
         if "active" in out:
             return "nvlink"
     except (subprocess.SubprocessError, OSError):

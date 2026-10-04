@@ -54,7 +54,7 @@ def dependency_error() -> str | None:
     time so inference/metrics work on a lightgbm-only machine)."""
     try:
         import lightgbm  # noqa: F401
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - availability probe: import failure becomes an honest pip-install message
         return f"pip install lightgbm ({type(exc).__name__}: {exc})"
     return None
 
@@ -252,7 +252,7 @@ def supports_format(fmt: str) -> str | None:
         try:
             import onnx  # noqa: F401
             import onnxruntime  # noqa: F401
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - availability probe: import failure becomes an honest pip-install message
             return (f"onnx export needs the onnx + onnxruntime packages "
                     f"({type(exc).__name__}: {exc}) — pip install onnx "
                     "onnxruntime")

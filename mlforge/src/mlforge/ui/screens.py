@@ -146,7 +146,8 @@ def render_events(run_id: str, events: list[dict[str, Any]]) -> list[str]:
 
         ts = ev.get("ts")
         stamp = (
-            _dt.datetime.fromtimestamp(ts).strftime("%H:%M:%S")
+            _dt.datetime.fromtimestamp(
+                ts, tz=_dt.UTC).astimezone().strftime("%H:%M:%S")
             if isinstance(ts, (int, float)) else "--:--:--"
         )
         detail_bits = [

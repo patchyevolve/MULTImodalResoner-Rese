@@ -98,7 +98,7 @@ def test_expired_heartbeat_crashes_to_interrupted(tmp_path, wf):
 
 def test_missing_heartbeat_within_grace_not_crashed(tmp_path, wf):
     clock = FakeClock()
-    run_id = _running(wf)   # last journal activity ≈ now (events use real time)
+    _running(wf)   # last journal activity ≈ now (events use real time)
     report = Supervisor(tmp_path, workflow=wf, timeout=120, clock=clock).scan_once()
     assert report["crashed"] == []
 

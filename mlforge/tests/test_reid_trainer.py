@@ -245,7 +245,7 @@ def test_resume_continues_exactly(tmp_path, home):
 def test_real_loss_decreases(tmp_path, home):
     make_reid_project(tmp_path)
     trainer = build(tmp_path)
-    state, losses = run_steps(trainer, TrainState(0, 0), 32)
+    _state, losses = run_steps(trainer, TrainState(0, 0), 32)
     assert len(losses) == 32
     assert all(math.isfinite(v) for v in losses)
     first8 = sum(losses[:8]) / 8

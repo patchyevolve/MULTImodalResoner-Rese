@@ -74,7 +74,7 @@ def _configured_dataset_paths(root: Path) -> set[Path]:
     try:
         from mlforge.ingest.config import load_paths
         values = load_paths(root)
-    except Exception:
+    except Exception:  # noqa: BLE001 - best-effort source capture: unreadable paths degrade to an empty set
         return set()
     out: set[Path] = set()
     for raw in values.values():

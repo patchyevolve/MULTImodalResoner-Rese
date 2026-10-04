@@ -55,7 +55,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from mlforge.errors import PreconditionFailed, ValidationBlock
+from mlforge.errors import PreconditionFailed
 from mlforge.runtime.trainer import HARNESS_ENV
 
 #: Real engine modules in registry order (each import-safe without its
@@ -90,7 +90,7 @@ def _all_modules() -> tuple[list[Any], dict[str, str]]:
     for name in _ENGINE_MODULES:
         try:
             mods.append(_module(name))
-        except Exception as exc:  # pragma: no cover — broken installation
+        except Exception as exc:  # noqa: BLE001 - pragma: no cover — broken installation
             broken[name] = f"{type(exc).__name__}: {exc}"
     return mods, broken
 

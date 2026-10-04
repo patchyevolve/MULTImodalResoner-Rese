@@ -383,7 +383,7 @@ def supports_format(fmt: str) -> str | None:
         try:
             import onnx  # noqa: F401
             import onnxruntime  # noqa: F401
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - availability probe: import failure becomes an honest pip-install message
             return (
                 "onnx export needs the onnx + onnxruntime packages "
                 f"({type(exc).__name__}: {exc}) — pip install onnx "

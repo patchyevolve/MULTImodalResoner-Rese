@@ -375,7 +375,7 @@ class Worker:
             return self._loop(wf, store, hb, trainer, tstate, last_beat)
         except WorkerExit as exit_:
             return exit_.code
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - any train failure routes to an honest run failure, never a worker crash
             return self._fail(wf, store, hb, lease, exc)
         finally:
             # A worker that still owns the lease must never leave it stale.
@@ -501,7 +501,7 @@ class Worker:
         wf.checkpoint_begin(self.run_id)
         try:
             ordinal, name = self._store_checkpoint(store, trainer, tstate)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - checkpoint write failure triggers the rollback retry path
             try:  # rollback attempt: the failed staging write is replaceable
                 ordinal, name = self._store_checkpoint(store, trainer, tstate)
             except Exception as exc2:
@@ -540,10 +540,10 @@ class Worker:
         wf.pause(self.run_id)  # explicit: the control intent IS the user command
         try:
             _ordinal, name = self._store_checkpoint(store, trainer, tstate)
-        except Exception as first:
+        except Exception as first:  # noqa: BLE001 - pause-checkpoint failure triggers retry then honest pause
             try:
                 _ordinal, name = self._store_checkpoint(store, trainer, tstate)
-            except Exception as second:
+            except Exception as second:  # noqa: BLE001 - second failure pauses the run with both errors recorded
                 wf.pause_checkpoint_failed(
                     self.run_id, f"pause checkpoint failed twice: {second} (first: {first})"
                 )

@@ -392,7 +392,7 @@ def test_finetune_lineage_and_strategy(tmp_path):
 
 def test_finetune_records_base_model_state(tmp_path):
     wf = WorkflowAPI(tmp_path)
-    base_id, ref = _publish_base(tmp_path, wf)
+    _base_id, ref = _publish_base(tmp_path, wf)
     plan = wf.preview_finetune(ref, strategy="freeze_backbone")
     wf.create_from_plan(plan)
     base = wf.resolve_model(ref)

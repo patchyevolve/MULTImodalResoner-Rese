@@ -297,7 +297,7 @@ def _materialize_roboflow(
     by_rel: dict[str, dict[str, Any]],
     dest: Path,
 ) -> Materialized:
-    train_rel, valid_rel, base, train_rec, valid_rec = _split_plan(
+    train_rel, valid_rel, _base, train_rec, valid_rec = _split_plan(
         bases, by_rel,
     )
     assert valid_rec is not None

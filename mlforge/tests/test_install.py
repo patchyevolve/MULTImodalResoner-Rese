@@ -20,7 +20,7 @@ def _run(*argv: str, cwd: Path) -> subprocess.CompletedProcess:
     # run from an arbitrary directory: the CLI must not depend on cwd
     return subprocess.run(
         [sys.executable, "-m", "mlforge", *argv],
-        capture_output=True, text=True, cwd=cwd, timeout=60,
+        capture_output=True, text=True, cwd=cwd, timeout=60, check=False,
     )
 
 

@@ -755,7 +755,7 @@ def test_prepare_dedupe(ws, home, tmp_path):
 
 
 def test_prepare_api_returns_result(ws, home, tmp_path):
-    coco, clips = _prepared_ws(ws, home, tmp_path)
+    _coco, _clips = _prepared_ws(ws, home, tmp_path)
     wf = WorkflowAPI(ws)
     res = prepare(ws, "rf_detr_s", workflow=wf)
     assert res.cache == "miss"
@@ -790,7 +790,7 @@ def test_gate_step4_builtin_pass(ws, home, tmp_path):
     run_id = wf.create_run(_spec()).run_id
     report = wf.validate_run(run_id)
     assert not report.blocked, report.render()
-    step4 = [c for c in report.checks if c.id == "dataset"][0]
+    step4 = next(c for c in report.checks if c.id == "dataset")
     assert "3 files hashed" in step4.detail
 
 
@@ -918,7 +918,7 @@ def test_reid_crops_manifest(tmp_path):
     assert out["output_schema"] == "reid_crops.v1"
     assert {r["identity"] for r in out["records"]} == {"0001", "0002"}
     # split comes from the folder, not from the caller's assumption
-    assert [r for r in out["records"] if r["split"] == "query"][0]["identity"] == "0001"
+    assert next(r for r in out["records"] if r["split"] == "query")["identity"] == "0001"
     by_id = {i["identity"]: i for i in out["identities"]}
     assert by_id["0001"]["images"] == 3
     assert by_id["0001"]["cameras"] == [1, 2, 3]

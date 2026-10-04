@@ -84,7 +84,7 @@ def _full_opset_ops(fmt: str) -> frozenset[str] | None:
         return frozenset(
             _op_key(s.name) for s in onnx.defs.get_all_schemas()
         )
-    except Exception:
+    except Exception:  # noqa: BLE001 - schema enumeration is best-effort: failure degrades to None
         return None
 
 

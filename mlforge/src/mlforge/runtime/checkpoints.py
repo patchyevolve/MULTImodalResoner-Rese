@@ -184,54 +184,52 @@ class CheckpointStore:
         staging.mkdir(parents=True)
 
         files: dict[str, str] = {}
-        try:
-            # 1-3: write payload files, hash, fsync
-            for rel, data in sorted(payload.items()):
-                if "/" in rel or rel in (".", ".."):
-                    raise ValidationBlock(f"illegal payload path: {rel!r}")
-                fpath = staging / rel
-                fpath.parent.mkdir(parents=True, exist_ok=True)
-                with open(fpath, "wb") as f:
-                    f.write(data)
-                    f.flush()
-                    os.fsync(f.fileno())
-                files[rel] = content_hash_bytes(data)
-
-            # 4: atomic rename staging → final (directory appears whole)
-            os.rename(staging, dest)
-
-            # 5: manifest.json + fsync
-            manifest = {
-                "schema_version": 1,
-                "ordinal": ordinal,
-                "global_step": global_step,
-                "epoch": epoch,
-                "components": sorted(components or set()),
-                "files": files,
-                "created_ts": time.time(),
-                "extra": extra or {},
-            }
-            manifest_path = dest / MANIFEST_NAME
-            with open(manifest_path, "w", encoding="utf-8") as f:
-                json.dump(manifest, f, sort_keys=True)
+        # A failure anywhere below propagates untouched and LEAVES the
+        # incomplete directory in place — recovery reports it (§11.1:
+        # no commit marker ⇒ treated as incomplete, not hidden).
+        # 1-3: write payload files, hash, fsync
+        for rel, data in sorted(payload.items()):
+            if "/" in rel or rel in (".", ".."):
+                raise ValidationBlock(f"illegal payload path: {rel!r}")
+            fpath = staging / rel
+            fpath.parent.mkdir(parents=True, exist_ok=True)
+            with open(fpath, "wb") as f:
+                f.write(data)
                 f.flush()
                 os.fsync(f.fileno())
-            manifest_hash = content_hash_bytes(
-                json.dumps(manifest, sort_keys=True).encode("utf-8")
-            )
+            files[rel] = content_hash_bytes(data)
 
-            # 6: commit marker + fsync (THE authority for existence)
-            marker = dest / COMMIT_MARKER
-            with open(marker, "w", encoding="utf-8") as f:
-                f.write(manifest_hash)
-                f.flush()
-                os.fsync(f.fileno())
-            _fsync_dir(dest)
-            _fsync_dir(self.root)
-        except BaseException:
-            # Leave the incomplete directory in place — recovery reports it
-            # (§11.1: no commit marker ⇒ treated as incomplete, not hidden).
-            raise
+        # 4: atomic rename staging → final (directory appears whole)
+        os.rename(staging, dest)
+
+        # 5: manifest.json + fsync
+        manifest = {
+            "schema_version": 1,
+            "ordinal": ordinal,
+            "global_step": global_step,
+            "epoch": epoch,
+            "components": sorted(components or set()),
+            "files": files,
+            "created_ts": time.time(),
+            "extra": extra or {},
+        }
+        manifest_path = dest / MANIFEST_NAME
+        with open(manifest_path, "w", encoding="utf-8") as f:
+            json.dump(manifest, f, sort_keys=True)
+            f.flush()
+            os.fsync(f.fileno())
+        manifest_hash = content_hash_bytes(
+            json.dumps(manifest, sort_keys=True).encode("utf-8")
+        )
+
+        # 6: commit marker + fsync (THE authority for existence)
+        marker = dest / COMMIT_MARKER
+        with open(marker, "w", encoding="utf-8") as f:
+            f.write(manifest_hash)
+            f.flush()
+            os.fsync(f.fileno())
+        _fsync_dir(dest)
+        _fsync_dir(self.root)
         return dest
 
     # -- verification (§11.3) ----------------------------------------------

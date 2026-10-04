@@ -259,7 +259,7 @@ def test_decomposition_data_requirements(tmp_path):
 def test_temperature_fit_reduces_ece(tmp_path):
     make_calib_project(tmp_path, overconfident_rows())
     t = build(tmp_path)
-    state, results = run_steps(t, TrainState(0, 0), 1)
+    _state, results = run_steps(t, TrainState(0, 0), 1)
     metrics = results[0].metrics
     assert metrics["phase"] == "temperature"
     assert metrics["ece"] < metrics["ece_before"] - 0.05
@@ -294,7 +294,7 @@ def test_phase_sequence_and_done(tmp_path):
 def test_decomposition_fit_prefers_planted_dominant_component(tmp_path):
     make_calib_project(tmp_path, component_rows())
     t = build(tmp_path, semantic=sem(epochs=3, decomposition=True))
-    state, results = run_steps(t, TrainState(0, 0), 3)
+    _state, results = run_steps(t, TrainState(0, 0), 3)
     assert results[2].metrics["phase"] == "decomposition"
     assert max(t.weights, key=t.weights.get) == "perception"
     assert all(math.isfinite(v) for v in t.weights.values())

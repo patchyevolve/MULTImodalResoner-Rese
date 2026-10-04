@@ -290,7 +290,7 @@ def test_row_floor_honors_bagging_off(tmp_path):
         build(tmp_path)
     t = build(tmp_path, semantic=sem(bagging_fraction=1.0))
     assert t.min_rows == 40 and t.n_train == 45
-    state, results = run_steps(t, TrainState(0, 0), 3)
+    _state, results = run_steps(t, TrainState(0, 0), 3)
     assert results[-1].metrics["round"] == 3
     assert results[-1].metrics["stalled"] == 0
 
@@ -429,7 +429,7 @@ def test_plan_guards(tmp_path, project):
 
 def test_boosting_reduces_loss_and_ranks(project):
     t = build(project, semantic=sem(epochs=6))
-    state, results = run_steps(t, TrainState(0, 0), 6)
+    _state, results = run_steps(t, TrainState(0, 0), 6)
     assert results[-1].done is True
     assert [r.metrics["round"] for r in results] == [1, 2, 3, 4, 5, 6]
     assert all(r.metrics["stalled"] == 0 for r in results)
@@ -471,7 +471,6 @@ def test_metrics_helpers_are_group_aware():
     assert _mean_ndcg(y, perfect, groups, 3) == pytest.approx(1.0)
     assert _lambdarank_loss(y, perfect, groups) > 0.0
     # loss lower when good pairs are ordered correctly
-    better = [0.9, 0.5, 0.1, 0.4, 0.7, 0.2]  # 0.7>0.4 wrongly
     worse = [0.1, 0.5, 0.9, 0.4, 0.7, 0.2]
     assert _lambdarank_loss(y, perfect, groups) < _lambdarank_loss(
         y, worse, groups)
@@ -615,7 +614,7 @@ def test_finetune_continues_parent(project):
                init_weights=payload["model"])
     assert t2.base_rounds == 6          # parent trees
     assert t2.booster.current_iteration() == 6
-    state2, results = run_steps(t2, TrainState(0, 0), 3)
+    _state2, results = run_steps(t2, TrainState(0, 0), 3)
     # new rounds stack on the parent with OUR learning_rate
     assert results[-1].metrics["round"] == 9
     assert results[-1].loss is not None

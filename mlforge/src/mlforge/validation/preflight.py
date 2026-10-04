@@ -241,7 +241,7 @@ class Preflight:
             probe = ctx.probe_overrides.get(key) or self.probes.get(key) or default_probe
             try:
                 verdict, detail, data = probe(ctx)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - a throwing probe is an honest FAIL verdict, not a crash
                 verdict, detail, data = FAIL, f"probe raised: {type(exc).__name__}: {exc}", {}
             checks.append(Check(step_no, key, label, verdict, detail, data))
             if verdict == FAIL:
@@ -268,7 +268,7 @@ class Preflight:
                     checks.append(Check(base + i + 1, key, label, FAIL, exc.message))
                     blocked = True
                     break
-                except Exception as exc:
+                except Exception as exc:  # noqa: BLE001 - a throwing check is an honest FAIL verdict, not a crash
                     checks.append(Check(base + i + 1, key, label, FAIL,
                                         f"check raised: {type(exc).__name__}: {exc}"))
                     blocked = True

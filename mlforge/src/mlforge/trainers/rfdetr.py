@@ -128,7 +128,7 @@ def dependency_error() -> str | None:
     err: str | None = None
     try:
         import rfdetr
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - availability probe: import failure becomes an honest pip-install message
         err = (
             f"rfdetr is not installed — pip install rfdetr "
             f"({type(exc).__name__}: {exc})"
@@ -136,7 +136,7 @@ def dependency_error() -> str | None:
     if err is None:
         try:
             from rfdetr.training import build_trainer  # noqa: F401
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - availability probe: import failure becomes an honest pip-install message
             err = (
                 "rfdetr's training stack is not installed — "
                 'pip install "rfdetr[train]" '
@@ -498,25 +498,25 @@ class RFDETRTrainer:
     # -- training ----------------------------------------------------------
 
     def _train_config(self, target: int, resume: str | None) -> dict[str, Any]:
-        cfg: dict[str, Any] = dict(
-            epochs=target,
-            dataset_dir=str(self.data.dir),
-            output_dir=str(self.out_dir),
-            dataset_file="roboflow",
-            batch_size=self.micro,
-            grad_accum_steps=self.accum,
-            lr=self.learning_rate,
-            optimizer=self.optimizer_name,
-            lr_scheduler=self.scheduler_name,
-            seed=self.seed,
-            amp_dtype=self.amp,
-            tensorboard=False,
-            progress_bar=None,
-            num_workers=self.num_workers,
-            eval_interval=self.eval_interval,
-            checkpoint_interval=self.checkpoint_interval,
-            early_stopping=self.early_stopping,
-        )
+        cfg: dict[str, Any] = {
+            "epochs": target,
+            "dataset_dir": str(self.data.dir),
+            "output_dir": str(self.out_dir),
+            "dataset_file": "roboflow",
+            "batch_size": self.micro,
+            "grad_accum_steps": self.accum,
+            "lr": self.learning_rate,
+            "optimizer": self.optimizer_name,
+            "lr_scheduler": self.scheduler_name,
+            "seed": self.seed,
+            "amp_dtype": self.amp,
+            "tensorboard": False,
+            "progress_bar": None,
+            "num_workers": self.num_workers,
+            "eval_interval": self.eval_interval,
+            "checkpoint_interval": self.checkpoint_interval,
+            "early_stopping": self.early_stopping,
+        }
         if resume:
             cfg["resume"] = str(resume)
         if self.device:

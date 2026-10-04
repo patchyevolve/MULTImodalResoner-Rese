@@ -44,7 +44,7 @@ try:
     from torch import nn
 
     _TORCH_IMPORT_ERROR: Exception | None = None
-except Exception as exc:  # ImportError (or broken wheel) — honest refusal
+except Exception as exc:  # noqa: BLE001 - ImportError (or broken wheel) — honest refusal
     torch = None  # type: ignore[assignment]
     nn = None  # type: ignore[assignment]
     F = None  # type: ignore[assignment]
@@ -145,7 +145,7 @@ if nn is not None:
 
         def forward(self, idx: torch.Tensor,
                     targets: torch.Tensor | None = None):
-            b, t = idx.shape
+            _b, t = idx.shape
             pos_ids = torch.arange(t, device=idx.device)
             x = self.tok(idx) + self.pos(pos_ids)[None, :, :]
             causal = torch.triu(

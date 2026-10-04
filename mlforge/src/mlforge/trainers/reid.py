@@ -55,7 +55,7 @@ try:
     from torch import nn
 
     _TORCH_IMPORT_ERROR: Exception | None = None
-except Exception as exc:  # ImportError (or broken wheel) — honest refusal
+except Exception as exc:  # noqa: BLE001 - ImportError (or broken wheel) — honest refusal
     torch = None  # type: ignore[assignment]
     nn = None  # type: ignore[assignment]
     F = None  # type: ignore[assignment]
@@ -65,7 +65,7 @@ try:
     from PIL import Image
 
     _PIL_IMPORT_ERROR: Exception | None = None
-except Exception as exc:  # pragma: no cover — pillow ships with torch envs
+except Exception as exc:  # noqa: BLE001 - pragma: no cover — pillow ships with torch envs
     Image = None  # type: ignore[assignment]
     _PIL_IMPORT_ERROR = exc
 
@@ -358,7 +358,7 @@ def load_reid_samples(
     # train split: prefer explicit `train` records (Market1501 keeps
     # query/test alongside); flat layouts without split fields use all.
     train_rows = [r for r in rows if r.get("split") in (None, "train")]
-    by_source = {str(r.get("source") or "") for r in train_rows}
+    {str(r.get("source") or "") for r in train_rows}
     if any(str(r.get("split")) == "train" for r in rows):
         train_rows = [r for r in rows if r.get("split") == "train"]
     if not train_rows:

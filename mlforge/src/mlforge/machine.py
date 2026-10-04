@@ -59,7 +59,7 @@ class StateMachine:
             if r.guard is not None:
                 try:
                     r.guard(ctx, state)
-                except Exception:
+                except Exception:  # noqa: BLE001, S112 - a throwing guard is not-legal: fail-closed action filtering
                     continue
             legal.append(r.action)
         return sorted(set(legal))
