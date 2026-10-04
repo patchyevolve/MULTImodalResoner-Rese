@@ -1,0 +1,6 @@
+
+# verification artifacts (coverage/mutation runs — regenerate, never commit)
+.coverage
+coverage.xml
+htmlcov/
+mlforge/mutants/
