@@ -27,6 +27,7 @@ from mlforge.runtime.checkpoints import REQUIRED_COMPONENTS
 from mlforge.runtime.trainer import TrainState
 from mlforge.store import ContentStore
 from mlforge.trainers import rfdetr as rfdetr_mod
+from mlforge.trainers import rfdetr_data
 from mlforge.trainers.rfdetr import MODEL_REGISTRY, OUT_DIRNAME, RFDETRTrainer
 from mlforge.trainers.rfdetr_data import materialize
 
@@ -132,11 +133,18 @@ def _coco_tree(base: Path, *, n_train: int = 4, n_valid: int = 2) -> Path:
 
 
 def _prepared(root: Path, tree: Path, *, transform: str = "coco_detection",
-              version: str = "v1") -> None:
-    """Store-backed prepared artifact + registration + machine-local path."""
+              version: str = "v1", drop: tuple[str, ...] = (),
+              extra_records: list[dict] | None = None) -> None:
+    """Store-backed prepared artifact + registration + machine-local path.
+
+    `drop` omits matching relative_paths from the records (the file stays
+    on disk — a record the prepared artifact never saw); `extra_records`
+    appends hand-built ones."""
     records = []
     for rel in sorted(p.relative_to(tree).as_posix()
                       for p in tree.rglob("*") if p.is_file()):
+        if rel in drop:
+            continue
         data = (tree / rel).read_bytes()
         split = rel.split("/", 1)[0]
         records.append({
@@ -146,6 +154,7 @@ def _prepared(root: Path, tree: Path, *, transform: str = "coco_detection",
             "sha256": content_hash_bytes(data),
             "size": len(data),
         })
+    records.extend(extra_records or [])
     doc = {
         "artifact_schema": "mlforge.prepared_dataset.v1",
         "model": "rf_detr_s",
@@ -743,3 +752,250 @@ def test_prefetch_refusal_edges(tmp_path, monkeypatch):
     monkeypatch.setattr(mw, "download_pretrain_weights", _boom)
     with pytest.raises(PreconditionFailed, match="could not fetch"):
         stub._prefetch_published_base(type("MlforgeWithDir", (), {}))
+
+
+# -- materializer depth (trainers/rfdetr_data.py): layouts, refusals --------
+
+
+def _coco2017_tree(base: Path, *, n_train: int = 4, n_valid: int = 2) -> Path:
+    """Standard COCO-2017 tree: annotations/instances_{train,val}2017.json
+    + split-year image dirs (12 §11.4 layouts)."""
+    def _ann(ids: list[int], names: list[str]) -> bytes:
+        return json.dumps({
+            "images": [{"id": i, "file_name": n, "width": 32, "height": 32}
+                       for i, n in zip(ids, names)],
+            "annotations": [{"id": i, "image_id": i, "category_id": 1,
+                             "bbox": [0, 0, 16, 16], "area": 256,
+                             "iscrowd": 0}
+                            for i in ids],
+            "categories": [{"id": 1, "name": "widget"}],
+        }, sort_keys=True).encode("utf-8")
+
+    ann_dir = base / "annotations"
+    ann_dir.mkdir(parents=True, exist_ok=True)
+    for split_dir, ann_name, n, color in (
+        ("train2017", "instances_train2017.json", n_train, (200, 40, 40)),
+        ("val2017", "instances_val2017.json", n_valid, (40, 40, 200)),
+    ):
+        d = base / split_dir
+        d.mkdir(parents=True, exist_ok=True)
+        ids, names = [], []
+        for i in range(n):
+            name = f"img{i}.jpg"
+            Image.new("RGB", (32, 32), color).save(d / name, "JPEG")
+            ids.append(i + 1)
+            names.append(name)
+        (ann_dir / ann_name).write_bytes(_ann(ids, names))
+    # neither _train nor _val: must be ignored by the ann scan, not crash
+    (ann_dir / "instances_test2017.json").write_bytes(b"{}")
+    return base
+
+
+def _seed_doc(root: Path, doc: dict, *, version: str = "v1") -> None:
+    """Prepared store artifact written directly (no source tree)."""
+    ident = ContentStore(root / "store").put_bytes(
+        json.dumps(doc, sort_keys=True).encode("utf-8"))
+    d = root / "datasets" / "coco"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "identity.json").write_text(json.dumps({
+        "dataset_id": "coco", "identity": ident, "version": version,
+        "file_count": len(doc.get("records") or []), "total_bytes": 1,
+    }), encoding="utf-8")
+
+
+def test_materialize_coco2017_layout(tmp_path, home):
+    """The COCO-2017 branch: instances_*{train,val}2017.json copied into
+    train/valid, split-year images symlinked, category list read."""
+    tree = _coco2017_tree(tmp_path / "tree")
+    _prepared(tmp_path, tree)
+    out = materialize(tmp_path, tmp_path / "run", ("coco:v1",))
+    assert out.layout == "coco2017"
+    assert (out.train_images, out.valid_images) == (4, 2)
+    assert out.classes == 1 and out.categories == ("widget",)
+    assert (out.dir / "train" / "_annotations.coco.json").is_file()
+    assert (out.dir / "valid" / "_annotations.coco.json").is_file()
+    assert (out.dir / "train" / "img0.jpg").is_symlink()
+    assert (out.dir / "valid" / "img1.jpg").is_symlink()
+
+
+def test_coco2017_missing_val_annotations_blocks(tmp_path, home):
+    """Train-only COCO-2017: RF-DETR validates every epoch, so a dataset
+    without validation annotations is refused by name."""
+    tree = _coco2017_tree(tmp_path / "tree")
+    (tree / "annotations" / "instances_val2017.json").unlink()
+    _prepared(tmp_path, tree)
+    with pytest.raises(ValidationBlock, match="validates every epoch"):
+        materialize(tmp_path, tmp_path / "run", ("coco:v1",))
+
+
+def test_load_records_version_mismatch_blocks(tmp_path, home):
+    tree = _coco_tree(tmp_path / "tree")
+    _prepared(tmp_path, tree, version="v9")
+    with pytest.raises(ValidationBlock, match="registered version"):
+        materialize(tmp_path, tmp_path / "run", ("coco:v1",))
+
+
+def test_load_records_unprepared_identity_blocks(tmp_path, home):
+    """Both halves of the store gate: an empty identity and a truthy one
+    that no store object answers to."""
+    tree = _coco_tree(tmp_path / "tree")
+    _prepared(tmp_path, tree)
+    reg = tmp_path / "datasets" / "coco" / "identity.json"
+    doc = json.loads(reg.read_text(encoding="utf-8"))
+    for bad in ("", "sha256:" + "0" * 64):  # absent, but hash-shaped
+        doc["identity"] = bad
+        reg.write_text(json.dumps(doc), encoding="utf-8")
+        with pytest.raises(PreconditionFailed,
+                           match="not a prepared store artifact"):
+            materialize(tmp_path, tmp_path / "run", ("coco:v1",))
+
+
+def test_load_records_empty_doc_blocks(tmp_path, home):
+    _seed_doc(tmp_path, {"transform": {"name": "coco_detection"},
+                         "records": []})
+    with pytest.raises(ValidationBlock, match="no file records"):
+        materialize(tmp_path, tmp_path / "run", ("coco:v1",))
+
+
+def test_load_records_unregistered_source_blocks(tmp_path, home):
+    _seed_doc(tmp_path, {
+        "transform": {"name": "coco_detection"},
+        "records": [{"source": "ghost:train",
+                     "relative_path": "train/_annotations.coco.json",
+                     "sha256": "sha256:x", "size": 1}],
+    })
+    with pytest.raises(PreconditionFailed, match="no machine-local path"):
+        materialize(tmp_path, tmp_path / "run", ("coco:v1",))
+
+
+def test_record_edge_cases(tmp_path, home):
+    """An empty relative_path record is skipped; duplicate paths with
+    differing bytes refuse (never join datasets), equal bytes are a
+    harmless re-claim."""
+    tree = _coco_tree(tmp_path / "tree")
+    _prepared(tmp_path, tree, extra_records=[
+        {"source": "coco:train", "split": "train", "relative_path": "",
+         "sha256": "sha256:empty", "size": 1},
+    ])
+    out = materialize(tmp_path, tmp_path / "run", ("coco:v1",))
+    assert (out.train_images, out.valid_images) == (4, 2)
+
+    other = tmp_path / "other"
+    tree2 = _coco_tree(other / "tree")
+    _prepared(other, tree2, extra_records=[
+        {"source": "coco:train", "split": "train",
+         "relative_path": "train/_annotations.coco.json",
+         "sha256": "sha256:DIFFERENT", "size": 99},
+    ])
+    with pytest.raises(ValidationBlock, match="different bytes"):
+        materialize(other, other / "run", ("coco:v1",))
+
+    third = tmp_path / "third"
+    tree3 = _coco_tree(third / "tree")
+    ann = (tree3 / "train" / "_annotations.coco.json").read_bytes()
+    _prepared(third, tree3, extra_records=[
+        {"source": "coco:train", "split": "train",
+         "relative_path": "train/_annotations.coco.json",
+         "sha256": content_hash_bytes(ann), "size": len(ann)},
+    ])
+    out = materialize(third, third / "run", ("coco:v1",))
+    assert out.train_images == 4  # equal-sha re-claim falls through
+
+
+def test_missing_source_files_block_honestly(tmp_path, home):
+    """Content vanished after prepare: the annotation copy and the image
+    link each name the exact missing path (never a silent gap)."""
+    tree = _coco_tree(tmp_path / "tree")
+    _prepared(tmp_path, tree)
+    (tree / "train" / "_annotations.coco.json").unlink()
+    with pytest.raises(ValidationBlock,
+                       match="annotation missing at registered path"):
+        materialize(tmp_path, tmp_path / "run", ("coco:v1",))
+
+    other = tmp_path / "other"
+    tree2 = _coco_tree(other / "tree")
+    _prepared(other, tree2)
+    (tree2 / "train" / "img0.jpg").unlink()
+    with pytest.raises(ValidationBlock, match="which is not under"):
+        materialize(other, other / "run", ("coco:v1",))
+
+
+def test_link_image_edges(tmp_path):
+    """Direct: fresh link, idempotent rebuild, retarget (unlink+relink),
+    and the missing-source refusal."""
+    src1 = tmp_path / "img1.jpg"
+    src1.write_bytes(b"one")
+    src2 = tmp_path / "img2.jpg"
+    src2.write_bytes(b"two")
+    dest = tmp_path / "out" / "img.jpg"
+    rfdetr_data._link_image(src1, dest, {})
+    assert dest.is_symlink() and dest.resolve() == src1.resolve()
+    rfdetr_data._link_image(src1, dest, {})   # same target: no-op
+    rfdetr_data._link_image(src2, dest, {})   # retarget: unlink first
+    assert dest.resolve() == src2.resolve()
+    with pytest.raises(ValidationBlock, match="image missing"):
+        rfdetr_data._link_image(tmp_path / "ghost.jpg", dest, {})
+
+
+def test_resolve_image_reports_tried_paths(tmp_path):
+    """Direct: every candidate is named, and a candidate already tried is
+    not appended twice (the duplicate-guard loop edge)."""
+    (tmp_path / "train").mkdir()
+    hit = tmp_path / "train" / "found.jpg"
+    hit.write_bytes(b"x")
+    path, rel = rfdetr_data._resolve_image(
+        tmp_path, "found.jpg", ["train", "train", "val"])
+    assert rel == "train/found.jpg" and path == hit
+    with pytest.raises(ValidationBlock, match="tried:"):
+        rfdetr_data._resolve_image(tmp_path, "ghost.jpg", ["train", "train"])
+
+
+def test_train_annotations_need_categories(tmp_path, home):
+    tree = _coco_tree(tmp_path / "tree")
+    ann = tree / "train" / "_annotations.coco.json"
+    doc = json.loads(ann.read_bytes())
+    doc["categories"] = []
+    ann.write_bytes(json.dumps(doc).encode("utf-8"))
+    _prepared(tmp_path, tree)
+    with pytest.raises(ValidationBlock, match="no categories"):
+        materialize(tmp_path, tmp_path / "run", ("coco:v1",))
+
+
+def test_valid_split_without_images_blocks(tmp_path, home):
+    tree = _coco_tree(tmp_path / "tree")
+    ann = tree / "valid" / "_annotations.coco.json"
+    doc = json.loads(ann.read_bytes())
+    doc["images"] = []
+    doc["annotations"] = []
+    ann.write_bytes(json.dumps(doc).encode("utf-8"))
+    _prepared(tmp_path, tree)
+    with pytest.raises(ValidationBlock, match="references no images"):
+        materialize(tmp_path, tmp_path / "run", ("coco:v1",))
+
+
+def test_image_entry_without_file_name_skipped(tmp_path, home):
+    tree = _coco_tree(tmp_path / "tree")
+    ann = tree / "train" / "_annotations.coco.json"
+    doc = json.loads(ann.read_bytes())
+    doc["images"].append({"id": 9, "file_name": "", "width": 32,
+                          "height": 32})
+    ann.write_bytes(json.dumps(doc).encode("utf-8"))
+    _prepared(tmp_path, tree)
+    out = materialize(tmp_path, tmp_path / "run", ("coco:v1",))
+    assert out.train_images == 4  # the empty entry contributed nothing
+
+
+def test_annotation_image_absent_from_records_blocks(tmp_path, home):
+    """An image that exists on disk and is referenced by the annotations
+    but was never prepared → integrity refusal, never a surprise link."""
+    tree = _coco_tree(tmp_path / "tree")
+    Image.new("RGB", (32, 32), (9, 9, 9)).save(
+        tree / "train" / "imgNEW.jpg", "JPEG")
+    ann = tree / "train" / "_annotations.coco.json"
+    doc = json.loads(ann.read_bytes())
+    doc["images"].append({"id": 42, "file_name": "imgNEW.jpg",
+                          "width": 32, "height": 32})
+    ann.write_bytes(json.dumps(doc).encode("utf-8"))
+    _prepared(tmp_path, tree, drop=("train/imgNEW.jpg",))
+    with pytest.raises(ValidationBlock, match="absent from the prepared"):
+        materialize(tmp_path, tmp_path / "run", ("coco:v1",))
