@@ -134,7 +134,7 @@ class Capabilities:
         }
 
     @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> "Capabilities":
+    def from_dict(cls, d: dict[str, Any]) -> Capabilities:
         return cls(
             gpu_count=int(d["gpu_count"]),
             gpus=tuple(GPUInfo(str(g["name"]), int(g["vram_total_mb"]),

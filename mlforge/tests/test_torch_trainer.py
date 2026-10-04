@@ -11,13 +11,13 @@ import pytest
 
 from mlforge.errors import PreconditionFailed, ValidationBlock
 from mlforge.runtime.checkpoints import REQUIRED_COMPONENTS
-from mlforge.runtime.trainer import TrainState, resolve_trainer, require_trainable
+from mlforge.runtime.trainer import TrainState, require_trainable, resolve_trainer
 from mlforge.store import ContentStore
 from mlforge.trainers import availability_error
 from mlforge.trainers.text_lm import (
     MODEL_REGISTRY,
-    TorchTextTrainer,
     TextArch,
+    TorchTextTrainer,
 )
 
 

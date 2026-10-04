@@ -29,7 +29,7 @@ from pathlib import Path
 
 import pytest
 
-from mlforge.errors import NotFound, PreconditionFailed, ValidationBlock
+from mlforge.errors import NotFound, ValidationBlock
 from mlforge.hashing import file_hash
 from mlforge.ingest.config import set_path as ingest_set_path
 from mlforge.ingest.identity import recompute_identity

@@ -100,9 +100,9 @@ def wait_for_state(
 
 __all__ = [
     "CONTROL_ACTIONS",
-    "control_path",
-    "write_control",
-    "read_control",
     "clear_control",
+    "control_path",
+    "read_control",
     "wait_for_state",
+    "write_control",
 ]

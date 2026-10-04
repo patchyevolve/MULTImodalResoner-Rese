@@ -28,23 +28,33 @@ import mlforge
 import mlforge.status as status_layer
 from mlforge.errors import (
     MlforgeError,
-    NoValidContinuation,
     NotFound,
+    NoValidContinuation,
     PreconditionFailed,
     ValidationBlock,
 )
 from mlforge.ingest import (
     load_paths as ingest_load_paths,
+)
+from mlforge.ingest import (
     prepare as ingest_prepare,
+)
+from mlforge.ingest import (
     recompute_identity as ingest_recompute_identity,
 )
 from mlforge.ingest.config import (
     paths_file as ingest_paths_file,
+)
+from mlforge.ingest.config import (
     set_path as ingest_set_path,
+)
+from mlforge.ingest.config import (
     write_registry as ingest_write_registry,
 )
 from mlforge.ingest.transforms import (
     dataset_types as ingest_dataset_types,
+)
+from mlforge.ingest.transforms import (
     suggest_transforms,
 )
 from mlforge.leases import LeaseState, RunLeaseManager
@@ -61,9 +71,10 @@ from mlforge.runtime.control import wait_for_state, write_control
 from mlforge.runtime.trainer import require_trainable
 from mlforge.store import ArtifactRegistry, ContentStore
 from mlforge.supervisor import enqueue_spawn, ensure_supervisor
-from mlforge.validation import Preflight, ValidationGate
 from mlforge.workflow import WorkflowAPI
-from mlforge.yamlmini import YamlError, dump as yaml_dump, load_file as yaml_load_file
+from mlforge.yamlmini import YamlError
+from mlforge.yamlmini import dump as yaml_dump
+from mlforge.yamlmini import load_file as yaml_load_file
 
 # 13 §11 build-order gates: implemented vs pending.
 # Every §4.1 command is implemented now; `serve` (not in the build
@@ -1280,8 +1291,8 @@ def _do_model(wf: WorkflowAPI, args) -> int:
             for m in models:
                 ref = (f"{m['name']}:{m['version']}"
                        if m.get("name") else m.get("model_id"))
-                print(f"{ref:<24} {str(m.get('state')):<24} "
-                      f"{str(m.get('run_id') or '—'):<30} "
+                print(f"{ref:<24} {m.get('state')!s:<24} "
+                      f"{m.get('run_id') or '—'!s:<30} "
                       f"{m.get('artifact_hash') or '—'}")
         return 0
     if args.model_command == "inspect":
@@ -1647,7 +1658,7 @@ def _dataset_list(wf: WorkflowAPI, args) -> int:
     print(f"{'NAME':<{w_name}}  {'STATE':<{w_state}}  VERSION  FILES  PATH")
     for r in rows:
         print(f"{r['dataset']:<{w_name}}  {r['state']:<{w_state}}  "
-              f"{r['version']:<7}  {str(r['file_count'] or '-'):>5}  "
+              f"{r['version']:<7}  {r['file_count'] or '-'!s:>5}  "
               f"{r['path'] or '(not configured)'}")
     return 0
 

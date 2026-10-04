@@ -30,6 +30,7 @@ import pytest
 from mlforge.cli.main import main
 from mlforge.run_spec import RunSpec
 from mlforge.runtime.control import read_control
+from mlforge.ui.app import _decode, _frame
 from mlforge.ui.screens import (
     TuiState,
     handle_key,
@@ -47,7 +48,6 @@ from mlforge.ui.viewmodel import (
     run_events,
     run_row,
 )
-from mlforge.ui.app import _decode, _frame
 from mlforge.ui.web import (
     INTENT_ACTIONS,
     make_handler,
@@ -56,7 +56,6 @@ from mlforge.ui.web import (
     route,
 )
 from mlforge.workflow import WorkflowAPI
-
 
 # -- helpers ---------------------------------------------------------------
 

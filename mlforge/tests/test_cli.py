@@ -106,7 +106,7 @@ def test_store_gc_execute_deletes(tmp_path, capsys):
 
 
 def test_store_gc_blocked_by_lease_exits_3(tmp_path, capsys):
-    from mlforge.store import ArtifactRegistry, ContentStore
+    from mlforge.store import ContentStore
 
     store = ContentStore(tmp_path / "store")
     store.put_bytes(b"blob")

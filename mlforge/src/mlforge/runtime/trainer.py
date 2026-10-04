@@ -24,9 +24,10 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Mapping, Protocol, Sequence, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 from mlforge.errors import PreconditionFailed
 from mlforge.runtime.checkpoints import REQUIRED_COMPONENTS
@@ -244,10 +245,10 @@ def require_trainable(
 __all__ = [
     "HARNESS_ENV",
     "HARNESS_TRAINER",
+    "ScaffoldTrainer",
     "StepResult",
     "TrainState",
     "Trainer",
-    "ScaffoldTrainer",
     "harness_allowed",
     "require_trainable",
     "resolve_trainer",

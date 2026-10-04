@@ -22,13 +22,16 @@ from __future__ import annotations
 import json
 
 import pytest
+from test_validation import make_spec
 
 from mlforge.errors import ValidationBlock
-from mlforge.run_spec import RunSpec
-from mlforge.validation import GateContext, provide_checkpoint, provide_driver, provide_hardware
+from mlforge.validation import (
+    GateContext,
+    provide_checkpoint,
+    provide_driver,
+    provide_hardware,
+)
 from mlforge.workflow import WorkflowAPI
-
-from test_validation import make_spec
 
 
 @pytest.fixture

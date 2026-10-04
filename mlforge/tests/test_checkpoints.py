@@ -15,18 +15,17 @@ Specs as executable checks:
 from __future__ import annotations
 
 import json
-import os
 
 import pytest
 
 from mlforge.errors import NotFound, ValidationBlock
 from mlforge.leases import RunLeaseManager
+from mlforge.run_spec import RunSpec
 from mlforge.runtime import (
     REQUIRED_COMPONENTS,
     CheckpointStore,
     HeartbeatWriter,
 )
-from mlforge.run_spec import RunSpec
 from mlforge.workflow import WorkflowAPI
 
 ALL_COMPONENTS = set(REQUIRED_COMPONENTS)

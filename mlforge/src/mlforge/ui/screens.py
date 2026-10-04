@@ -88,7 +88,7 @@ def render_dashboard(model: dict[str, Any], selection: int = 0,
         lines.append(_box_row("  no runs — `mlforge train --config F`"))
     for i, run in enumerate(runs):
         marker = "▸ " if i == selection else "  "
-        row = f"{marker}{_fit(str(run.get('id')), 30)}  {str(run.get('state')):<12}"
+        row = f"{marker}{_fit(str(run.get('id')), 30)}  {run.get('state')!s:<12}"
         model_name = run.get("model")
         if model_name:
             row += f" {model_name:<12}"
@@ -108,8 +108,8 @@ def render_dashboard(model: dict[str, Any], selection: int = 0,
         lines.append(_box_row("  no models — published when a run COMPLETES"))
     for m in models:
         lines.append(_box_row(
-            f"  {_fit(str(m.get('ref')), 24)}  {str(m.get('state')):<16} "
-            f"{str(m.get('origin') or 'run')}"
+            f"  {_fit(str(m.get('ref')), 24)}  {m.get('state')!s:<16} "
+            f"{m.get('origin') or 'run'!s}"
         ))
     lines.append(_section("DATASETS"))
     datasets = model.get("datasets") or []
@@ -118,7 +118,7 @@ def render_dashboard(model: dict[str, Any], selection: int = 0,
     for d in datasets:
         version = d.get("version") or "v?"
         lines.append(_box_row(
-            f"  {_fit(str(d.get('id')), 24)}  {str(d.get('state')):<16} {version}"
+            f"  {_fit(str(d.get('id')), 24)}  {d.get('state')!s:<16} {version}"
         ))
     lines.append(bot)
     lines.append(" [j/k] move  [Enter] run  [e] events  [r] refresh  "

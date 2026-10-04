@@ -80,4 +80,4 @@ class HeartbeatWriter:
         self.path.unlink(missing_ok=True)
 
 
-__all__ = ["HeartbeatWriter", "DEFAULT_HEARTBEAT_INTERVAL"]
+__all__ = ["DEFAULT_HEARTBEAT_INTERVAL", "HeartbeatWriter"]

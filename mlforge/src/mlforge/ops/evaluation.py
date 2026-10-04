@@ -30,8 +30,9 @@ from __future__ import annotations
 import hashlib
 import inspect
 import json
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any
 
 from mlforge.errors import ValidationBlock
 from mlforge.hashing import content_hash, content_hash_bytes
@@ -170,7 +171,7 @@ def scaffold_metrics(
     import hashlib
 
     digest = hashlib.sha256(
-        f"{model_hash}|{dataset_hash}|{protocol_hash_value}".encode("utf-8")
+        f"{model_hash}|{dataset_hash}|{protocol_hash_value}".encode()
     ).hexdigest()
     map_value = 0.2 + (int(digest[0:8], 16) % 60000) / 100000.0  # [0.2, 0.8)
     ap50 = min(0.99, map_value + 0.1 + (int(digest[8:16], 16) % 1000) / 10000.0)

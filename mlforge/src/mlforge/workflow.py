@@ -29,12 +29,14 @@ from __future__ import annotations
 
 import json
 import time
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any
 
 from mlforge.commands import CommandJournal
-from mlforge.commands.idempotency import DedupDecision, execute as _execute_once
+from mlforge.commands.idempotency import DedupDecision
+from mlforge.commands.idempotency import execute as _execute_once
 from mlforge.errors import (
     InvalidTransition,
     MlforgeError,
@@ -72,29 +74,26 @@ from mlforge.machine import (
     MODEL_MACHINE,
     PROJECT_MACHINE,
     RUN_MACHINE,
-    StateMachine,
 )
 from mlforge.ops import (
     FORMATS as EXPORT_FORMATS,
+)
+from mlforge.ops import (
     build_bundle,
     build_evaluation,
     build_export,
     build_protocol,
     check_input,
-    comparability_groups as _comparability_groups,
     component_integrity,
     contract_source_dir,
     execute_engine,
     execute_scaffold,
     latest_evaluation,
-    latest_export as _latest_export,
     list_evaluations,
-    list_exports as _list_exports,
     load_model_spec,
     model_entry_hash,
     numerical_validation,
     read_package,
-    required_operators as _required_operators,
     scaffold_contract,
     source_tree_hash,
     validate_export,
@@ -102,6 +101,12 @@ from mlforge.ops import (
     write_evaluation,
     write_export,
     write_output,
+)
+from mlforge.ops import (
+    comparability_groups as _comparability_groups,
+)
+from mlforge.ops import (
+    required_operators as _required_operators,
 )
 from mlforge.ops.engines import build_engine, harness_active, load_weights
 from mlforge.planner import (
@@ -201,7 +206,11 @@ class WorkflowAPI:
         Explicit providers always win (`setdefault`) — callers that can
         verify more honestly keep their wiring."""
         from mlforge.capture import provide_environment, provide_source_code
-        from mlforge.leases import RunLeaseManager, provide_revalidation, provide_run_lease
+        from mlforge.leases import (
+            RunLeaseManager,
+            provide_revalidation,
+            provide_run_lease,
+        )
 
         dataset_provider = provide_dataset_identity(self.root)
         providers = dict(self.gate_providers or {})
@@ -2173,8 +2182,8 @@ class WorkflowAPI:
         # The registry stores the weights it hashes — infer/export load
         # them from here (12 §15.3 package file family; a model whose
         # weights are only at some external path is not verifiable).
-        from mlforge.ops.importing import WEIGHTS_FILE
         from mlforge.hashing import file_hash as _file_hash
+        from mlforge.ops.importing import WEIGHTS_FILE
 
         src = Path(path) / WEIGHTS_FILE
         dest = d / WEIGHTS_FILE
@@ -2257,4 +2266,4 @@ class WorkflowAPI:
         return out
 
 
-__all__ = ["WorkflowAPI", "RunHandle", "content_hash"]
+__all__ = ["RunHandle", "WorkflowAPI", "content_hash"]

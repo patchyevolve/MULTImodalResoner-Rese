@@ -27,8 +27,8 @@ from typing import Any
 
 from mlforge.errors import NotFound
 from mlforge.leases import RunLeaseManager
-from mlforge.runtime.checkpoints import CheckpointStore
 from mlforge.run_spec import RunSpec
+from mlforge.runtime.checkpoints import CheckpointStore
 
 #: 13 §9.4 example: "WARNING — no heartbeat for 120s."
 HEARTBEAT_STALE_SECONDS = 120.0
@@ -547,13 +547,13 @@ def render_watch(detail: dict[str, Any]) -> list[str]:
 __all__ = [
     "HEARTBEAT_STALE_SECONDS",
     "STAGES",
+    "collect_hardware",
     "collect_overview",
     "collect_run",
-    "collect_hardware",
     "gpu_telemetry",
+    "render_hardware",
     "render_l1",
     "render_l2",
-    "render_hardware",
     "render_overview",
     "render_watch",
 ]

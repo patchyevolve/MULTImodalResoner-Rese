@@ -18,6 +18,7 @@ import zipfile
 from pathlib import Path
 
 import pytest
+from test_train_cli import _spec
 
 from mlforge.cli.main import main
 from mlforge.errors import NotFound, PreconditionFailed, ValidationBlock
@@ -38,8 +39,8 @@ from mlforge.ingest.transforms import (
     env_fingerprint,
     get_transform,
     mot_challenge,
-    reid_crops,
     registry_names,
+    reid_crops,
     run_transform,
     soccernet_events,
     suggest_transforms,
@@ -50,8 +51,6 @@ from mlforge.ingest.transforms import (
 from mlforge.validation import RESUME_GATE_STEPS, provide_pass
 from mlforge.workflow import WorkflowAPI
 from mlforge.yamlmini import YamlError, dump, loads
-
-from test_train_cli import _spec
 
 # ---------------------------------------------------------------------------
 # fixtures / helpers
@@ -543,7 +542,8 @@ def test_prepare_miss_then_hit(ws, home, tmp_path):
                              .read_text())
     assert len(cache_index) == 1
     # second run: same artifact from cache, no re-transform
-    import io, contextlib
+    import contextlib
+    import io
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
         code = main(["--root", str(ws), "prepare", "rf_detr_s", "--json"])

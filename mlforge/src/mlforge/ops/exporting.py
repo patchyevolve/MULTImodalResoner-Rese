@@ -79,7 +79,7 @@ def _full_opset_ops(fmt: str) -> frozenset[str] | None:
     if not FORMATS[fmt].get("full_opset"):
         return None
     try:
-        import onnx.defs  # noqa: F401
+        import onnx.defs
 
         return frozenset(
             _op_key(s.name) for s in onnx.defs.get_all_schemas()
@@ -208,7 +208,7 @@ def numerical_validation(model_spec: dict[str, Any],
 
     contract = model_spec["inference_contract"]
     atol = float(contract.get("numerical_tolerance", {}).get("atol", 1e-4))
-    digest = hashlib.sha256(f"{model_hash}|{fmt}".encode("utf-8")).hexdigest()
+    digest = hashlib.sha256(f"{model_hash}|{fmt}".encode()).hexdigest()
     max_error = (int(digest[:8], 16) % 1000) / 1000.0 * atol * 0.9
     return {
         "max_error": round(max_error, 10),

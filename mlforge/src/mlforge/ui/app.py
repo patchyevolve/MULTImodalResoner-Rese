@@ -22,7 +22,12 @@ from mlforge.ui.screens import (
     render_help,
     render_run,
 )
-from mlforge.ui.viewmodel import dashboard_model, default_selection, run_detail, run_events
+from mlforge.ui.viewmodel import (
+    dashboard_model,
+    default_selection,
+    run_detail,
+    run_events,
+)
 
 _CLEAR = "\x1b[2J\x1b[H"
 

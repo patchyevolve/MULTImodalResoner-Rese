@@ -35,9 +35,10 @@ import platform
 import re
 import sys
 import zipfile
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 from xml.etree import ElementTree as ET
 
 from mlforge.errors import PreconditionFailed, ValidationBlock
@@ -639,8 +640,8 @@ def _read_xlsx(path: Path, label: str) -> list[tuple[str, list[str], list[dict[s
             f"{label}: not a readable .xlsx file: {exc}") from None
     with zf:
         sheets = sorted(
-            ((int(m.group(1)), name) for name in zf.namelist()
-             if (m := _XLSX_SHEET_RE.match(name))))
+            (int(m.group(1)), name) for name in zf.namelist()
+             if (m := _XLSX_SHEET_RE.match(name)))
         if not sheets:
             raise ValidationBlock(f"{label}: no worksheets in the workbook")
         shared = _xlsx_shared_strings(zf)
@@ -1608,9 +1609,9 @@ __all__ = [
     "env_fingerprint",
     "get_transform",
     "mot_challenge",
-    "reid_crops",
     "register_transform",
     "registry_names",
+    "reid_crops",
     "run_transform",
     "soccernet_events",
     "suggest_transforms",

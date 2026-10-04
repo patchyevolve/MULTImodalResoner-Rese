@@ -238,8 +238,8 @@ def load_output(root: Path, output_id: str) -> dict[str, Any]:
 
 __all__ = [
     "IMAGE_EXTENSIONS",
-    "OUTPUT_SCHEMA",
     "OUTPUTS_DIR",
+    "OUTPUT_SCHEMA",
     "check_input",
     "execute_engine",
     "execute_scaffold",

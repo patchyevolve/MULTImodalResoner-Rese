@@ -652,9 +652,9 @@ def test_export_bytes_real_onnx_and_roundtrip(tmp_path, weights):
     assert float(numerical["tolerance"]) == reid_engine.ATOL
     assert numerical["n_probe"] >= 2
 
+    import numpy as np
     import onnx
     import onnxruntime as ort
-    import numpy as np
 
     graph = onnx.load_from_string(proto)
     assert graph.ir_version == 8

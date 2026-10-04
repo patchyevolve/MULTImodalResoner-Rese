@@ -41,9 +41,10 @@ from __future__ import annotations
 import json
 import math
 import random
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any
 
 from mlforge.errors import PreconditionFailed, ValidationBlock
 from mlforge.runtime.checkpoints import REQUIRED_COMPONENTS

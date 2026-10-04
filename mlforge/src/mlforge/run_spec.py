@@ -16,9 +16,10 @@ namespace separation), §25 (five-layer identity stack).
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 
 from mlforge.errors import ValidationBlock
 from mlforge.hashing import run_spec_hash
@@ -78,7 +79,7 @@ class RunSpec:
         }
 
     @classmethod
-    def from_dict(cls, d: Mapping[str, Any]) -> "RunSpec":
+    def from_dict(cls, d: Mapping[str, Any]) -> RunSpec:
         if d.get("schema_version") != SCHEMA_VERSION:
             # Never silently reinterpret (12 §17): unknown schema → BLOCK.
             raise ValidationBlock(

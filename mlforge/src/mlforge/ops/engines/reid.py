@@ -33,8 +33,9 @@ from __future__ import annotations
 
 import io
 import math
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 
 from mlforge.errors import PreconditionFailed, ValidationBlock
 from mlforge.hashing import content_hash

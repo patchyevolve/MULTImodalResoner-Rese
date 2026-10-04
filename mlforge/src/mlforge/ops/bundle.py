@@ -166,8 +166,8 @@ def component_integrity(
 
 
 __all__ = [
-    "BUNDLE_SCHEMA",
     "BUNDLES_DIR",
+    "BUNDLE_SCHEMA",
     "build_bundle",
     "component_integrity",
     "list_bundles",

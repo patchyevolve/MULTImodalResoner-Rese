@@ -21,9 +21,10 @@ from __future__ import annotations
 import json
 import os
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 FSYNC_EVERY_WRITE = True
 
@@ -38,7 +39,7 @@ class Event:
         return {"ts": self.ts, "event": self.event, **self.data}
 
     @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> "Event":
+    def from_dict(cls, d: dict[str, Any]) -> Event:
         d = dict(d)
         ts = float(d.pop("ts", 0.0))
         name = str(d.pop("event"))

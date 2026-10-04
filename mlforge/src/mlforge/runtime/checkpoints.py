@@ -33,7 +33,7 @@ import json
 import os
 import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -406,10 +406,10 @@ def _rmtree(path: Path) -> None:
 
 
 __all__ = [
-    "CheckpointStore",
-    "Candidate",
-    "Selection",
-    "REQUIRED_COMPONENTS",
     "COMMIT_MARKER",
     "MANIFEST_NAME",
+    "REQUIRED_COMPONENTS",
+    "Candidate",
+    "CheckpointStore",
+    "Selection",
 ]

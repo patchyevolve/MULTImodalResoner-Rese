@@ -39,9 +39,10 @@ import json
 import math
 import random
 import urllib.request
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any
 
 from mlforge.errors import PreconditionFailed, ValidationBlock
 from mlforge.runtime.checkpoints import REQUIRED_COMPONENTS
@@ -50,8 +51,8 @@ from mlforge.trainers import cpu_tree, resolve_device
 
 try:
     import torch
-    import torch.nn as nn
     import torch.nn.functional as F
+    from torch import nn
 
     _TORCH_IMPORT_ERROR: Exception | None = None
 except Exception as exc:  # ImportError (or broken wheel) — honest refusal
@@ -664,7 +665,7 @@ class ReidTrainer:
             matched: list[str] = []
             skipped: list[str] = []
             for key, value in state.items():
-                key = key[7:] if key.startswith("module.") else key
+                key = key.removeprefix("module.")
                 if key in own and own[key].shape == value.shape:
                     own[key] = value
                     matched.append(key)
@@ -743,7 +744,7 @@ class ReidTrainer:
 
     # -- data -----------------------------------------------------------------
 
-    def _epoch_order(self, epoch: int) -> "torch.Tensor":
+    def _epoch_order(self, epoch: int) -> torch.Tensor:
         """Deterministic per-epoch sample order (recorded protocol)."""
         gen = torch.Generator(device="cpu")
         gen.manual_seed((self.seed * 1_000_003 + epoch) % (2 ** 63))
@@ -754,10 +755,10 @@ class ReidTrainer:
             base = base.repeat(reps)
         return base[:need]
 
-    def _gather(self, indices: "torch.Tensor"):
+    def _gather(self, indices: torch.Tensor):
         """Indices → batch tensor (256x128, flip-augmented, normalized)."""
         h, w = self.arch.input_hw
-        imgs: list["torch.Tensor"] = []
+        imgs: list[torch.Tensor] = []
         for i in indices.tolist():
             sample = self.samples[int(i)]
             try:
@@ -923,8 +924,8 @@ TRAINER_CLASS = ReidTrainer
 __all__ = [
     "MODEL_REGISTRY",
     "TRAINER_CLASS",
-    "OsNetArch",
     "OSNet",
+    "OsNetArch",
     "ReidTrainer",
     "dependency_error",
     "load_reid_samples",

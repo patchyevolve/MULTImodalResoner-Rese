@@ -25,7 +25,7 @@ This module owns STEPS 1–3 and the report shape; the Workflow API
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 

@@ -26,9 +26,10 @@ from __future__ import annotations
 import json
 import os
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from mlforge.errors import PreconditionFailed, ValidationBlock
 from mlforge.journal import CorruptJournal
@@ -225,11 +226,11 @@ def execute(
 
 
 __all__ = [
+    "DEFAULT_STALE_AFTER",
+    "KIND_DUPLICATE",
+    "KIND_IN_FLIGHT",
+    "KIND_NEW",
     "CommandJournal",
     "DedupDecision",
     "execute",
-    "KIND_NEW",
-    "KIND_DUPLICATE",
-    "KIND_IN_FLIGHT",
-    "DEFAULT_STALE_AFTER",
 ]

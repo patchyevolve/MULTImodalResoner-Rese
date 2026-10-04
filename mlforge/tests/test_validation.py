@@ -34,7 +34,11 @@ from mlforge.validation import (
     provide_fail,
     provide_pass,
 )
-from mlforge.validation.gate import RESUME_GATE_STEPS, _builtin_manifest, _builtin_schema
+from mlforge.validation.gate import (
+    RESUME_GATE_STEPS,
+    _builtin_manifest,
+    _builtin_schema,
+)
 from mlforge.workflow import WorkflowAPI
 
 #: Every step that needs an external provider (3..16).

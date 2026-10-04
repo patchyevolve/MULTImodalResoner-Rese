@@ -20,9 +20,10 @@ import pytest
 
 from mlforge.errors import PreconditionFailed
 from mlforge.leases import LeaseState, RunLeaseManager, provide_run_lease
-from mlforge.runtime import ScaffoldTrainer, write_control
-from mlforge.runtime.worker import Worker, main as worker_main
 from mlforge.run_spec import RunSpec
+from mlforge.runtime import ScaffoldTrainer, write_control
+from mlforge.runtime.worker import Worker
+from mlforge.runtime.worker import main as worker_main
 from mlforge.states import RunState
 from mlforge.supervisor import (
     drain_pending,

@@ -28,7 +28,6 @@ from mlforge.trainers import rfdetr as rfdetr_mod
 from mlforge.trainers.rfdetr import MODEL_REGISTRY, RFDETRTrainer
 from mlforge.trainers.rfdetr_data import materialize
 
-
 # ---------------------------------------------------------------------------
 # fixtures / helpers
 # ---------------------------------------------------------------------------

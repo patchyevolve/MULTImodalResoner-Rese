@@ -23,7 +23,7 @@ the upstream model must be AVAILABLE in the model registry, 13 §5.5).
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -57,7 +57,7 @@ class Source:
         return f"{self.dataset}:{self.split}" if self.split else str(self.dataset)
 
     @classmethod
-    def parse(cls, item: Any, where: str) -> "Source":
+    def parse(cls, item: Any, where: str) -> Source:
         if isinstance(item, str):
             text = item.strip()
             if ":" in text:

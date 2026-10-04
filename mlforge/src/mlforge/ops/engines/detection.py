@@ -57,10 +57,11 @@ import io
 import json
 import shutil
 import tempfile
+from collections.abc import Mapping, Sequence
 from contextlib import redirect_stdout
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any
 
 from mlforge.errors import PreconditionFailed, ValidationBlock
 from mlforge.hashing import content_hash, content_hash_bytes

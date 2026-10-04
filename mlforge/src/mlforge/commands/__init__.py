@@ -19,10 +19,10 @@ from mlforge.commands.idempotency import (
 )
 
 __all__ = [
+    "KIND_DUPLICATE",
+    "KIND_IN_FLIGHT",
+    "KIND_NEW",
     "CommandJournal",
     "DedupDecision",
     "execute",
-    "KIND_NEW",
-    "KIND_DUPLICATE",
-    "KIND_IN_FLIGHT",
 ]

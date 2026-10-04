@@ -378,4 +378,4 @@ def load_file(path) -> Any:
     return loads(text)
 
 
-__all__ = ["YamlError", "loads", "load_file", "dump"]
+__all__ = ["YamlError", "dump", "load_file", "loads"]

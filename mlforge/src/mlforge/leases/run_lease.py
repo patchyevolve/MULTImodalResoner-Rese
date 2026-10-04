@@ -245,8 +245,8 @@ class RunLeaseManager:
 
 
 __all__ = [
-    "RunLeaseManager",
+    "DEFAULT_HEARTBEAT_TIMEOUT",
     "LeaseInfo",
     "LeaseState",
-    "DEFAULT_HEARTBEAT_TIMEOUT",
+    "RunLeaseManager",
 ]

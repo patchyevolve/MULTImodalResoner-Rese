@@ -58,9 +58,10 @@ import json
 import math
 import os
 import warnings
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any
 
 from mlforge.errors import PreconditionFailed, ValidationBlock
 from mlforge.runtime.checkpoints import REQUIRED_COMPONENTS
@@ -126,7 +127,7 @@ def dependency_error() -> str | None:
         return _DEP_CACHE[0]
     err: str | None = None
     try:
-        import rfdetr  # noqa: F401
+        import rfdetr
     except Exception as exc:
         err = (
             f"rfdetr is not installed — pip install rfdetr "
@@ -712,7 +713,7 @@ __all__ = [
     "MODEL_REGISTRY",
     "OUT_DIRNAME",
     "TRAINER_CLASS",
-    "RfDetrVariant",
     "RFDETRTrainer",
+    "RfDetrVariant",
     "dependency_error",
 ]

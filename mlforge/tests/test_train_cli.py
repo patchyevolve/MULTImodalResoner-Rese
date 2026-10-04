@@ -20,12 +20,10 @@ import time
 import pytest
 
 from mlforge.cli.main import main
-from mlforge.errors import NoValidContinuation, PreconditionFailed
 from mlforge.leases import RunLeaseManager, provide_run_lease
-from mlforge.runtime import ScaffoldTrainer, write_control
-from mlforge.runtime.worker import Worker
 from mlforge.run_spec import RunSpec
-from mlforge.states import RunState
+from mlforge.runtime import ScaffoldTrainer
+from mlforge.runtime.worker import Worker
 from mlforge.supervisor import enqueue_spawn  # noqa: F401 (contract import)
 from mlforge.validation import RESUME_GATE_STEPS, provide_pass
 from mlforge.workflow import WorkflowAPI
@@ -289,7 +287,6 @@ def test_resume_preflight_block_leaves_state_unchanged(tmp_path, capsys, no_supe
     on run state ("No changes were made")."""
     run_id = _paused_run(tmp_path)
 
-    import mlforge.cli.main as cli
 
     class _BlockedPreflight:
         blocked = True

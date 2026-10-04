@@ -101,4 +101,4 @@ def provide_revalidation(
     return _p
 
 
-__all__ = ["provide_run_lease", "provide_revalidation"]
+__all__ = ["provide_revalidation", "provide_run_lease"]

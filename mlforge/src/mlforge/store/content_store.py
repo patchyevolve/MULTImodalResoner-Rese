@@ -24,7 +24,7 @@ import uuid
 from pathlib import Path
 
 from mlforge.errors import NotFound, ValidationBlock
-from mlforge.hashing import content_hash_bytes, sha256_hex
+from mlforge.hashing import content_hash_bytes
 
 _CHUNK = 1 << 20  # 1 MiB
 

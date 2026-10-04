@@ -38,15 +38,15 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any
 
 from mlforge.errors import NotFound, PreconditionFailed, ValidationBlock
-from mlforge.hashing import content_hash
 from mlforge.planner.plan import PLAN_FILENAME
 from mlforge.run_spec import SCHEMA_VERSION, RunSpec
-from mlforge.validation.report import FAIL, PASS, WARN, Check, ValidationReport
+from mlforge.validation.report import FAIL, PASS, Check, ValidationReport
 
 #: A provider answers one gate step. Returns a Check (verdict decided by
 #: the provider) or None ⇒ the engine records FAIL "unverifiable".

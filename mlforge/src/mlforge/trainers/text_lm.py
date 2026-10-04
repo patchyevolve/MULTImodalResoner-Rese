@@ -28,9 +28,10 @@ import io
 import json
 import math
 import random
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any
 
 from mlforge.errors import PreconditionFailed, ValidationBlock
 from mlforge.runtime.checkpoints import REQUIRED_COMPONENTS
@@ -39,8 +40,8 @@ from mlforge.trainers import cpu_tree, resolve_device
 
 try:
     import torch
-    import torch.nn as nn
     import torch.nn.functional as F
+    from torch import nn
 
     _TORCH_IMPORT_ERROR: Exception | None = None
 except Exception as exc:  # ImportError (or broken wheel) — honest refusal
@@ -110,8 +111,8 @@ if nn is not None:
                 nn.Dropout(arch.dropout),
             )
 
-        def forward(self, x: "torch.Tensor",
-                    mask: "torch.Tensor") -> "torch.Tensor":
+        def forward(self, x: torch.Tensor,
+                    mask: torch.Tensor) -> torch.Tensor:
             h = self.ln1(x)
             attn, _ = self.attn(h, h, h, attn_mask=mask, need_weights=False)
             x = x + attn
@@ -142,8 +143,8 @@ if nn is not None:
             elif isinstance(module, nn.Embedding):
                 nn.init.normal_(module.weight, std=0.02)
 
-        def forward(self, idx: "torch.Tensor",
-                    targets: "torch.Tensor | None" = None):
+        def forward(self, idx: torch.Tensor,
+                    targets: torch.Tensor | None = None):
             b, t = idx.shape
             pos_ids = torch.arange(t, device=idx.device)
             x = self.tok(idx) + self.pos(pos_ids)[None, :, :]
@@ -463,7 +464,7 @@ class TorchTextTrainer:
 
     # -- data order ---------------------------------------------------------
 
-    def _epoch_order(self, epoch: int) -> "torch.Tensor":
+    def _epoch_order(self, epoch: int) -> torch.Tensor:
         """Deterministic per-epoch window order (recorded protocol)."""
         gen = torch.Generator(device="cpu")
         gen.manual_seed((self.seed * 1_000_003 + epoch) % (2 ** 63))
@@ -474,7 +475,7 @@ class TorchTextTrainer:
             base = base.repeat(reps)
         return base[:need]
 
-    def _gather(self, windows: "torch.Tensor"):
+    def _gather(self, windows: torch.Tensor):
         starts = windows * self.block
         offsets = torch.arange(self.block)
         idx = starts[:, None] + offsets[None, :]
@@ -609,10 +610,10 @@ TRAINER_CLASS = TorchTextTrainer
 __all__ = [
     "MODEL_REGISTRY",
     "TRAINER_CLASS",
-    "TorchTextTrainer",
-    "TinyGPT",
     "TextArch",
+    "TinyGPT",
+    "TorchTextTrainer",
     "dependency_error",
-    "torch_available",
     "load_text_corpus",
+    "torch_available",
 ]

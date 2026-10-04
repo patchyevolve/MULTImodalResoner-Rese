@@ -19,7 +19,6 @@ exact recency should compare journal `ts` events.
 
 from __future__ import annotations
 
-import os
 import secrets
 import threading
 import time

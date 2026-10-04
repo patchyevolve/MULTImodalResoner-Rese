@@ -18,6 +18,8 @@ from __future__ import annotations
 import json
 
 import pytest
+from test_ingest import COCO_FILES, _add_verified, _ingestion, _tree
+from test_validation import make_spec
 
 from mlforge.cli.main import _gpu_required_for
 from mlforge.planner import (
@@ -32,9 +34,6 @@ from mlforge.store import ContentStore
 from mlforge.validation import GateContext, provide_dataset_identity, provide_transform
 from mlforge.validation.gate import provide_model
 from mlforge.workflow import WorkflowAPI
-
-from test_ingest import COCO_FILES, _add_verified, _ingestion, _tree
-from test_validation import make_spec
 
 GiB = 1 << 30
 

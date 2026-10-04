@@ -13,14 +13,15 @@ Design:
 
 from __future__ import annotations
 
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import Any, Callable, Mapping
+from typing import Any
 
 from mlforge.errors import InvalidTransition, NoValidContinuation
 from mlforge.states import (
+    LIVE_STATES,
     DatasetState,
     FailureRecovery,
-    LIVE_STATES,
     ModelState,
     ProjectState,
     RunState,

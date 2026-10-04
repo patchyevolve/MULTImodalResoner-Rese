@@ -247,4 +247,4 @@ class ArtifactRegistry:
         )
 
 
-__all__ = ["ArtifactRegistry", "GCReport", "ContentStore", "ValidationBlock"]
+__all__ = ["ArtifactRegistry", "ContentStore", "GCReport", "ValidationBlock"]

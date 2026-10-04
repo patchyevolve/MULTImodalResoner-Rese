@@ -22,7 +22,6 @@ from mlforge.runtime.trainer import TrainState
 from mlforge.store import ContentStore
 from mlforge.trainers.reid import MODEL_REGISTRY, OSNet, ReidTrainer
 
-
 # ---------------------------------------------------------------------------
 # fixtures / helpers
 # ---------------------------------------------------------------------------

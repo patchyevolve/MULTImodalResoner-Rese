@@ -40,9 +40,9 @@ from mlforge.planner import (
     solve_or_block,
 )
 from mlforge.planner.capabilities import _features_from_arch
+from mlforge.run_spec import RunSpec
 from mlforge.runtime import ScaffoldTrainer
 from mlforge.runtime.worker import Worker
-from mlforge.run_spec import RunSpec
 from mlforge.states import RunState
 from mlforge.validation import (
     RESUME_GATE_STEPS,

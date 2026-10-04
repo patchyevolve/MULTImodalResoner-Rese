@@ -237,10 +237,10 @@ def make_handler(wf):
             self.end_headers()
             self.wfile.write(data)
 
-        def do_GET(self) -> None:  # noqa: N802 (stdlib naming)
+        def do_GET(self) -> None:
             self._dispatch("GET")
 
-        def do_POST(self) -> None:  # noqa: N802
+        def do_POST(self) -> None:
             self._dispatch("POST")
 
     return Handler

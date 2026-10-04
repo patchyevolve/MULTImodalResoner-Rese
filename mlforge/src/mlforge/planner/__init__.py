@@ -43,13 +43,13 @@ from mlforge.planner.solver import (
 )
 
 __all__ = [
+    "PLAN_FILENAME",
+    "PLAN_SCHEMA_VERSION",
+    "PRECISIONS",
     "Capabilities",
     "ExecutionPlan",
     "GPUInfo",
     "MemoryProfile",
-    "PLAN_FILENAME",
-    "PLAN_SCHEMA_VERSION",
-    "PRECISIONS",
     "Solution",
     "build_plan",
     "detect_capabilities",

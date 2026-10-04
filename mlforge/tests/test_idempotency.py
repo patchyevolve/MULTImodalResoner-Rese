@@ -13,12 +13,17 @@ Specs as executable checks:
 
 from __future__ import annotations
 
-import json
 import os
 
 import pytest
 
-from mlforge.commands import KIND_DUPLICATE, KIND_IN_FLIGHT, KIND_NEW, CommandJournal, execute
+from mlforge.commands import (
+    KIND_DUPLICATE,
+    KIND_IN_FLIGHT,
+    KIND_NEW,
+    CommandJournal,
+    execute,
+)
 from mlforge.errors import PreconditionFailed, ValidationBlock
 from mlforge.journal import CorruptJournal
 from mlforge.run_spec import RunSpec

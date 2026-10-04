@@ -9,7 +9,7 @@ from mlforge.errors import (
 from mlforge.machine import RUN_MACHINE, StateMachine
 from mlforge.states import FailureRecovery, RunState
 
-V = lambda s: s.value  # noqa: E731
+V = lambda s: s.value
 
 
 def fire(state: RunState | str, action: str, **ctx) -> str:

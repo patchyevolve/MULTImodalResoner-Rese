@@ -17,4 +17,4 @@ API:
 from mlforge.store.content_store import ContentStore
 from mlforge.store.registry import ArtifactRegistry, GCReport
 
-__all__ = ["ContentStore", "ArtifactRegistry", "GCReport"]
+__all__ = ["ArtifactRegistry", "ContentStore", "GCReport"]

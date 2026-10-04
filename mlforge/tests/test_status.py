@@ -18,14 +18,13 @@ from __future__ import annotations
 import json
 import time
 
+from test_train_cli import _spec, wf_factory  # shared pass-gate helpers
+from test_worker import _worker, make_ready
+
 from mlforge.cli.main import main
-from mlforge.runtime import ScaffoldTrainer, read_control, write_control
+from mlforge.runtime import ScaffoldTrainer, read_control
 from mlforge.states import RunState
 from mlforge.workflow import WorkflowAPI
-
-from test_train_cli import _spec, wf_factory  # shared pass-gate helpers
-from test_worker import make_ready, _worker, _run_in_thread, _wait_state
-
 
 # -- L1 single-run block ------------------------------------------------------
 

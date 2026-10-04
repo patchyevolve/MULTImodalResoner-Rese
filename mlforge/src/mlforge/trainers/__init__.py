@@ -30,8 +30,9 @@ Trainer construction channels (all trainers accept the same keywords):
 
 from __future__ import annotations
 
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any
 
 from mlforge.errors import PreconditionFailed, ValidationBlock
 

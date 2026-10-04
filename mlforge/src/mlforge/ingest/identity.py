@@ -41,7 +41,7 @@ class FileEntry:
                 "size": self.size}
 
     @classmethod
-    def from_dict(cls, d: dict) -> "FileEntry":
+    def from_dict(cls, d: dict) -> FileEntry:
         return cls(str(d["relative_path"]), str(d["sha256"]), int(d["size"]))
 
 
@@ -85,8 +85,7 @@ class DatasetManifest:
 def parse_ref(ref: str) -> tuple[str, str]:
     """`coco_2017` | `coco_2017:v1` | `dataset://coco_2017:v1` → (id, version)."""
     text = ref.strip()
-    if text.startswith("dataset://"):
-        text = text[len("dataset://"):]
+    text = text.removeprefix("dataset://")
     if not text:
         raise ValidationBlock(f"empty dataset reference: {ref!r}")
     if ":" in text:

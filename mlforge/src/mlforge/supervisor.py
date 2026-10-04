@@ -364,11 +364,11 @@ def _default_supervisor_launcher(root: Path) -> int:
 
 
 __all__ = [
-    "Supervisor",
     "DEFAULT_HEARTBEAT_TIMEOUT",
     "DEFAULT_SCAN_INTERVAL",
-    "enqueue_spawn",
+    "Supervisor",
     "drain_pending",
+    "enqueue_spawn",
     "ensure_supervisor",
     "supervisor_alive",
 ]
@@ -403,4 +403,4 @@ if __name__ == "__main__":  # pragma: no cover - process entry
     _sys.exit(_main())
 
 
-__all__ = ["Supervisor", "DEFAULT_HEARTBEAT_TIMEOUT", "DEFAULT_SCAN_INTERVAL"]
+__all__ = ["DEFAULT_HEARTBEAT_TIMEOUT", "DEFAULT_SCAN_INTERVAL", "Supervisor"]

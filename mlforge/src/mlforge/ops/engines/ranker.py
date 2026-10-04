@@ -29,8 +29,9 @@ from __future__ import annotations
 
 import json
 import math
+from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any
 
 from mlforge.errors import PreconditionFailed, ValidationBlock
 from mlforge.hashing import content_hash
@@ -305,8 +306,11 @@ def compute_metrics(
     without a split column (a dedicated eval artifact), never train or
     holdout rows (12 §15.4: `split` is never "train").
     """
-    from mlforge.trainers.gbdt import _EXCLUDED_SPLITS, _VAL_SPLITS
-    from mlforge.trainers.gbdt import _mean_ndcg  # trainer's own metric
+    from mlforge.trainers.gbdt import (
+        _EXCLUDED_SPLITS,
+        _VAL_SPLITS,
+        _mean_ndcg,  # trainer's own metric
+    )
 
     transform = dataset.get("transform")
     if transform and str(transform) != "tabular":

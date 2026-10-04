@@ -30,7 +30,7 @@ from typing import Any
 from mlforge.errors import PreconditionFailed, ValidationBlock
 from mlforge.hashing import content_hash
 from mlforge.planner.capabilities import Capabilities, detect_capabilities
-from mlforge.planner.solver import MemoryProfile, Solution, solve_or_block
+from mlforge.planner.solver import MemoryProfile, solve_or_block
 from mlforge.run_spec import RunSpec
 
 PLAN_SCHEMA_VERSION = 1
@@ -187,7 +187,7 @@ class ExecutionPlan:
         return {**self._fields(), "identity": self.identity}
 
     @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> "ExecutionPlan":
+    def from_dict(cls, d: dict[str, Any]) -> ExecutionPlan:
         if d.get("schema_version") != PLAN_SCHEMA_VERSION:
             raise ValidationBlock(
                 f"unsupported execution_plan schema_version: "
@@ -221,7 +221,7 @@ class ExecutionPlan:
         tmp.replace(path)  # atomic (12 §11.1)
 
     @classmethod
-    def read(cls, path: Path) -> "ExecutionPlan":
+    def read(cls, path: Path) -> ExecutionPlan:
         return cls.from_dict(json.loads(path.read_text(encoding="utf-8")))
 
     def summary_line(self) -> str:

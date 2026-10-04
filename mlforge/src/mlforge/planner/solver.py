@@ -51,7 +51,7 @@ class MemoryProfile:
         return asdict(self)
 
     @classmethod
-    def from_dict(cls, d: dict | None) -> "MemoryProfile":
+    def from_dict(cls, d: dict | None) -> MemoryProfile:
         d = d or {}
         return cls(
             base_bytes=int(d.get("base_bytes", cls.base_bytes)),
