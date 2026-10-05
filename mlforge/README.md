@@ -111,6 +111,181 @@ host it runs on:
 * **RAM floor** is 8 GiB by default; `runtime.min_ram_bytes` lowers it.
   Every disk/RAM failure message names the exact knob to change.
 
+## Configure
+
+Two layers — **identity is portable, paths are machine-local** (12 §10.1):
+
+| Where | What |
+|---|---|
+| `datasets.yaml` (workspace) | dataset_id → identity hash; ships with the repo; **never** contains absolute paths |
+| `$MLFORGE_HOME/datasets.json` (default `~/.mlforge`) | dataset_id → this machine's directory — what `configure datasets` edits |
+| `project.yaml` (workspace) | project name/schema/created/MLForge version — written by `init`, never rewritten |
+| `ingestion.yaml` (workspace) | which dataset feeds which model (below) |
+| `configs/*.json` (workspace) | train configs (below) |
+
+* `mlforge configure datasets` — list every registration and this machine's
+  path for it.
+* `mlforge configure datasets --set ID=PATH` — re-point one or more
+  (repeatable, non-interactive). `dataset add` already records the path on
+  the machine where it ran; use `configure` after cloning the project to a
+  new machine, moving data, or re-pointing several datasets at once.
+* Every candidate path is **hashed against its registration before being
+  written** — a wrong path is an explicit mismatch, never a silent
+  acceptance.
+
+A path is **never part of dataset identity** — the same bytes are the same
+dataset on every machine; a wrong path fails later at `prepare`/gate
+verification (exit 1) instead of corrupting identity.
+
+## The files you write
+
+### `ingestion.yaml` — what feeds what (workspace root)
+
+```yaml
+models:
+  reasoner_s:
+    transform: text_corpus            # required; unknown transform ⇒ exit 1
+    train_sources: [corpus_train:train]
+    val_sources: [corpus_val:val]     # optional; never the train split
+    depends_on: []                    # optional upstream models (must be AVAILABLE)
+  calibrator:
+    transform: calibration
+    train_sources:
+      - {generated_from: rf_detr_s, dataset: det_preds}   # another model's output
+    val_sources: [det_val:val]
+```
+
+Source forms (12 §10.2):
+
+| Form | Meaning |
+|---|---|
+| `name:split` | a registered dataset (`mlforge dataset add`); the split is source metadata |
+| `{generated_from: <model>, dataset: <ID>}` | output of another model — `generated_from` is provenance (that model must be **AVAILABLE** in the registry), `dataset` names the registered bytes |
+
+Fail-closed — the DAG never warns-and-continues:
+
+| Condition | Exit |
+|---|---|
+| missing/unreadable `ingestion.yaml` | 3 |
+| unknown key or unknown transform | 1 |
+| unregistered source | 2 |
+| content hash mismatch vs registration | 1 |
+| unmet `depends_on` / `generated_from` | 3 |
+
+### `configs/<name>.json` — the train config
+
+```json
+{
+  "schema_version": 1,
+  "model": "reasoner_s",
+  "train_datasets": ["dataset://reasoner_s_prepared:v1"],
+  "val_dataset": "dataset://reasoner_s_prepared:v1",
+  "semantic": {
+    "optimizer": "adamw", "learning_rate": 0.003, "scheduler": "cosine",
+    "loss": "byte_cross_entropy", "seed": 42, "global_batch": 4,
+    "epochs": 2, "precision_policy": "fp32"
+  },
+  "runtime": { "gpu": false, "device": "auto" }
+}
+```
+
+* **Identity keys** — `model`, `train_datasets`, `val_dataset`,
+  `semantic`, `schema_version`. An unknown schema version BLOCKs; it is
+  never silently reinterpreted.
+* **Execution keys** — everything under `runtime`: `gpu` (bool),
+  `device` (`auto`/`cpu`/`cuda[:N]`), `checkpoint_bytes`, `log_bytes`,
+  `safety_margin_bytes`, `min_ram_bytes` (see Quickstart). Changing
+  `runtime` does **not** change run identity; changing `semantic` does.
+* `fork` / `retrain` / `finetune` take a **partial** config —
+  `{"semantic": {...}, "runtime": {...}}`, both optional — as base
+  overrides; `--set` applies on top (explicit wins).
+
+Validation happens at creation, not mid-run: an unknown key or a missing
+required semantic field BLOCKs before anything exists.
+
+## Transforms (the data types)
+
+`mlforge dataset types` prints this catalog. Only registered code runs —
+an unknown transform, or one that yields zero records, is a BLOCK, never a
+silent skip (12 §6.4):
+
+| Transform | Accepts | Produces | Trains |
+|---|---|---|---|
+| `text_corpus` | `.pdf .docx .md .txt .rst .zip` | extracted, paragraph-chunked text records | `reasoner_s` |
+| `coco_detection` | images + COCO `.json` | file records + rehashed annotations | `rf_detr_s`, `rf_detr_l`, `rf_detr_seg_s` |
+| `reid_crops` | `identity_camera*.jpg` folders | identity/camera manifest | `osnet_x1_0` |
+| `tabular` | `.csv .tsv .jsonl .xlsx` | strict row records | `hypothesis_ranker` |
+| `calibration` | `.jsonl/.json` of `logits\|probs` + `label` | calibrator rows | `calibrator` (usually fed via `generated_from`) |
+| `mot_challenge` | MOT `.csv/.txt` + frames | validated per-frame boxes | — data-side only; `train` refuses honestly |
+| `video_clips` | `.mp4 .mkv .avi .mov .webm` + COCO json | decoded clip probes | — data-side only |
+| `soccernet_events` | `Labels-v2.json` / `video.ini` | 17-class event records | — data-side only |
+
+`audio` is declared not-supported (fail-closed, same as an unknown
+transform). The transform is chosen per model in `ingestion.yaml`;
+`prepare <model>` materializes `<model>_prepared:v1` from it, which is what
+the train config's `train_datasets` points at.
+
+## Semantic fields — what each knob does
+
+Eight fields are required and validated **at run creation** (missing ⇒
+BLOCK, exit 1). Together they are the run's frozen identity: after
+creation no field can be edited in place — change one and you
+`fork`/`retrain` (new lineage edge; the old run stays untouched).
+
+| Field | What it controls | ↑ higher | ↓ lower / watch out |
+|---|---|---|---|
+| `learning_rate` | step size of the optimizer | faster early progress — too high and the loss diverges; the run is wasted | stable but slower; sane ranges differ per family (text ≈ 3e-3, detection ≈ 1e-4; on the ranker this is LightGBM's shrinkage) |
+| `global_batch` | examples per optimizer step — frozen; the planner decomposes `micro × accum × world` to match it, infeasible combination ⇒ BLOCK with migration options | fewer, larger steps ⇒ better throughput, fewer LR updates per epoch (consider raising `learning_rate` with it) | more updates, noisier gradients, more steps per epoch (slower wall-clock) |
+| `epochs` | passes over the data | more training; on `hypothesis_ranker` **epochs IS the boosting-round count**; on `calibrator` it must equal the number of fit phases (mismatch ⇒ BLOCK) | undertrained — on books, 6 epochs took the text loss from 5.56 → 2.68 |
+| `scheduler` | LR curve after a 5 % warmup: `cosine` decays smoothly to 10 % of the base LR, `linear` decays straight to 0, `constant` never decays | — choice, not magnitude: cosine usually generalizes best for text/vision | a different curve is a different experiment (identity change) |
+| `optimizer` | update rule (family allowlist — wrong value ⇒ refusal naming the supported set) | — | torch families: `adamw` (weight-decay-corrected adaptive), `adam`, `sgd` (plain — tune LR with it); ranker: `gbdt`/`boosting`/`none`; calibrator: `search` (closed form) / `none` |
+| `loss` | objective (family allowlist) | — | text: `byte_cross_entropy` (default), `cross_entropy`, `next_token`; detection: `l1`; re-ID: `cross_entropy`; ranker: `lambdarank`; calibrator: `nll` |
+| `seed` | RNG for weight init and shuffle order | — | same seed ⇒ bit-identical init/sampler on a given host; a different seed is a different run (identity) |
+| `precision_policy` | numerics: `fp32` everywhere; `bf16` prefers half precision where the host supports it (CPU-only falls back with a warning) | `bf16` ⇒ faster/less memory on GPU hosts | `fp32` ⇒ portable and always exact; detection also accepts a `{"preferred": ...}` dict form |
+
+Optional keys — their presence is recorded in identity too:
+
+| Key | Family | Effect |
+|---|---|---|
+| `windows_per_epoch` | text | cap windows drawn per epoch — ↑ sees less data per epoch (faster epochs); `0`/absent = all windows |
+| `pretrained` | re-ID | init from the public OSNet ImageNet weights (default: from scratch) |
+| `alphas`, `decomposition` | calibrator | conformal coverage levels (arch default if absent); `decomposition` adds a fit phase — it changes the required `epochs` |
+| `label_column`, `group_column`, `feature_columns` | ranker | tabular schema mapping (defaults: `label`, `group`, the spec's feature names) |
+
+`--set` on `fork`/`retrain`/`finetune` accepts only the allowlist
+(`lineage.py`): `lr`, `batch`, `precision` are recognized aliases for
+`learning_rate`, `global_batch`, `precision_policy`, plus
+`finetune_strategy`, `pretrained`, `windows_per_epoch`. A typo BLOCKs
+**before anything exists**.
+
+## Command reference
+
+Quickstart shows the happy paths; every command also has
+`mlforge <cmd> --help`. Common flags: `--root PATH` (default `.`),
+`--json`, `--command-id ID` (idempotent retry key), `--attach` (stream a
+run; Ctrl+C detaches, training continues), `--yes` (skip confirmation).
+Exit codes: `0` ok · `1` validation block · `2` not found · `3`
+precondition · `4` runtime (`errors.py`).
+
+| Area | Command | Does |
+|---|---|---|
+| project | `init NAME` | workspace + portable defaults |
+| | `configure datasets [--set ID=PATH]` | machine-local dataset paths |
+| data | `dataset add ID PATH [--version V] [--force]` | register + hash + point |
+| | `dataset list` / `dataset verify ID` / `dataset types` | inventory / tamper check / transform catalog |
+| | `prepare MODEL` | resolve → transform → `MODEL_prepared:v1` |
+| train | `train --config CFG` | create → 19-step gate → preflight → spawn supervisor |
+| | `resume` / `pause` / `stop RUN` | checkpoint continuation / committed pause / stop |
+| | `fork RUN` / `retrain MODEL` / `finetune MODEL` | new run from a lineage edge; `--set k=v`, `--config` base overrides |
+| | `validate RUN\|MODEL` / `preflight RUN [--gpu]` / `lease status\|break` | gate replay / capability check / run lease |
+| model | `model list` / `model inspect M` / `model import` | registry + lineage / detail / external package |
+| | `evaluate MODEL --dataset DS [--protocol F]` | metrics on a registered split (eval split, never `train`) |
+| | `compare M1 [M2 ...]` / `infer MODEL INPUT_FILE` | side-by-side metrics / one prediction against the contract |
+| | `export MODEL --format FMT` / `package MODEL` / `store gc` | onnx·openvino·tensorrt·coreml·tflite / deploy bundle / artifact GC (dry-run default) |
+| observe | `status [-v] [RUN]` / `inspect OBJ` | L1 overview (+L2 detail) / object fact sheet |
+| | `events RUN [--follow]` / `watch [RUN]` / `hardware` | journal stream / live dashboard / measured host plan |
+| | `gui` / `serve` | local dashboard / honest refusal (exit 4 until packaged) |
+
 ## Ground truth (normative)
 
 Implementation follows these two documents exactly; where code and docs
@@ -220,7 +395,8 @@ mlforge/
     runs, unknown ⇒ BLOCK) with code-hash identity + four-field cache
     key (12 §6.4), built-in transforms `coco_detection`,
     `text_corpus` (PDF/DOCX/MD/TXT/zip → extract → paragraph-chunked
-   text records; a source yielding nothing BLOCKs, never fabricates),
+   text records; a source yielding nothing BLOCKs, never fabricates) —
+   grown to all 8 registered transforms (see *Transforms*),
    `dataset add|list|verify` (tamper → REJECTED, `--force`
    reregister), `prepare` (resolve → cache → transform → derived
    `<model>_prepared` REGISTERED→VERIFIED→PREPARED, `--command-id`
